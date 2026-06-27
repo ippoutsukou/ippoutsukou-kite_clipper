@@ -49,6 +49,41 @@ class PhotoAnalysis:
         return max(0.0, sharpness_score + brightness_score + resolution_score - penalty)
 
 
+@dataclass
+class FrameAnalysis:
+    path: Path
+    width: int
+    height: int
+    blur_score: float
+    brightness: float
+    megapixels: float
+    is_blurry: bool
+    is_dark: bool
+    is_low_resolution: bool
+    has_person_candidate: bool
+    has_kite_candidate: bool
+    is_empty_scene: bool
+    is_ng: bool
+    ng_reason: str
+
+    @property
+    def score(self) -> float:
+        sharpness_score = min(self.blur_score / 500.0, 1.0) * 40.0
+        brightness_score = brightness_quality_score(self.brightness) * 25.0
+        resolution_score = min(self.megapixels / 8.0, 1.0) * 15.0
+        subject_score = 20.0 if (self.has_person_candidate or self.has_kite_candidate) else 0.0
+        penalty = 0.0
+        if self.is_blurry:
+            penalty += 15.0
+        if self.is_dark:
+            penalty += 10.0
+        if self.is_low_resolution:
+            penalty += 8.0
+        if self.is_empty_scene:
+            penalty += 20.0
+        return max(0.0, sharpness_score + brightness_score + resolution_score + subject_score - penalty)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="カイトボードの写真・動画をOpenCVベースで整理します。"
@@ -60,6 +95,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-height", type=int, default=720, help="最低高さ")
     parser.add_argument("--similarity-threshold", type=int, default=10, help="pHashのハミング距離しきい値")
     parser.add_argument("--frame-interval", type=int, default=1, help="動画フレーム抽出間隔（秒）")
+    parser.add_argument("--cleanup-review", action="store_true", help="review配下の確認済み候補を整理します")
+    parser.add_argument("--dry-run", action="store_true", help="削除せず、削除予定だけを表示します")
+    parser.add_argument("--confirm-delete", action="store_true", help="review/photos と review/frames のファイル削除を実行します")
     return parser.parse_args()
 
 
@@ -119,6 +157,107 @@ def analyze_photo(
         is_low_resolution=width < min_width or height < min_height,
         hash_bits=average_hash(gray),
     )
+
+
+def analyze_frame(
+    path: Path,
+    blur_threshold: float,
+    dark_threshold: float,
+    min_width: int,
+    min_height: int,
+) -> FrameAnalysis:
+    image = read_image(path)
+    if image is None:
+        raise ValueError(f"画像として読み込めません: {path}")
+
+    height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    brightness = float(np.mean(gray))
+    megapixels = (width * height) / 1_000_000.0
+    has_person = detect_person_candidate(image)
+    has_kite = detect_kite_candidate(image)
+    is_empty = detect_empty_scene(image)
+    ng_reasons: list[str] = []
+    if not has_person and not has_kite:
+        ng_reasons.append("no_person_or_kite_candidate")
+    if is_empty:
+        ng_reasons.append("empty_scene_candidate")
+
+    return FrameAnalysis(
+        path=path,
+        width=width,
+        height=height,
+        blur_score=blur_score,
+        brightness=brightness,
+        megapixels=megapixels,
+        is_blurry=blur_score < blur_threshold,
+        is_dark=brightness < dark_threshold,
+        is_low_resolution=width < min_width or height < min_height,
+        has_person_candidate=has_person,
+        has_kite_candidate=has_kite,
+        is_empty_scene=is_empty,
+        is_ng=bool(ng_reasons),
+        ng_reason=";".join(ng_reasons),
+    )
+
+
+def resized_for_detection(image: np.ndarray, max_width: int = 960) -> np.ndarray:
+    height, width = image.shape[:2]
+    if width <= max_width:
+        return image
+    scale = max_width / width
+    return cv2.resize(image, (max_width, int(height * scale)), interpolation=cv2.INTER_AREA)
+
+
+def detect_person_candidate(image: np.ndarray) -> bool:
+    detection_image = resized_for_detection(image, 640)
+    hog = cv2.HOGDescriptor()
+    hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    rects, weights = hog.detectMultiScale(
+        detection_image,
+        winStride=(8, 8),
+        padding=(8, 8),
+        scale=1.05,
+    )
+    return any(float(weight) > 0.25 for weight in weights) if len(rects) else False
+
+
+def detect_kite_candidate(image: np.ndarray) -> bool:
+    detection_image = resized_for_detection(image, 960)
+    height, width = detection_image.shape[:2]
+    upper = detection_image[: max(1, int(height * 0.65)), :]
+    hsv = cv2.cvtColor(upper, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    color_mask = cv2.inRange(saturation, 70, 255)
+    bright_mask = cv2.inRange(value, 80, 255)
+    mask = cv2.bitwise_and(color_mask, bright_mask)
+    mask = cv2.medianBlur(mask, 5)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    image_area = upper.shape[0] * upper.shape[1]
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < image_area * 0.00025 or area > image_area * 0.08:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        if w < 12 or h < 8:
+            continue
+        aspect_ratio = w / max(h, 1)
+        if 0.5 <= aspect_ratio <= 8.0:
+            return True
+    return False
+
+
+def detect_empty_scene(image: np.ndarray) -> bool:
+    detection_image = resized_for_detection(image, 640)
+    gray = cv2.cvtColor(detection_image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(detection_image, cv2.COLOR_BGR2HSV)
+    edges = cv2.Canny(gray, 80, 160)
+    edge_density = float(np.count_nonzero(edges)) / edges.size
+    saturation_mean = float(np.mean(hsv[:, :, 1]))
+    return edge_density < 0.012 and saturation_mean < 55.0
 
 
 def average_hash(gray: np.ndarray, size: int = 16) -> np.ndarray:
@@ -227,6 +366,11 @@ def write_result_csv(csv_path: Path, rows: list[dict[str, object]]) -> None:
         "is_blurry",
         "is_dark",
         "is_low_resolution",
+        "has_person_candidate",
+        "has_kite_candidate",
+        "is_empty_scene",
+        "is_ng",
+        "ng_reason",
         "score",
         "status",
         "message",
@@ -252,6 +396,11 @@ def photo_row(photo: PhotoAnalysis) -> dict[str, object]:
         "is_blurry": photo.is_blurry,
         "is_dark": photo.is_dark,
         "is_low_resolution": photo.is_low_resolution,
+        "has_person_candidate": "",
+        "has_kite_candidate": "",
+        "is_empty_scene": "",
+        "is_ng": "",
+        "ng_reason": "",
         "score": round(photo.score, 3),
         "status": "ok",
         "message": "",
@@ -273,36 +422,123 @@ def error_row(item_type: str, source_path: Path, message: str) -> dict[str, obje
         "is_blurry": "",
         "is_dark": "",
         "is_low_resolution": "",
+        "has_person_candidate": "",
+        "has_kite_candidate": "",
+        "is_empty_scene": "",
+        "is_ng": "",
+        "ng_reason": "",
         "score": "",
         "status": "error",
         "message": message,
     }
 
 
-def frame_row(video_path: Path, frame_path: Path) -> dict[str, object]:
+def frame_row(video_path: Path, frame: FrameAnalysis) -> dict[str, object]:
     return {
         "type": "frame",
         "source_path": str(video_path),
-        "output_path": str(frame_path),
+        "output_path": str(frame.path),
         "group_id": "",
         "selected": "",
-        "width": "",
-        "height": "",
-        "blur_score": "",
-        "brightness": "",
-        "megapixels": "",
-        "is_blurry": "",
-        "is_dark": "",
-        "is_low_resolution": "",
-        "score": "",
+        "width": frame.width,
+        "height": frame.height,
+        "blur_score": round(frame.blur_score, 3),
+        "brightness": round(frame.brightness, 3),
+        "megapixels": round(frame.megapixels, 3),
+        "is_blurry": frame.is_blurry,
+        "is_dark": frame.is_dark,
+        "is_low_resolution": frame.is_low_resolution,
+        "has_person_candidate": frame.has_person_candidate,
+        "has_kite_candidate": frame.has_kite_candidate,
+        "is_empty_scene": frame.is_empty_scene,
+        "is_ng": frame.is_ng,
+        "ng_reason": frame.ng_reason,
+        "score": round(frame.score, 3),
         "status": "ok",
         "message": "",
     }
 
 
+def cleanup_review(root: Path, confirm_delete: bool, dry_run: bool) -> int:
+    logs = root / "logs"
+    setup_logging(logs)
+    cleanup_targets = [root / "review" / "photos", root / "review" / "frames"]
+    actual_delete = confirm_delete and not dry_run
+    rows: list[dict[str, object]] = []
+
+    for target_dir in cleanup_targets:
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for target in sorted(path for path in target_dir.rglob("*") if path.is_file()):
+                if target.name == ".gitkeep":
+                    rows.append(cleanup_row(target, target_dir, "skipped", "ok", "keep marker"))
+                    continue
+                if not is_relative_to(target.resolve(), target_dir.resolve()):
+                    rows.append(cleanup_row(target, target_dir, "skipped", "error", "outside cleanup directory"))
+                    continue
+                try:
+                    if actual_delete:
+                        target.unlink()
+                        rows.append(cleanup_row(target, target_dir, "deleted", "ok", ""))
+                    else:
+                        rows.append(cleanup_row(target, target_dir, "would_delete", "ok", "dry run"))
+                except Exception as exc:
+                    logging.exception("review整理エラー: %s", target)
+                    rows.append(cleanup_row(target, target_dir, "error", "error", str(exc)))
+        except Exception as exc:
+            logging.exception("review整理ディレクトリエラー: %s", target_dir)
+            rows.append(cleanup_row(target_dir, target_dir, "error", "error", str(exc)))
+
+    write_cleanup_csv(logs / "cleanup.csv", rows)
+    action_label = "削除" if actual_delete else "削除予定"
+    count = sum(1 for row in rows if row["action"] in {"deleted", "would_delete"})
+    print(f"{action_label}: {count} 件")
+    print(f"CSV: {logs / 'cleanup.csv'}")
+    print(f"エラーログ: {logs / 'error.log'}")
+    if not actual_delete:
+        print("実際に削除するには --cleanup-review --confirm-delete を指定してください。")
+    return 0
+
+
+def is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def cleanup_row(
+    path: Path,
+    target_dir: Path,
+    action: str,
+    status: str,
+    message: str,
+) -> dict[str, object]:
+    return {
+        "path": str(path),
+        "cleanup_dir": str(target_dir),
+        "action": action,
+        "status": status,
+        "message": message,
+    }
+
+
+def write_cleanup_csv(csv_path: Path, rows: list[dict[str, object]]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["path", "cleanup_dir", "action", "status", "message"]
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def main() -> int:
     args = parse_args()
     root = args.root.resolve()
+    if args.cleanup_review:
+        return cleanup_review(root, args.confirm_delete, args.dry_run)
+
     input_photos = root / "input" / "photos"
     input_videos = root / "input" / "videos"
     review_photos = root / "review" / "photos"
@@ -341,7 +577,19 @@ def main() -> int:
     for video_path in iter_files(input_videos, VIDEO_EXTENSIONS):
         try:
             frames = extract_video_frames(video_path, review_frames, args.frame_interval)
-            rows.extend(frame_row(video_path, frame_path) for frame_path in frames)
+            for frame_path in frames:
+                try:
+                    frame = analyze_frame(
+                        frame_path,
+                        args.blur_threshold,
+                        args.dark_threshold,
+                        args.min_width,
+                        args.min_height,
+                    )
+                    rows.append(frame_row(video_path, frame))
+                except Exception as exc:
+                    logging.exception("フレーム判定エラー: %s", frame_path)
+                    rows.append(error_row("frame", frame_path, str(exc)))
         except Exception as exc:
             logging.exception("動画フレーム抽出エラー: %s", video_path)
             rows.append(error_row("video", video_path, str(exc)))

@@ -1,12 +1,15 @@
 .venv/
 __pycache__/
 *.py[cod]
+backup/
 
 # 入力データと生成物はコミットしない
 input/photos/*
 input/videos/*
 review/photos/*
 review/frames/*
+selected_photos/*
+selected_frames/*
 logs/*
 
 # 空フォルダだけは保持する
@@ -14,6 +17,8 @@ logs/*
 !input/videos/.gitkeep
 !review/photos/.gitkeep
 !review/frames/.gitkeep
+!selected_photos/.gitkeep
+!selected_frames/.gitkeep
 !logs/.gitkeep
 
 # ローカル設定・機密情報
