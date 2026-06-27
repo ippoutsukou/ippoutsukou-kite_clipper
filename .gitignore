@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# 入力データと生成物はコミットしない
+input/photos/*
+input/videos/*
+review/photos/*
+review/frames/*
+logs/*
+
+# 空フォルダだけは保持する
+!input/photos/.gitkeep
+!input/videos/.gitkeep
+!review/photos/.gitkeep
+!review/frames/.gitkeep
+!logs/.gitkeep
+
+# ローカル設定・機密情報
+.env
+.env.*
+*.pem
+*.key
+secrets/
+credentials/
