@@ -1,6 +1,6 @@
-# kite_clipper
+# Media Clip Organizer
 
-Windows 上で、カイトボードの写真と動画を整理するための OpenCV ベースのツールです。
+Windows 上で、写真と動画を整理するための OpenCV ベースのツールです。
 
 ## フォルダ構成
 

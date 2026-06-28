@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -20,7 +21,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv"}
 class KiteClipperGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("kite_clipper")
+        self.title("Media Clip Organizer")
         self.geometry("980x720")
         self.minsize(900, 620)
         self.clip_paths: list[Path] = []
@@ -32,7 +33,10 @@ class KiteClipperGui(tk.Tk):
         self.split_gap = tk.StringVar(value="2")
         self.fast_copy = tk.BooleanVar(value=False)
         self.cleanup_review_frames = tk.BooleanVar(value=False)
+        self.cleanup_review_photos = tk.BooleanVar(value=False)
         self.cleanup_work = tk.BooleanVar(value=False)
+        self.cleanup_selected_clips = tk.BooleanVar(value=False)
+        self.last_action: str | None = None
         self.normalize_mode = tk.StringVar(value="vertical")
         self.fit_mode = tk.StringVar(value="contain")
 
@@ -49,7 +53,7 @@ class KiteClipperGui(tk.Tk):
 
         top = ttk.Frame(main)
         top.pack(fill=tk.X)
-        ttk.Label(top, text="kite_clipper 操作パネル", font=("", 15, "bold")).pack(side=tk.LEFT)
+        ttk.Label(top, text="Media Clip Organizer", font=("", 15, "bold")).pack(side=tk.LEFT)
         ttk.Label(top, textvariable=self.status_var).pack(side=tk.RIGHT)
 
         folder_frame = ttk.LabelFrame(main, text="1. フォルダ")
@@ -61,6 +65,7 @@ class KiteClipperGui(tk.Tk):
             ("review/frames", ROOT / "review" / "frames"),
             ("selected_frames", ROOT / "selected_frames"),
             ("selected_clips", ROOT / "selected_clips"),
+            ("work", ROOT / "work"),
             ("final", ROOT / "final"),
         ]:
             ttk.Button(folder_frame, text=label, command=lambda p=folder: self.open_folder(p)).pack(
@@ -106,7 +111,13 @@ class KiteClipperGui(tk.Tk):
         ttk.Checkbutton(cut_frame, text="review/framesも削除", variable=self.cleanup_review_frames).pack(
             side=tk.LEFT, padx=8
         )
+        ttk.Checkbutton(cut_frame, text="review/photosも削除", variable=self.cleanup_review_photos).pack(
+            side=tk.LEFT, padx=8
+        )
         ttk.Checkbutton(cut_frame, text="workも削除", variable=self.cleanup_work).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(cut_frame, text="selected_clipsも削除", variable=self.cleanup_selected_clips).pack(
+            side=tk.LEFT, padx=8
+        )
 
         concat_frame = ttk.LabelFrame(main, text="4. selected_clips を結合")
         concat_frame.pack(fill=tk.BOTH, expand=True, pady=8)
@@ -249,16 +260,25 @@ class KiteClipperGui(tk.Tk):
         args = ["--cleanup-after-cut", "--dry-run"]
         if self.cleanup_review_frames.get():
             args.append("--include-review-frames")
+        if self.cleanup_review_photos.get():
+            args.append("--include-review-photos")
         if self.cleanup_work.get():
             args.append("--include-work")
+        if self.cleanup_selected_clips.get():
+            args.append("--include-selected-clips")
+        self.last_action = "cleanup_dry_run"
         self.run_cli(args, "削除予定確認中")
 
     def cleanup_after_cut_delete(self) -> None:
         targets = ["selected_frames"]
         if self.cleanup_review_frames.get():
             targets.append("review/frames")
+        if self.cleanup_review_photos.get():
+            targets.append("review/photos")
         if self.cleanup_work.get():
             targets.append("work")
+        if self.cleanup_selected_clips.get():
+            targets.append("selected_clips")
         message = (
             f"{' と '.join(targets)} のファイルを完全削除します。\n"
             "Windowsのゴミ箱には入りません。\n"
@@ -270,8 +290,13 @@ class KiteClipperGui(tk.Tk):
         args = ["--cleanup-after-cut", "--confirm-delete"]
         if self.cleanup_review_frames.get():
             args.append("--include-review-frames")
+        if self.cleanup_review_photos.get():
+            args.append("--include-review-photos")
         if self.cleanup_work.get():
             args.append("--include-work")
+        if self.cleanup_selected_clips.get():
+            args.append("--include-selected-clips")
+        self.last_action = "cleanup_delete"
         self.run_cli(args, "削除中")
 
     def concat_selected_clips(self) -> None:
@@ -319,16 +344,37 @@ class KiteClipperGui(tk.Tk):
     def on_command_done(self, return_code: int) -> None:
         self.status_var.set("完了" if return_code == 0 else f"エラー: {return_code}")
         self.refresh_all()
+        if self.last_action == "cleanup_dry_run":
+            self.show_cleanup_feedback("削除予定を確認しました")
+        elif self.last_action == "cleanup_delete":
+            self.show_cleanup_feedback("削除が完了しました")
+        self.last_action = None
 
     def append_log(self, message: str) -> None:
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
+
+    def show_cleanup_feedback(self, title: str) -> None:
+        csv_path = ROOT / "logs" / "cleanup_after_cut.csv"
+        count = count_cleanup_actions(csv_path)
+        message = f"対象ファイル: {count} 件\n\n結果CSV:\n{csv_path}"
+        messagebox.showinfo(title, message)
 
 
 def count_files(folder: Path) -> int:
     if not folder.exists():
         return 0
     return sum(1 for path in folder.rglob("*") if path.is_file() and path.name != ".gitkeep")
+
+
+def count_cleanup_actions(csv_path: Path) -> int:
+    if not csv_path.exists():
+        return 0
+    try:
+        text = csv_path.read_text(encoding="utf-8-sig")
+    except Exception:
+        return 0
+    return len(re.findall(r",(?:would_delete|deleted),", text))
 
 
 def get_duration_seconds(path: Path) -> float:

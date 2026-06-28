@@ -1,4 +1,4 @@
-# kite_clipper 作業手順書
+# Media Clip Organizer 作業手順書
 
 ## 1. 元データを入れる
 
@@ -114,7 +114,10 @@ logs/clip_cuts.csv
 
 GUIでは「削除予定を確認」で対象を確認し、「selected_frames を削除」で削除します。
 `review/frames` も削除したい場合だけ、`review/framesも削除` にチェックを入れてください。
+採用候補写真も削除したい場合だけ、`review/photosも削除` にチェックを入れてください。
 正規化済みの一時動画も削除したい場合だけ、`workも削除` にチェックを入れてください。
+切り出し済みクリップも削除したい場合だけ、`selected_clipsも削除` にチェックを入れてください。
+削除予定確認後は、対象件数と `logs/cleanup_after_cut.csv` の場所が表示されます。
 削除ボタンでは確認ダイアログが出ます。
 
 まず削除予定だけ確認します。
@@ -135,10 +138,22 @@ GUIでは「削除予定を確認」で対象を確認し、「selected_frames �
 .\.venv\Scripts\python.exe .\kite_clipper.py --cleanup-after-cut --include-review-frames --confirm-delete
 ```
 
+`review/photos` の採用候補写真もまとめて削除したい場合:
+
+```powershell
+.\.venv\Scripts\python.exe .\kite_clipper.py --cleanup-after-cut --include-review-photos --confirm-delete
+```
+
 `work` の一時ファイルもまとめて削除したい場合:
 
 ```powershell
 .\.venv\Scripts\python.exe .\kite_clipper.py --cleanup-after-cut --include-work --confirm-delete
+```
+
+`selected_clips` の切り出し済み動画もまとめて削除したい場合:
+
+```powershell
+.\.venv\Scripts\python.exe .\kite_clipper.py --cleanup-after-cut --include-selected-clips --confirm-delete
 ```
 
 整理結果:

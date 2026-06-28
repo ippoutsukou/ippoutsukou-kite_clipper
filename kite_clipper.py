@@ -120,7 +120,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-copy", action="store_true", help="再エンコードせず高速に切り出します。カット位置は少しずれる場合があります")
     parser.add_argument("--cleanup-after-cut", action="store_true", help="動画切り出し後に不要になった選択フレームを整理します")
     parser.add_argument("--include-review-frames", action="store_true", help="cleanup-after-cutでreview/framesも整理対象にします")
+    parser.add_argument("--include-review-photos", action="store_true", help="cleanup-after-cutでreview/photosも整理対象にします")
     parser.add_argument("--include-work", action="store_true", help="cleanup-after-cutでwork配下の一時ファイルも整理対象にします")
+    parser.add_argument("--include-selected-clips", action="store_true", help="cleanup-after-cutでselected_clipsも整理対象にします")
     parser.add_argument("--concat-selected-clips", action="store_true", help="selected_clips の動画を1本に結合します")
     parser.add_argument("--concat-order-file", type=Path, default=None, help="結合順を1行1ファイルで指定するテキスト")
     parser.add_argument("--concat-output", type=Path, default=None, help="結合後の出力ファイル")
@@ -1003,15 +1005,21 @@ def cleanup_after_cut(
     confirm_delete: bool,
     dry_run: bool,
     include_review_frames: bool,
+    include_review_photos: bool,
     include_work: bool,
+    include_selected_clips: bool,
 ) -> int:
     logs = root / "logs"
     setup_logging(logs)
     cleanup_targets = [root / "selected_frames"]
     if include_review_frames:
         cleanup_targets.append(root / "review" / "frames")
+    if include_review_photos:
+        cleanup_targets.append(root / "review" / "photos")
     if include_work:
         cleanup_targets.append(root / "work")
+    if include_selected_clips:
+        cleanup_targets.append(root / "selected_clips")
 
     actual_delete = confirm_delete and not dry_run
     rows: list[dict[str, object]] = []
@@ -1141,7 +1149,9 @@ def main() -> int:
             args.confirm_delete,
             args.dry_run,
             args.include_review_frames,
+            args.include_review_photos,
             args.include_work,
+            args.include_selected_clips,
         )
     if args.cut_from_selected_frames:
         return cut_from_selected_frames(
