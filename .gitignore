@@ -10,6 +10,9 @@ review/photos/*
 review/frames/*
 selected_photos/*
 selected_frames/*
+selected_clips/*
+final/*
+work/*
 logs/*
 
 # 空フォルダだけは保持する
@@ -19,6 +22,9 @@ logs/*
 !review/frames/.gitkeep
 !selected_photos/.gitkeep
 !selected_frames/.gitkeep
+!selected_clips/.gitkeep
+!final/.gitkeep
+!work/.gitkeep
 !logs/.gitkeep
 
 # ローカル設定・機密情報
