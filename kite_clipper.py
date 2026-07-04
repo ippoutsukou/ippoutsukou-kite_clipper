@@ -3,9 +3,14 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import multiprocessing
+import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +29,23 @@ PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv"}
 FRAME_NAME_PATTERN = re.compile(r"^(?P<video_stem>.+)__t(?P<time>\d+(?:\.\d+)?)$")
 LEGACY_FRAME_NAME_PATTERN = re.compile(r"^(?P<video_stem>.+)_(?P<number>\d{6})$")
+
+
+def app_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def bundled_tool_path(tool_name: str) -> str:
+    bundled = app_base_dir() / "vendor" / "ffmpeg" / "windows-x64" / f"{tool_name}.exe"
+    if bundled.exists():
+        return str(bundled)
+    return tool_name
+
+
+def ffmpeg_path(path: Path) -> str:
+    return path.resolve().as_posix()
 
 
 @dataclass
@@ -143,12 +165,44 @@ def parse_args() -> argparse.Namespace:
 
 def setup_logging(log_dir: Path) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "error.log"
+    log_file.touch(exist_ok=True)
     logging.basicConfig(
-        filename=log_dir / "error.log",
+        filename=str(log_file),
         level=logging.ERROR,
         format="%(asctime)s [%(levelname)s] %(message)s",
         encoding="utf-8",
     )
+
+
+def ensure_runtime_dirs(root: Path) -> None:
+    for relative in [
+        "input/photos",
+        "input/videos",
+        "review/photos",
+        "review/frames",
+        "selected_frames",
+        "selected_clips",
+        "final",
+        "logs",
+        "work",
+    ]:
+        (root / relative).mkdir(parents=True, exist_ok=True)
+
+
+def write_dict_csv(csv_path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    file = csv_path.open("w", newline="", encoding="utf-8-sig")
+    try:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    finally:
+        try:
+            file.close()
+        except OSError as exc:
+            if exc.errno != 9:
+                raise
 
 
 def iter_files(directory: Path, extensions: set[str]) -> Iterable[Path]:
@@ -174,7 +228,7 @@ def analyze_photo(
     dark_threshold: float,
     min_width: int,
     min_height: int,
-) -> PhotoAnalysis | None:
+) -> PhotoAnalysis:
     image = read_image(path)
     if image is None:
         raise ValueError(f"画像として読み込めません: {path}")
@@ -242,6 +296,21 @@ def analyze_frame(
     )
 
 
+def analyze_frame_task(
+    frame_path: Path,
+    blur_threshold: float,
+    dark_threshold: float,
+    min_width: int,
+    min_height: int,
+) -> tuple[Path, FrameAnalysis | None, str]:
+    # ProcessPoolExecutorの子プロセスで実行するため、例外は文字列にして持ち帰ります。
+    try:
+        analysis = analyze_frame(frame_path, blur_threshold, dark_threshold, min_width, min_height)
+        return frame_path, analysis, ""
+    except Exception as exc:
+        return frame_path, None, str(exc)
+
+
 def resized_for_detection(image: np.ndarray, max_width: int = 960) -> np.ndarray:
     height, width = image.shape[:2]
     if width <= max_width:
@@ -250,10 +319,21 @@ def resized_for_detection(image: np.ndarray, max_width: int = 960) -> np.ndarray
     return cv2.resize(image, (max_width, int(height * scale)), interpolation=cv2.INTER_AREA)
 
 
+_HOG_DETECTOR: cv2.HOGDescriptor | None = None
+
+
+def get_hog_detector() -> cv2.HOGDescriptor:
+    # HOGDescriptorの生成は重いので、最初の1回だけ作って使い回します。
+    global _HOG_DETECTOR
+    if _HOG_DETECTOR is None:
+        _HOG_DETECTOR = cv2.HOGDescriptor()
+        _HOG_DETECTOR.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    return _HOG_DETECTOR
+
+
 def detect_person_candidate(image: np.ndarray) -> bool:
     detection_image = resized_for_detection(image, 640)
-    hog = cv2.HOGDescriptor()
-    hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    hog = get_hog_detector()
     rects, weights = hog.detectMultiScale(
         detection_image,
         winStride=(8, 8),
@@ -370,6 +450,123 @@ def extract_video_frames(video_path: Path, output_dir: Path, interval: float) ->
         raise ValueError("--frame-interval は 0 より大きい値にしてください")
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ffmpegでの抽出はOpenCVのシーク方式より大幅に速いため、まずffmpegを試します。
+    # 1秒以上の間隔ならキーフレームのみのデコード（最速）で近い間隔の抽出ができます。
+    if interval >= 1.0:
+        try:
+            return extract_frames_keyframe(video_path, output_dir, interval)
+        except Exception:
+            logging.exception("キーフレーム抽出に失敗したためfps方式で再試行します: %s", video_path)
+    try:
+        return extract_frames_ffmpeg_fps(video_path, output_dir, interval)
+    except Exception:
+        logging.exception("ffmpeg抽出に失敗したためOpenCV方式で再試行します: %s", video_path)
+        return extract_frames_opencv(video_path, output_dir, interval)
+
+
+SHOWINFO_PTS_PATTERN = re.compile(r"pts_time:(\d+(?:\.\d+)?)")
+
+
+def thin_by_interval(times: list[float], interval: float) -> list[int]:
+    # interval未満の間隔で並ぶキーフレームを間引き、採用するインデックスを返します。
+    selected: list[int] = []
+    last_kept = None
+    for index, time_sec in enumerate(times):
+        if last_kept is None or time_sec - last_kept >= interval - 0.5:
+            selected.append(index)
+            last_kept = time_sec
+    return selected
+
+
+def extract_frames_keyframe(video_path: Path, output_dir: Path, interval: float) -> list[Path]:
+    video_stem = safe_stem(video_path)
+
+    with tempfile.TemporaryDirectory(dir=str(output_dir), prefix=".extract_") as temp_name:
+        temp_dir = Path(temp_name)
+        # showinfoフィルタで「実際に出力したフレームの時刻」をstderrに出させて、
+        # 出力ファイルと1対1でペアリングします（事前予測だと数がズレることがあるため）。
+        command = [
+            bundled_tool_path("ffmpeg"),
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-nostats",
+            "-y",
+            "-discard",
+            "nokey",
+            "-i",
+            ffmpeg_path(video_path),
+            "-map",
+            "0:v:0",
+            "-vf",
+            "showinfo",
+            "-fps_mode",
+            "passthrough",
+            "-q:v",
+            "2",
+            ffmpeg_path(temp_dir / "frame_%06d.jpg"),
+        ]
+        result = run_ffmpeg(command)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "ffmpeg keyframe extract failed")
+
+        frame_times = [float(value) for value in SHOWINFO_PTS_PATTERN.findall(result.stderr)]
+        extracted = sorted(temp_dir.glob("frame_*.jpg"))
+        if not extracted or len(extracted) != len(frame_times):
+            raise RuntimeError(
+                f"フレーム時刻を取得できません: 出力{len(extracted)}枚 時刻{len(frame_times)}件"
+            )
+
+        selected_indexes = set(thin_by_interval(frame_times, interval))
+        frame_paths: list[Path] = []
+        for index, extracted_path in enumerate(extracted):
+            if index not in selected_indexes:
+                continue
+            frame_path = output_dir / f"{video_stem}__t{format_timestamp(frame_times[index])}.jpg"
+            shutil.move(str(extracted_path), str(frame_path))
+            frame_paths.append(frame_path)
+        return frame_paths
+
+
+def extract_frames_ffmpeg_fps(video_path: Path, output_dir: Path, interval: float) -> list[Path]:
+    video_stem = safe_stem(video_path)
+    with tempfile.TemporaryDirectory(dir=str(output_dir), prefix=".extract_") as temp_name:
+        temp_dir = Path(temp_name)
+        command = [
+            bundled_tool_path("ffmpeg"),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            ffmpeg_path(video_path),
+            "-map",
+            "0:v:0",
+            "-vf",
+            f"fps=1/{interval}",
+            "-q:v",
+            "2",
+            ffmpeg_path(temp_dir / "frame_%06d.jpg"),
+        ]
+        result = run_ffmpeg(command)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "ffmpeg fps extract failed")
+
+        extracted = sorted(temp_dir.glob("frame_*.jpg"))
+        if not extracted:
+            raise RuntimeError(f"フレームを抽出できません: {video_path}")
+
+        frame_paths: list[Path] = []
+        for index, extracted_path in enumerate(extracted):
+            time_sec = index * interval
+            frame_path = output_dir / f"{video_stem}__t{format_timestamp(time_sec)}.jpg"
+            shutil.move(str(extracted_path), str(frame_path))
+            frame_paths.append(frame_path)
+        return frame_paths
+
+
+def extract_frames_opencv(video_path: Path, output_dir: Path, interval: float) -> list[Path]:
     video_stem = safe_stem(video_path)
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
@@ -443,10 +640,7 @@ def write_result_csv(csv_path: Path, rows: list[dict[str, object]]) -> None:
         "status",
         "message",
     ]
-    with csv_path.open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    write_dict_csv(csv_path, fieldnames, rows)
 
 
 def photo_row(photo: PhotoAnalysis) -> dict[str, object]:
@@ -668,17 +862,23 @@ def group_selected_frames(frames: list[SelectedFrame], split_gap: float) -> list
 
 def get_video_duration(video_path: Path) -> float:
     command = [
-        "ffprobe",
+        bundled_tool_path("ffprobe"),
         "-v",
         "error",
         "-show_entries",
         "format=duration",
         "-of",
         "default=noprint_wrappers=1:nokey=1",
-        str(video_path),
+        ffmpeg_path(video_path),
     ]
     try:
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
     except Exception:
         return 0.0
     if result.returncode != 0:
@@ -699,7 +899,7 @@ def cut_video_clip(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     duration = max(0.1, end_sec - start_sec)
     command = [
-        "ffmpeg",
+        bundled_tool_path("ffmpeg"),
         "-hide_banner",
         "-loglevel",
         "error",
@@ -707,7 +907,7 @@ def cut_video_clip(
         "-ss",
         format_seconds(start_sec),
         "-i",
-        str(video_path),
+        ffmpeg_path(video_path),
         "-t",
         format_seconds(duration),
     ]
@@ -716,21 +916,26 @@ def cut_video_clip(
     else:
         command.extend([
             "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "18",
+            "libopenh264",
+            "-b:v",
+            "8M",
+            "-pix_fmt",
+            "yuv420p",
             "-c:a",
             "aac",
             "-movflags",
             "+faststart",
         ])
-    command.append(str(output_path))
-    result = subprocess.run(command, capture_output=True, text=True)
+    command.append(ffmpeg_path(output_path))
+    result = run_ffmpeg(command)
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip() or "ffmpeg failed"
         raise RuntimeError(message)
+
+
+def run_ffmpeg(command: list[str]) -> subprocess.CompletedProcess[str]:
+    # Windowsの既定エンコーディング(cp932)だとffmpegのUTF-8出力が化けるため明示します。
+    return subprocess.run(command, capture_output=True, encoding="utf-8", errors="replace")
 
 
 def clip_cut_row(
@@ -775,10 +980,7 @@ def write_clip_cuts_csv(csv_path: Path, rows: list[dict[str, object]]) -> None:
         "status",
         "message",
     ]
-    with csv_path.open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    write_dict_csv(csv_path, fieldnames, rows)
 
 
 def concat_selected_clips(
@@ -905,21 +1107,21 @@ def normalize_clip(input_path: Path, output_path: Path, width: int, height: int,
         raise ValueError(f"未対応のfitです: {fit}")
 
     command = [
-        "ffmpeg",
+        bundled_tool_path("ffmpeg"),
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
         "-i",
-        str(input_path),
+        ffmpeg_path(input_path),
         "-vf",
         video_filter,
         "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "18",
+        "libopenh264",
+        "-b:v",
+        "8M",
+        "-pix_fmt",
+        "yuv420p",
         "-c:a",
         "aac",
         "-ar",
@@ -928,9 +1130,9 @@ def normalize_clip(input_path: Path, output_path: Path, width: int, height: int,
         "2",
         "-movflags",
         "+faststart",
-        str(output_path),
+        ffmpeg_path(output_path),
     ]
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = run_ffmpeg(command)
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip() or "ffmpeg normalize failed"
         raise RuntimeError(message)
@@ -939,7 +1141,7 @@ def normalize_clip(input_path: Path, output_path: Path, width: int, height: int,
 def concat_video_clips(concat_list: Path, output_path: Path, fast_copy: bool) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     command = [
-        "ffmpeg",
+        bundled_tool_path("ffmpeg"),
         "-hide_banner",
         "-loglevel",
         "error",
@@ -949,25 +1151,25 @@ def concat_video_clips(concat_list: Path, output_path: Path, fast_copy: bool) ->
         "-safe",
         "0",
         "-i",
-        str(concat_list),
+        ffmpeg_path(concat_list),
     ]
     if fast_copy:
         command.extend(["-c", "copy"])
     else:
         command.extend([
             "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "18",
+            "libopenh264",
+            "-b:v",
+            "8M",
+            "-pix_fmt",
+            "yuv420p",
             "-c:a",
             "aac",
             "-movflags",
             "+faststart",
         ])
-    command.append(str(output_path))
-    result = subprocess.run(command, capture_output=True, text=True)
+    command.append(ffmpeg_path(output_path))
+    result = run_ffmpeg(command)
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip() or "ffmpeg failed"
         raise RuntimeError(message)
@@ -994,10 +1196,7 @@ def concat_row(
 def write_concat_csv(csv_path: Path, rows: list[dict[str, object]]) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = ["order", "clip_path", "duration_sec", "output_path", "status", "message"]
-    with csv_path.open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    write_dict_csv(csv_path, fieldnames, rows)
 
 
 def cleanup_after_cut(
@@ -1072,27 +1271,7 @@ def cleanup_review(root: Path, confirm_delete: bool, dry_run: bool) -> int:
     rows: list[dict[str, object]] = []
 
     for target_dir in cleanup_targets:
-        try:
-            target_dir.mkdir(parents=True, exist_ok=True)
-            for target in sorted(path for path in target_dir.rglob("*") if path.is_file()):
-                if target.name == ".gitkeep":
-                    rows.append(cleanup_row(target, target_dir, "skipped", "ok", "keep marker"))
-                    continue
-                if not is_relative_to(target.resolve(), target_dir.resolve()):
-                    rows.append(cleanup_row(target, target_dir, "skipped", "error", "outside cleanup directory"))
-                    continue
-                try:
-                    if actual_delete:
-                        target.unlink()
-                        rows.append(cleanup_row(target, target_dir, "deleted", "ok", ""))
-                    else:
-                        rows.append(cleanup_row(target, target_dir, "would_delete", "ok", "dry run"))
-                except Exception as exc:
-                    logging.exception("review整理エラー: %s", target)
-                    rows.append(cleanup_row(target, target_dir, "error", "error", str(exc)))
-        except Exception as exc:
-            logging.exception("review整理ディレクトリエラー: %s", target_dir)
-            rows.append(cleanup_row(target_dir, target_dir, "error", "error", str(exc)))
+        rows.extend(cleanup_files_in_directory(target_dir, actual_delete))
 
     write_cleanup_csv(logs / "cleanup.csv", rows)
     action_label = "削除" if actual_delete else "削除予定"
@@ -1132,15 +1311,58 @@ def cleanup_row(
 def write_cleanup_csv(csv_path: Path, rows: list[dict[str, object]]) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = ["path", "cleanup_dir", "action", "status", "message"]
-    with csv_path.open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    write_dict_csv(csv_path, fieldnames, rows)
+
+
+def analyze_frames(
+    frame_jobs: list[tuple[Path, Path]],
+    blur_threshold: float,
+    dark_threshold: float,
+    min_width: int,
+    min_height: int,
+) -> list[dict[str, object]]:
+    if not frame_jobs:
+        return []
+
+    video_by_frame = {frame_path: video_path for video_path, frame_path in frame_jobs}
+    frame_paths = [frame_path for _video_path, frame_path in frame_jobs]
+    # 判定（特にHOG人物検出）が最も重いため、フレーム数が多いときは並列実行します。
+    # 1コアはOSとGUIのために空けておきます。
+    max_workers = max(1, (os.cpu_count() or 2) - 1)
+    rows: list[dict[str, object]] = []
+
+    if max_workers == 1 or len(frame_paths) <= 4:
+        results = [
+            analyze_frame_task(frame_path, blur_threshold, dark_threshold, min_width, min_height)
+            for frame_path in frame_paths
+        ]
+    else:
+        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+            results = list(
+                pool.map(
+                    analyze_frame_task,
+                    frame_paths,
+                    [blur_threshold] * len(frame_paths),
+                    [dark_threshold] * len(frame_paths),
+                    [min_width] * len(frame_paths),
+                    [min_height] * len(frame_paths),
+                )
+            )
+
+    for frame_path, analysis, error_message in results:
+        video_path = video_by_frame[frame_path]
+        if analysis is not None:
+            rows.append(frame_row(video_path, analysis))
+        else:
+            logging.error("フレーム判定エラー: %s (%s)", frame_path, error_message)
+            rows.append(error_row("frame", frame_path, error_message))
+    return rows
 
 
 def main() -> int:
     args = parse_args()
     root = args.root.resolve()
+    ensure_runtime_dirs(root)
     if args.cleanup_review:
         return cleanup_review(root, args.confirm_delete, args.dry_run)
     if args.cleanup_after_cut:
@@ -1183,15 +1405,15 @@ def main() -> int:
 
     for photo_path in iter_files(input_photos, PHOTO_EXTENSIONS):
         try:
-            analysis = analyze_photo(
-                photo_path,
-                args.blur_threshold,
-                args.dark_threshold,
-                args.min_width,
-                args.min_height,
+            photos.append(
+                analyze_photo(
+                    photo_path,
+                    args.blur_threshold,
+                    args.dark_threshold,
+                    args.min_width,
+                    args.min_height,
+                )
             )
-            if analysis:
-                photos.append(analysis)
         except Exception as exc:
             logging.exception("写真処理エラー: %s", photo_path)
             rows.append(error_row("photo", photo_path, str(exc)))
@@ -1206,25 +1428,24 @@ def main() -> int:
             rows.append(error_row("photo_copy", review_photos, str(exc)))
         rows.extend(photo_row(photo) for photo in photos)
 
+    frame_jobs: list[tuple[Path, Path]] = []
     for video_path in iter_files(input_videos, VIDEO_EXTENSIONS):
         try:
             frames = extract_video_frames(video_path, review_frames, args.frame_interval)
-            for frame_path in frames:
-                try:
-                    frame = analyze_frame(
-                        frame_path,
-                        args.blur_threshold,
-                        args.dark_threshold,
-                        args.min_width,
-                        args.min_height,
-                    )
-                    rows.append(frame_row(video_path, frame))
-                except Exception as exc:
-                    logging.exception("フレーム判定エラー: %s", frame_path)
-                    rows.append(error_row("frame", frame_path, str(exc)))
+            frame_jobs.extend((video_path, frame_path) for frame_path in frames)
         except Exception as exc:
             logging.exception("動画フレーム抽出エラー: %s", video_path)
             rows.append(error_row("video", video_path, str(exc)))
+
+    rows.extend(
+        analyze_frames(
+            frame_jobs,
+            args.blur_threshold,
+            args.dark_threshold,
+            args.min_width,
+            args.min_height,
+        )
+    )
 
     write_result_csv(logs / "result.csv", rows)
     print(f"完了: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1234,4 +1455,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # PyInstallerでexe化した際にProcessPoolExecutorの子プロセスを正しく起動するために必要です。
+    multiprocessing.freeze_support()
     raise SystemExit(main())

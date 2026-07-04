@@ -49,3 +49,27 @@ python .\kite_clipper.py --blur-threshold 120 --dark-threshold 70 --min-width 12
 ## 出力 CSV
 
 `logs/result.csv` には、写真ごとの判定結果、選択有無、コピー先、動画フレームの抽出結果、エラー行が保存されます。
+## FFmpeg の同梱配布
+
+このアプリは `vendor/ffmpeg/windows-x64/ffmpeg.exe` と
+`vendor/ffmpeg/windows-x64/ffprobe.exe` が存在する場合、それらを優先して使います。
+存在しない場合は、従来どおり PATH 上の `ffmpeg` / `ffprobe` を使います。
+
+配布時は LGPL 版 FFmpeg のみを同梱してください。GPL 版または nonfree 版は同梱しないでください。
+
+配布前に次を確認します。
+
+```powershell
+.\vendor\ffmpeg\windows-x64\ffmpeg.exe -version
+.\vendor\ffmpeg\windows-x64\ffprobe.exe -version
+```
+
+表示される configure 行に、次の文字列が含まれていないことを確認してください。
+
+```text
+--enable-gpl
+--enable-nonfree
+```
+
+同梱する場合は、FFmpeg のライセンス文、ソース入手先、ビルド情報を
+`vendor/ffmpeg/windows-x64/` に残してください。
