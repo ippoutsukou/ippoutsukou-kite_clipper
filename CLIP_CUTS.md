@@ -100,9 +100,11 @@ logs/clip_cuts.csv
 出力:
 
 ```text
-final/final_video.mp4
+final/final_video_<日時>.mp4
 logs/concat_clips.csv
 ```
+
+結合するたびに実行日時付きの名前で保存されるため、過去の結合結果は上書きされません。
 
 順番を変えたい場合は、GUIを使って `selected_clips` の一覧を上へ/下へで並べ替えてから結合します。
 

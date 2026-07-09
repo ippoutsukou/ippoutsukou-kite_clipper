@@ -10,9 +10,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -46,6 +47,51 @@ def bundled_tool_path(tool_name: str) -> str:
 
 def ffmpeg_path(path: Path) -> str:
     return path.resolve().as_posix()
+
+
+_VIDEO_ENCODER: str | None = None
+
+
+def detect_video_encoder() -> str:
+    # 対応していればハードウェアエンコーダ（Quick Sync / Media Foundation）を使い、
+    # 使えない環境ではソフトウェアエンコーダにフォールバックします。速度差が大きいため、
+    # プロセス内で一度だけ判定してキャッシュします。
+    global _VIDEO_ENCODER
+    if _VIDEO_ENCODER is not None:
+        return _VIDEO_ENCODER
+    for candidate in ("h264_qsv", "h264_mf", "libopenh264"):
+        if candidate == "libopenh264" or _can_encode(candidate):
+            _VIDEO_ENCODER = candidate
+            break
+    return _VIDEO_ENCODER
+
+
+def _can_encode(encoder_name: str) -> bool:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        probe_output = Path(temp_dir) / "probe.mp4"
+        command = [
+            bundled_tool_path("ffmpeg"),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=size=320x240:rate=10:duration=0.3",
+            "-pix_fmt",
+            "yuv420p",
+            "-frames:v",
+            "3",
+            "-c:v",
+            encoder_name,
+            ffmpeg_path(probe_output),
+        ]
+        try:
+            result = run_ffmpeg(command)
+        except Exception:
+            return False
+        return result.returncode == 0 and probe_output.exists() and probe_output.stat().st_size > 0
 
 
 @dataclass
@@ -119,6 +165,18 @@ class SelectedFrame:
     path: Path
     video_stem: str
     time_sec: float
+
+
+@dataclass
+class CutJob:
+    video_stem: str
+    video_path: Path
+    output_path: Path
+    start_sec: float
+    end_sec: float
+    first_frame: Path
+    last_frame: Path
+    frame_count: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -721,6 +779,56 @@ def frame_row(video_path: Path, frame: FrameAnalysis) -> dict[str, object]:
     }
 
 
+def run_cut_job(job: CutJob, fast_copy: bool) -> dict[str, object]:
+    try:
+        cut_video_clip(job.video_path, job.output_path, job.start_sec, job.end_sec, fast_copy)
+        return clip_cut_row(
+            job.video_stem,
+            job.video_path,
+            job.first_frame,
+            job.last_frame,
+            job.start_sec,
+            job.end_sec,
+            job.output_path,
+            "ok",
+            f"{job.frame_count} selected frames",
+        )
+    except Exception as exc:
+        logging.exception("動画切り出しエラー: %s", job.video_path)
+        return clip_cut_row(
+            job.video_stem,
+            job.video_path,
+            job.first_frame,
+            job.last_frame,
+            job.start_sec,
+            job.end_sec,
+            job.output_path,
+            "error",
+            str(exc),
+        )
+
+
+def clip_worker_count(fast_copy: bool) -> int:
+    cpu_count = os.cpu_count() or 2
+    if fast_copy:
+        # 再エンコードなし（ストリームコピー）はCPU負荷が軽いため、コア数に応じて並列化します。
+        return max(1, min(4, cpu_count))
+    if detect_video_encoder() in ("h264_qsv", "h264_mf", "h264_amf", "h264_nvenc"):
+        # ハードウェアエンコーダは同時セッション数に制限があることが多いため、控えめにします。
+        return 2
+    return max(1, min(4, cpu_count - 1))
+
+
+def run_cut_jobs(jobs: list[CutJob], fast_copy: bool) -> list[dict[str, object]]:
+    if not jobs:
+        return []
+    worker_count = clip_worker_count(fast_copy)
+    if worker_count <= 1 or len(jobs) <= 1:
+        return [run_cut_job(job, fast_copy) for job in jobs]
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        return list(pool.map(lambda job: run_cut_job(job, fast_copy), jobs))
+
+
 def cut_from_selected_frames(
     root: Path,
     split_gap: float,
@@ -747,6 +855,7 @@ def cut_from_selected_frames(
             logging.exception("selected_frames解析エラー: %s", frame_path)
             rows.append(clip_cut_row("", "", "", "", "", "", "", "error", str(exc)))
 
+    jobs: list[CutJob] = []
     for video_stem, frames in sorted(frames_by_video.items()):
         video_path = videos_by_stem.get(video_stem)
         if not video_path:
@@ -773,36 +882,20 @@ def cut_from_selected_frames(
                 f"__t{format_timestamp(start_sec)}_t{format_timestamp(end_sec)}.mp4"
             )
             output_path = unique_output_path(selected_clips, output_name)
-            try:
-                cut_video_clip(video_path, output_path, start_sec, end_sec, fast_copy)
-                rows.append(
-                    clip_cut_row(
-                        video_stem,
-                        video_path,
-                        first.path,
-                        last.path,
-                        start_sec,
-                        end_sec,
-                        output_path,
-                        "ok",
-                        f"{len(group)} selected frames",
-                    )
+            jobs.append(
+                CutJob(
+                    video_stem=video_stem,
+                    video_path=video_path,
+                    output_path=output_path,
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                    first_frame=first.path,
+                    last_frame=last.path,
+                    frame_count=len(group),
                 )
-            except Exception as exc:
-                logging.exception("動画切り出しエラー: %s", video_path)
-                rows.append(
-                    clip_cut_row(
-                        video_stem,
-                        video_path,
-                        first.path,
-                        last.path,
-                        start_sec,
-                        end_sec,
-                        output_path,
-                        "error",
-                        str(exc),
-                    )
-                )
+            )
+
+    rows.extend(run_cut_jobs(jobs, fast_copy))
 
     write_clip_cuts_csv(logs / "clip_cuts.csv", rows)
     ok_count = sum(1 for row in rows if row["status"] == "ok")
@@ -889,6 +982,55 @@ def get_video_duration(video_path: Path) -> float:
         return 0.0
 
 
+@lru_cache(maxsize=None)
+def get_video_resolution(video_path: Path) -> tuple[int, int]:
+    # 同じ動画から多数のクリップを切り出すため、パスごとに結果をキャッシュします。
+    # 取得に失敗した場合は 1920x1080（12M相当）を安全側の既定値として返します。
+    command = [
+        bundled_tool_path("ffprobe"),
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=p=0",
+        ffmpeg_path(video_path),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except Exception:
+        return 1920, 1080
+    if result.returncode != 0:
+        return 1920, 1080
+    try:
+        first_line = result.stdout.strip().splitlines()[0]
+        width_str, height_str = first_line.split(",")[:2]
+        return int(width_str), int(height_str)
+    except (ValueError, IndexError):
+        return 1920, 1080
+
+
+def bitrate_for_resolution(width: int, height: int) -> str:
+    # 出力解像度に応じた再エンコードのビットレート。ピクセル数で判定する
+    # （縦横どちら向きでも同じ扱いにするため）。
+    pixels = width * height
+    if pixels >= int(3840 * 2160 * 0.9):
+        return "40M"
+    if pixels >= int(2560 * 1440 * 0.9):
+        return "24M"
+    if pixels >= int(1920 * 1080 * 0.9):
+        return "12M"
+    return "8M"
+
+
 def cut_video_clip(
     video_path: Path,
     output_path: Path,
@@ -914,11 +1056,12 @@ def cut_video_clip(
     if fast_copy:
         command.extend(["-c", "copy"])
     else:
+        width, height = get_video_resolution(video_path)
         command.extend([
             "-c:v",
-            "libopenh264",
+            detect_video_encoder(),
             "-b:v",
-            "8M",
+            bitrate_for_resolution(width, height),
             "-pix_fmt",
             "yuv420p",
             "-c:a",
@@ -996,7 +1139,12 @@ def concat_selected_clips(
     selected_clips = root / "selected_clips"
     final_dir = root / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
-    output = output_path if output_path else final_dir / "final_video.mp4"
+    if output_path:
+        output = output_path
+    else:
+        # 既定の出力名を日時付きにして、過去の結合結果を上書きしないようにします。
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output = final_dir / f"final_video_{timestamp}.mp4"
     if not output.is_absolute():
         output = root / output
 
@@ -1018,7 +1166,11 @@ def concat_selected_clips(
 
         concat_list = logs / "concat_list.txt"
         write_ffmpeg_concat_list(concat_list, concat_inputs)
-        concat_video_clips(concat_list, output, fast_copy)
+        # concat_inputs の先頭クリップ（normalize済みならその出力ファイル）を probe して
+        # ビットレートを決めることで、正規化の有無にかかわらず一律に扱えます。
+        concat_width, concat_height = get_video_resolution(concat_inputs[0])
+        concat_bitrate = bitrate_for_resolution(concat_width, concat_height)
+        concat_video_clips(concat_list, output, fast_copy, concat_bitrate)
         for index, clip in enumerate(clips, start=1):
             rows.append(concat_row(index, clip, get_video_duration(clip), output, "ok", f"{normalize}/{fit}"))
     except Exception as exc:
@@ -1117,9 +1269,9 @@ def normalize_clip(input_path: Path, output_path: Path, width: int, height: int,
         "-vf",
         video_filter,
         "-c:v",
-        "libopenh264",
+        detect_video_encoder(),
         "-b:v",
-        "8M",
+        bitrate_for_resolution(width, height),
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -1138,7 +1290,12 @@ def normalize_clip(input_path: Path, output_path: Path, width: int, height: int,
         raise RuntimeError(message)
 
 
-def concat_video_clips(concat_list: Path, output_path: Path, fast_copy: bool) -> None:
+def concat_video_clips(
+    concat_list: Path,
+    output_path: Path,
+    fast_copy: bool,
+    video_bitrate: str = "8M",
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     command = [
         bundled_tool_path("ffmpeg"),
@@ -1158,9 +1315,9 @@ def concat_video_clips(concat_list: Path, output_path: Path, fast_copy: bool) ->
     else:
         command.extend([
             "-c:v",
-            "libopenh264",
+            detect_video_encoder(),
             "-b:v",
-            "8M",
+            video_bitrate,
             "-pix_fmt",
             "yuv420p",
             "-c:a",

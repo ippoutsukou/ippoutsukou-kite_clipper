@@ -37,24 +37,31 @@ PowerShellで次を実行します。
 4. 「切り出し」
 5. selected_clips の順番を上へ/下へで調整
 6. 「結合」
-7. final/final_video.mp4 を確認
+7. final/final_video_<日時>.mp4 を確認
 ```
 
 フレーム選別ビューアの操作:
 
 ```text
 クリック          採用/解除（採用 = selected_frames へコピー）
-Shift+クリック    直前の操作と同じ状態を範囲にまとめて適用
+Shift+クリック    アンカー（最後に操作したフレーム）から、その現在の状態をそこまで範囲適用
 矢印キー          フォーカス移動
-Space             フォーカス中のフレームを採用/解除
+Space             フォーカス中のフレームを採用/解除（ここがアンカーになる）
+Shift+Space       アンカーからフォーカス位置まで範囲適用
 右クリック        元画像を既定のビューアで開く
 ```
 
+範囲適用は「アンカーの今の状態に揃える」動きです。
+Spaceで採用してから範囲適用すればまとめて採用、
+Spaceで解除してから範囲適用すればまとめて解除になります。
+キー操作はサムネイル一覧をクリックしてから使ってください（一覧にフォーカスがある間だけ効きます）。
+
 - 解除すると `selected_frames` 内のコピーだけが削除されます。`review/frames` の元画像は残ります。
-- 上部で動画ごとの絞り込みとサムネイルサイズ（小/中/大）を切り替えられます。
+- 上部で動画ごとの絞り込みとサムネイルサイズ（小/中/大/特大）を切り替えられます。
 - `logs/result.csv` にNG判定があるフレームには「NG」バッジが付き、「NG候補を隠す」で非表示にできます（ファイルは削除されません）。
+- 元動画の音声を解析し、音量が動画全体の中央値より明らかに大きい秒（歓声・声など）の前後のフレームにオレンジの「♪」バッジが付きます。良いシーン探しの手がかりに使えます。音声なし動画ではバッジは付きません。
 - 上部に選択枚数・推定クリップ本数・推定合計時間（前後余白込み）が常時表示されるため、結合前に尺を確認できます。
-- サムネイルは `work/frame_thumbs` にキャッシュされ、2回目以降は速く開きます。
+- サムネイルは `work/frame_thumbs` に、音量解析結果は `work/audio_peaks` にキャッシュされ、2回目以降は速く開きます。
 
 従来どおりエクスプローラーで `selected_frames` にコピーする方法も併用できます。
 
@@ -130,6 +137,41 @@ logs/clip_cuts.csv
 .\.venv\Scripts\python.exe .\kite_clipper.py --cut-from-selected-frames --split-gap 3
 ```
 
+## 4.5 選別結果を学習データとして記録する
+
+選別結果（採用=OK / 非採用=NG）を、将来のAI半自動トリミング機能の学習データとして
+`dataset/labels.csv` に蓄積します。手順5のクリーンアップで `review/frames` を削除すると
+元画像を参照できなくなるため、削除する前に実行してください。
+
+まず件数だけ確認します（dry-run）。
+
+```powershell
+.\.venv\Scripts\python.exe .\record_labels.py --dry-run
+```
+
+問題なければ記録を実行します。
+
+```powershell
+.\.venv\Scripts\python.exe .\record_labels.py
+```
+
+出力:
+
+```text
+dataset/labels.csv        # ラベル+特徴量(追記式)
+dataset/frames/<動画名>/  # 学習用の縮小画像(長辺640px)
+```
+
+補足オプション:
+
+```text
+--no-images              CSVのみ記録し、画像コピーをしません
+--max-side N             コピーする画像の長辺ピクセルを変更します（既定640）
+--allow-empty-selection  採用フレームが0件でも、全フレームをNGとして記録します
+```
+
+この手順は任意です。実行しなくても手順5以降に影響はありません。
+
 ## 5. 切り出し後に不要ファイルを整理する
 
 GUIでは「削除予定を確認」で対象を確認し、「selected_frames を削除」で削除します。
@@ -195,9 +237,12 @@ logs/cleanup_after_cut.csv
 出力:
 
 ```text
-final/final_video.mp4
+final/final_video_<日時>.mp4   例: final_video_20260704_204438.mp4
 logs/concat_clips.csv
 ```
+
+結合するたびに実行日時付きの新しいファイル名で保存されるため、過去の結合結果は上書きされずに残ります。
+出力名を自分で指定したい場合は `--concat-output 出力先.mp4` を付けます（この場合は同名なら上書きされます）。
 
 GUIでは `selected_clips` の一覧にクリップ時間が表示されます。
 上へ/下へで順番を調整してから「結合」を押してください。
@@ -251,4 +296,5 @@ logs/result.csv
 logs/clip_cuts.csv
 logs/cleanup_after_cut.csv
 logs/error.log
+dataset/labels.csv
 ```

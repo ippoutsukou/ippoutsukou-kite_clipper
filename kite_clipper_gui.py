@@ -35,12 +35,39 @@ THUMBNAIL_DIR = ROOT / "work" / "thumbnails"
 THUMBNAIL_MAX_WIDTH = 320
 THUMBNAIL_MAX_HEIGHT = 240
 
+# ワークフローのメイン4ボタン（生成→フレーム選別→切り出し→結合）用のアクセントカラー。
+# ttkテーマ（Windowsのデフォルトテーマ）はbg/fg指定を無視するため、
+# この4つだけ classic な tk.Button を使って目立たせます。
+ACCENT_BG = "#1a73e8"
+ACCENT_FG = "white"
+ACCENT_ACTIVE_BG = "#1558b0"
+ACCENT_ACTIVE_FG = "white"
+ACCENT_DISABLED_FG = "#c9d6ea"
+
 
 def bundled_tool_path(tool_name: str) -> str:
     bundled = app_base_dir() / "vendor" / "ffmpeg" / "windows-x64" / f"{tool_name}.exe"
     if bundled.exists():
         return str(bundled)
     return tool_name
+
+
+def _accent_button(parent: tk.Widget, text: str, command) -> tk.Button:
+    """ワークフローのメイン手順ボタン用に色付けした tk.Button を生成します。"""
+    return tk.Button(
+        parent,
+        text=text,
+        command=command,
+        bg=ACCENT_BG,
+        fg=ACCENT_FG,
+        activebackground=ACCENT_ACTIVE_BG,
+        activeforeground=ACCENT_ACTIVE_FG,
+        disabledforeground=ACCENT_DISABLED_FG,
+        relief=tk.RAISED,
+        padx=12,
+        pady=2,
+        font=("", 9, "bold"),
+    )
 
 
 def ffmpeg_path(path: Path) -> str:
@@ -51,8 +78,13 @@ class KiteClipperGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Media Clip Organizer")
-        self.geometry("1100x820")
-        self.minsize(960, 700)
+        # 画面からはみ出さないよう、起動サイズを画面の作業領域に合わせて調整します。
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        width = min(1100, screen_w - 80)
+        height = min(820, screen_h - 120)  # タスクバー分の余裕を見込む
+        self.geometry(f"{width}x{height}")
+        self.minsize(900, 560)
         self.clip_paths: list[Path] = []
         self.clip_durations: dict[Path, float] = {}
         self.clip_tags: dict[str, list[str]] = load_clip_tags()
@@ -75,20 +107,62 @@ class KiteClipperGui(tk.Tk):
         self.last_action: str | None = None
         self.normalize_mode = tk.StringVar(value="vertical")
         self.fit_mode = tk.StringVar(value="contain")
+        self.concat_info_var = tk.StringVar()
 
         self.frame_selector: FrameSelectorWindow | None = None
         self.status_var = tk.StringVar(value="待機中")
         self.counts_var = tk.StringVar(value="")
         self.total_duration_var = tk.StringVar(value="合計: 00:00.00")
-        # CLI実行中に無効化するボタン（多重実行の防止）
-        self.action_buttons: list[ttk.Button] = []
+        # CLI実行中に無効化するボタン（多重実行の防止）。tk.Button（アクセント色ボタン）も含むため tk.Widget で受けます。
+        self.action_buttons: list[tk.Widget] = []
 
         self.create_widgets()
         self.refresh_all()
 
     def create_widgets(self) -> None:
-        main = ttk.Frame(self, padding=12)
-        main.pack(fill=tk.BOTH, expand=True)
+        # 低解像度の画面でも下部のボタンやログ欄が見切れないよう、
+        # メイン画面全体を Canvas + Scrollbar で縦スクロール可能にします。
+        canvas = tk.Canvas(self, highlightthickness=0)
+        v_scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=v_scrollbar.set)
+        v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        main = ttk.Frame(canvas, padding=12)
+        main_window = canvas.create_window((0, 0), window=main, anchor="nw")
+
+        def _on_main_configure(_event: object = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event: tk.Event) -> None:
+            # 内部フレームの幅は常にcanvas幅へ追従させます。
+            canvas.itemconfigure(main_window, width=event.width)
+            # canvasの高さがmainの要求高さ以上ある大画面では、従来通り
+            # main（セクション4など）がcanvasいっぱいに広がる見た目を維持します。
+            # 収まらない場合は高さ指定を外し、自然な高さでスクロールさせます。
+            if event.height >= main.winfo_reqheight():
+                canvas.itemconfigure(main_window, height=event.height)
+            else:
+                # height=0 を指定すると、canvas window item は内部ウィジェットの
+                # 要求サイズ（自然な高さ）に戻ります（空文字はTclErrorになるため使えません）。
+                canvas.itemconfigure(main_window, height=0)
+
+        main.bind("<Configure>", _on_main_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event: tk.Event) -> str | None:
+            # クリップ一覧やログ欄など、自前でホイールスクロールするウィジェットの上では
+            # canvas側のスクロールを行わず、そちらの操作を優先します。
+            widget = event.widget
+            while widget is not None:
+                widget_class = widget.winfo_class()
+                if widget_class in ("Listbox", "Text", "TCombobox"):
+                    return None
+                widget = getattr(widget, "master", None)
+            canvas.yview_scroll(-int(event.delta / 120), "units")
+            return "break"
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         top = ttk.Frame(main)
         top.pack(fill=tk.X)
@@ -124,12 +198,15 @@ class KiteClipperGui(tk.Tk):
             values=("1", "0.5", "0.25"),
             width=8,
         ).pack(side=tk.LEFT, padx=4)
-        generate_button = ttk.Button(generate_frame, text="生成", command=self.generate_candidates)
+        # ワークフロー手順①: 候補写真・切り出しフレームを生成
+        generate_button = _accent_button(generate_frame, "① 生成", self.generate_candidates)
         generate_button.pack(side=tk.LEFT, padx=8)
         self.action_buttons.append(generate_button)
-        ttk.Button(generate_frame, text="フレーム選別", command=self.open_frame_selector).pack(
-            side=tk.LEFT, padx=8
-        )
+        # 続く手順であることが分かるよう矢印を挟みます。
+        ttk.Label(generate_frame, text="→").pack(side=tk.LEFT)
+        # ワークフロー手順②: 生成したフレームを選別（action_buttonsには追加しない＝従来通り）
+        frame_selector_button = _accent_button(generate_frame, "② フレーム選別", self.open_frame_selector)
+        frame_selector_button.pack(side=tk.LEFT, padx=8)
         ttk.Button(generate_frame, text="review/frames を開く", command=lambda: self.open_folder(ROOT / "review" / "frames")).pack(
             side=tk.LEFT, padx=4
         )
@@ -149,7 +226,8 @@ class KiteClipperGui(tk.Tk):
             ttk.Label(cut_frame, text=label).pack(side=tk.LEFT, padx=(8, 4))
             ttk.Entry(cut_frame, textvariable=var, width=7).pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(cut_frame, text="高速コピー", variable=self.fast_copy).pack(side=tk.LEFT, padx=8)
-        cut_button = ttk.Button(cut_frame, text="切り出し", command=self.cut_from_selected_frames)
+        # ワークフロー手順③: selected_frames から動画を切り出し
+        cut_button = _accent_button(cut_frame, "③ 切り出し", self.cut_from_selected_frames)
         cut_button.pack(side=tk.LEFT, padx=8)
         dry_run_button = ttk.Button(cut_frame, text="削除予定を確認", command=self.cleanup_after_cut_dry_run)
         dry_run_button.pack(side=tk.LEFT, padx=4)
@@ -173,25 +251,27 @@ class KiteClipperGui(tk.Tk):
         normalize_frame = ttk.Frame(concat_frame)
         normalize_frame.pack(fill=tk.X, padx=8, pady=(8, 0))
         ttk.Label(normalize_frame, text="最終サイズ").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Combobox(
+        normalize_combo = ttk.Combobox(
             normalize_frame,
             textvariable=self.normalize_mode,
             values=("vertical", "horizontal", "square", "original"),
             width=12,
             state="readonly",
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        normalize_combo.pack(side=tk.LEFT, padx=4)
         ttk.Label(normalize_frame, text="表示方法").pack(side=tk.LEFT, padx=(12, 4))
-        ttk.Combobox(
+        fit_combo = ttk.Combobox(
             normalize_frame,
             textvariable=self.fit_mode,
             values=("contain", "cover"),
             width=10,
             state="readonly",
-        ).pack(side=tk.LEFT, padx=4)
-        ttk.Label(
-            normalize_frame,
-            text="vertical=ショート縦 / contain=全体表示 / cover=画面いっぱい",
-        ).pack(side=tk.LEFT, padx=12)
+        )
+        fit_combo.pack(side=tk.LEFT, padx=4)
+        ttk.Label(normalize_frame, textvariable=self.concat_info_var).pack(side=tk.LEFT, padx=12)
+        normalize_combo.bind("<<ComboboxSelected>>", self.update_concat_info)
+        fit_combo.bind("<<ComboboxSelected>>", self.update_concat_info)
+        self.update_concat_info()
 
         list_area = ttk.Frame(concat_frame)
         list_area.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -242,7 +322,8 @@ class KiteClipperGui(tk.Tk):
         ttk.Button(order_buttons, text="上へ", command=lambda: self.move_clip(-1)).pack(side=tk.LEFT, padx=4)
         ttk.Button(order_buttons, text="下へ", command=lambda: self.move_clip(1)).pack(side=tk.LEFT, padx=4)
         ttk.Button(order_buttons, text="クリップ再読み込み", command=self.refresh_clips).pack(side=tk.LEFT, padx=4)
-        concat_button = ttk.Button(order_buttons, text="結合", command=self.concat_selected_clips)
+        # ワークフロー手順④: selected_clips を結合して final に出力
+        concat_button = _accent_button(order_buttons, "④ 結合", self.concat_selected_clips)
         concat_button.pack(side=tk.LEFT, padx=12)
         self.action_buttons.append(concat_button)
         ttk.Button(order_buttons, text="final を開く", command=lambda: self.open_folder(ROOT / "final")).pack(side=tk.LEFT, padx=4)
@@ -276,6 +357,22 @@ class KiteClipperGui(tk.Tk):
             to_float(self.pre_roll.get(), 1.0),
             to_float(self.post_roll.get(), 1.0),
         )
+
+    def update_concat_info(self, _event: object = None) -> None:
+        # 選択中の「最終サイズ／表示方法」でどう結合されるかを説明するラベルを更新します。
+        fit_note = "（contain=全体表示 / cover=画面いっぱい）"
+        mode = self.normalize_mode.get()
+        if mode == "original":
+            text = "original: 無劣化で結合します（全クリップの形式が同一である必要あり）"
+        elif mode == "vertical":
+            text = f"vertical: 1080×1920 / 30fps に再エンコードして結合します{fit_note}"
+        elif mode == "horizontal":
+            text = f"horizontal: 1920×1080 / 30fps に再エンコードして結合します{fit_note}"
+        elif mode == "square":
+            text = f"square: 1080×1080 / 30fps に再エンコードして結合します{fit_note}"
+        else:
+            text = ""
+        self.concat_info_var.set(text)
 
     def open_folder(self, folder: Path) -> None:
         folder.mkdir(parents=True, exist_ok=True)
@@ -581,7 +678,11 @@ class KiteClipperGui(tk.Tk):
                 file.write(str(clip) + "\n")
         args = ["--concat-selected-clips", "--concat-order-file", str(order_file)]
         args.extend(["--normalize", self.normalize_mode.get(), "--fit", self.fit_mode.get()])
-        if self.fast_copy.get():
+        # original選択時はチェック状態に関係なく必ず高速コピーにする。
+        # 「最終サイズ=original」なのに高速コピーOFFのまま結合すると、
+        # 無劣化のはずが8M再エンコードされて画質が大きく劣化する事故になるため。
+        # original以外はCLI側で--fast-copyが無視されるため、従来通りチェック状態に従う。
+        if self.normalize_mode.get() == "original" or self.fast_copy.get():
             args.append("--fast-copy")
         self.run_cli(args, "動画結合中")
 

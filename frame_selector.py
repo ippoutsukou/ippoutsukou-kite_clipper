@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 import csv
+import json
 import os
 import re
 import shutil
+import subprocess
 import threading
 import tkinter as tk
 from dataclasses import dataclass, field
@@ -21,10 +23,11 @@ import numpy as np
 FRAME_NAME_PATTERN = re.compile(r"^(?P<video_stem>.+)__t(?P<time>\d+(?:\.\d+)?)$")
 LEGACY_FRAME_NAME_PATTERN = re.compile(r"^(?P<video_stem>.+)_(?P<number>\d{6})$")
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv"}
 
 # 正方形ボックスに収めることで、縦動画のフレームも横動画のフレームも
 # アスペクト比を保ったまま同じグリッドに並べられます。
-SIZE_OPTIONS = {"小": 150, "中": 220, "大": 300}
+SIZE_OPTIONS = {"小": 150, "中": 220, "大": 300, "特大": 420}
 DEFAULT_SIZE = "中"
 CACHE_BOX = 480
 GAP = 10
@@ -34,7 +37,17 @@ SELECT_COLOR = "#2e8b57"
 NORMAL_COLOR = "#c8c8c8"
 FOCUS_COLOR = "#1976d2"
 NG_COLOR = "#d32f2f"
+AUDIO_COLOR = "#f57c00"
 PLACEHOLDER_FILL = "#e6e6e6"
+
+# 音量ピーク判定: 1秒ごとのRMS音量(dB)が「動画全体の中央値+6dB」を超え、
+# かつ無音に近くない(-45dB以上)秒をピークとみなします。風切り音のような
+# 定常ノイズは中央値側に入るため、歓声や声のスパイクだけが残ります。
+AUDIO_PEAK_OVER_MEDIAN_DB = 6.0
+AUDIO_PEAK_FLOOR_DB = -45.0
+AUDIO_SAMPLE_RATE = 8000
+
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 @dataclass
@@ -97,6 +110,56 @@ def read_image(path: Path) -> np.ndarray | None:
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
+def safe_stem(path: Path) -> str:
+    # kite_clipper.py の safe_stem と同じ変換。フレーム名の video_stem と
+    # input/videos の動画を対応付けるために使います。
+    return "".join(char if char.isalnum() or char in "-_" else "_" for char in path.stem)
+
+
+def bundled_tool_path(root: Path, tool_name: str) -> str:
+    bundled = root / "vendor" / "ffmpeg" / "windows-x64" / f"{tool_name}.exe"
+    if bundled.exists():
+        return str(bundled)
+    return tool_name
+
+
+def compute_audio_peaks(video_path: Path, ffmpeg: str) -> set[int]:
+    """動画の音声から音量ピークの秒(0始まり)を返します。音声なしなら空。"""
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(AUDIO_SAMPLE_RATE),
+        "-f",
+        "s16le",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, timeout=900, creationflags=CREATE_NO_WINDOW
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if result.returncode != 0 or not result.stdout:
+        return set()
+    samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    seconds = len(samples) // AUDIO_SAMPLE_RATE
+    if seconds == 0:
+        return set()
+    windows = samples[: seconds * AUDIO_SAMPLE_RATE].reshape(seconds, AUDIO_SAMPLE_RATE)
+    rms = np.sqrt(np.mean(windows * windows, axis=1))
+    db = 20.0 * np.log10(np.maximum(rms, 1e-6))
+    threshold = max(float(np.median(db)) + AUDIO_PEAK_OVER_MEDIAN_DB, AUDIO_PEAK_FLOOR_DB)
+    return {int(index) for index in np.nonzero(db >= threshold)[0]}
+
+
 def format_duration(seconds: float) -> str:
     if seconds <= 0:
         return "00:00.00"
@@ -141,8 +204,10 @@ class FrameSelectorWindow(tk.Toplevel):
         self.focus_index: int | None = None
         self.focus_rect_id = 0
         self.anchor_index: int | None = None
-        self.anchor_state = True
         self._relayout_pending = False
+        self.audio_peaks: dict[str, set[int]] = {}
+        self.audio_gen = 0
+        self.audio_queue: Queue[tuple[int, str, set[int]]] = Queue()
 
         self.filter_var = tk.StringVar(value="すべて")
         self.size_var = tk.StringVar(value=DEFAULT_SIZE)
@@ -185,7 +250,10 @@ class FrameSelectorWindow(tk.Toplevel):
         ttk.Label(info, textvariable=self.stats_var, font=("", 11, "bold")).pack(side=tk.LEFT)
         ttk.Label(
             info,
-            text="クリック=採用/解除  Shift+クリック=範囲  矢印=移動  Space=採用/解除  右クリック=元画像を開く",
+            text=(
+                "クリック=採用/解除  矢印=移動  Space=採用/解除  "
+                "Shift+Space / Shift+クリック=そこまで範囲適用  右クリック=元画像  ♪=音量ピーク"
+            ),
             foreground="#666666",
         ).pack(side=tk.RIGHT)
 
@@ -205,14 +273,19 @@ class FrameSelectorWindow(tk.Toplevel):
         self.canvas.bind("<Button-3>", self.on_right_click)
         self.canvas.bind("<Configure>", self.on_canvas_configure)
         self.bind("<MouseWheel>", self.on_mousewheel)
-        self.bind("<Left>", lambda _e: self.move_focus(-1))
-        self.bind("<Right>", lambda _e: self.move_focus(1))
-        self.bind("<Up>", lambda _e: self.move_focus(-self.columns))
-        self.bind("<Down>", lambda _e: self.move_focus(self.columns))
-        self.bind("<space>", lambda _e: self.toggle_focus())
-        self.bind("<Shift-space>", lambda _e: self.range_toggle_to_focus())
-        self.bind("<Prior>", lambda _e: self.canvas.yview_scroll(-20, "units"))
-        self.bind("<Next>", lambda _e: self.canvas.yview_scroll(20, "units"))
+        # キー操作はキャンバスにフォーカスがあるときだけ効かせます。ウィンドウ
+        # 全体にバインドすると、コンボボックスやボタンにフォーカスがある状態で
+        # Spaceや矢印がグリッド操作と二重に効いてしまうためです。
+        self.canvas.configure(takefocus=1)
+        self.canvas.bind("<Left>", lambda _e: self.move_focus(-1))
+        self.canvas.bind("<Right>", lambda _e: self.move_focus(1))
+        self.canvas.bind("<Up>", lambda _e: self.move_focus(-self.columns))
+        self.canvas.bind("<Down>", lambda _e: self.move_focus(self.columns))
+        self.canvas.bind("<space>", lambda _e: self.toggle_focus())
+        self.canvas.bind("<Shift-space>", lambda _e: self.range_toggle_to_focus())
+        self.canvas.bind("<Prior>", lambda _e: self.canvas.yview_scroll(-20, "units"))
+        self.canvas.bind("<Next>", lambda _e: self.canvas.yview_scroll(20, "units"))
+        self.canvas.focus_set()
 
     # ------------------------------------------------------------ データ読込
 
@@ -250,6 +323,8 @@ class FrameSelectorWindow(tk.Toplevel):
         self.hide_ng_check.configure(state=tk.NORMAL if has_ng else tk.DISABLED)
         if not has_ng:
             self.hide_ng_var.set(False)
+        self.audio_peaks = {}
+        self.start_audio_analysis()
         self.rebuild()
 
     def rescan_selected(self) -> None:
@@ -344,6 +419,15 @@ class FrameSelectorWindow(tk.Toplevel):
                     anchor=tk.NE,
                     font=("", 10, "bold"),
                     fill=NG_COLOR,
+                )
+            if self.is_audio_peak(cell):
+                self.canvas.create_text(
+                    x + box - 6,
+                    y + box - 4,
+                    text="♪",
+                    anchor=tk.SE,
+                    font=("", 13, "bold"),
+                    fill=AUDIO_COLOR,
                 )
         rows = (len(self.cells) + self.columns - 1) // self.columns if self.cells else 0
         total_height = GAP + rows * (box + LABEL_H + GAP)
@@ -457,7 +541,72 @@ class FrameSelectorWindow(tk.Toplevel):
                 self._place_image(index)
         except Empty:
             pass
+        audio_updated = False
+        try:
+            while True:
+                gen, stem, peaks = self.audio_queue.get_nowait()
+                if gen != self.audio_gen:
+                    continue
+                self.audio_peaks[stem] = peaks
+                if peaks:
+                    audio_updated = True
+        except Empty:
+            pass
+        if audio_updated:
+            self.redraw_all()
         self.after(80, self._poll_results)
+
+    # -------------------------------------------------------- 音量ピーク解析
+
+    def is_audio_peak(self, cell: FrameCell) -> bool:
+        peaks = self.audio_peaks.get(cell.video_stem)
+        if not peaks or cell.time_sec < 0:
+            return False
+        second = int(cell.time_sec)
+        # 歓声とフレーム時刻のずれを吸収するため前後1秒まで許容します。
+        return second in peaks or (second - 1) in peaks or (second + 1) in peaks
+
+    def start_audio_analysis(self) -> None:
+        self.audio_gen += 1
+        gen = self.audio_gen
+        videos_dir = self.root_dir / "input" / "videos"
+        videos: dict[str, Path] = {}
+        if videos_dir.exists():
+            for path in sorted(videos_dir.iterdir()):
+                if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+                    videos[safe_stem(path)] = path
+        stems = sorted({cell.video_stem for cell in self.all_cells})
+        tasks = [(stem, videos[stem]) for stem in stems if stem in videos]
+        if not tasks:
+            return
+        threading.Thread(target=self._audio_worker, args=(gen, tasks), daemon=True).start()
+
+    def _audio_worker(self, gen: int, tasks: list[tuple[str, Path]]) -> None:
+        ffmpeg = bundled_tool_path(self.root_dir, "ffmpeg")
+        for stem, video_path in tasks:
+            if gen != self.audio_gen:
+                return
+            self.audio_queue.put((gen, stem, self._load_or_compute_peaks(video_path, ffmpeg)))
+
+    def _load_or_compute_peaks(self, video_path: Path, ffmpeg: str) -> set[int]:
+        cache_dir = self.root_dir / "work" / "audio_peaks"
+        try:
+            cache_file = cache_dir / f"{safe_stem(video_path)}_{int(video_path.stat().st_mtime)}.json"
+        except OSError:
+            return set()
+        if cache_file.exists():
+            try:
+                data = json.loads(cache_file.read_text(encoding="utf-8"))
+                return {int(value) for value in data}
+            except Exception:
+                pass
+        peaks = compute_audio_peaks(video_path, ffmpeg)
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(sorted(peaks)), encoding="utf-8")
+        except OSError:
+            pass
+        return peaks
 
     def _place_image(self, index: int) -> None:
         cell = self.cells[index]
@@ -488,31 +637,44 @@ class FrameSelectorWindow(tk.Toplevel):
             return None
         return index
 
+    def anchor_selected_state(self) -> bool | None:
+        """アンカーセルの「現在の」採用状態。範囲適用はこの状態に揃えます。"""
+        if self.anchor_index is None or self.anchor_index >= len(self.cells):
+            return None
+        return self.cells[self.anchor_index].path.name in self.selected_names
+
+    def apply_range(self, end_index: int) -> None:
+        state = self.anchor_selected_state()
+        if state is None:
+            return
+        low, high = sorted((self.anchor_index, end_index))
+        for position in range(low, high + 1):
+            self.set_selected(position, state)
+        self.focus_index = end_index
+        self.update_focus_rect()
+        self.after_toggle()
+
     def on_click(self, event: tk.Event) -> None:
+        self.canvas.focus_set()
         index = self.index_at(event)
         if index is None:
             return
         target = self.cells[index].path.name not in self.selected_names
         self.set_selected(index, target)
         self.anchor_index = index
-        self.anchor_state = target
         self.focus_index = index
         self.update_focus_rect()
         self.after_toggle()
 
     def on_shift_click(self, event: tk.Event) -> None:
+        self.canvas.focus_set()
         index = self.index_at(event)
         if index is None:
             return
         if self.anchor_index is None:
             self.on_click(event)
             return
-        low, high = sorted((self.anchor_index, index))
-        for position in range(low, high + 1):
-            self.set_selected(position, self.anchor_state)
-        self.focus_index = index
-        self.update_focus_rect()
-        self.after_toggle()
+        self.apply_range(index)
 
     def on_right_click(self, event: tk.Event) -> None:
         index = self.index_at(event)
@@ -530,16 +692,16 @@ class FrameSelectorWindow(tk.Toplevel):
         target = self.cells[index].path.name not in self.selected_names
         self.set_selected(index, target)
         self.anchor_index = index
-        self.anchor_state = target
         self.after_toggle()
 
     def range_toggle_to_focus(self) -> None:
-        if self.focus_index is None or self.anchor_index is None:
+        if self.focus_index is None or self.focus_index >= len(self.cells):
             return
-        low, high = sorted((self.anchor_index, self.focus_index))
-        for position in range(low, high + 1):
-            self.set_selected(position, self.anchor_state)
-        self.after_toggle()
+        if self.anchor_index is None:
+            # アンカーがまだ無ければ、Spaceと同じ動きで起点を作ります。
+            self.toggle_focus()
+            return
+        self.apply_range(self.focus_index)
 
     def move_focus(self, delta: int) -> None:
         if not self.cells:
