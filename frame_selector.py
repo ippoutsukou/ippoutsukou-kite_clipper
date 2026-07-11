@@ -40,6 +40,13 @@ NG_COLOR = "#d32f2f"
 AUDIO_COLOR = "#f57c00"
 PLACEHOLDER_FILL = "#e6e6e6"
 
+# AIスコアバッジの色分け閾値（0〜100）
+AI_SCORE_HIGH_COLOR = "#2e7d32"
+AI_SCORE_MID_COLOR = "#ef6c00"
+AI_SCORE_LOW_COLOR = "#757575"
+AI_SCORE_HIGH_THRESHOLD = 70
+AI_SCORE_MID_THRESHOLD = 40
+
 # 音量ピーク判定: 1秒ごとのRMS音量(dB)が「動画全体の中央値+6dB」を超え、
 # かつ無音に近くない(-45dB以上)秒をピークとみなします。風切り音のような
 # 定常ノイズは中央値側に入るため、歓声や声のスパイクだけが残ります。
@@ -88,6 +95,30 @@ def load_ng_info(csv_path: Path) -> dict[str, tuple[bool, str]]:
     except Exception:
         return {}
     return info
+
+
+def load_ai_scores(csv_path: Path) -> dict[str, float]:
+    """frame_scorer.py predict が出力する logs/ai_scores.csv を読み込みます。
+
+    ファイルが無い場合や壊れている場合は空辞書を返します（＝バッジ表示なし、
+    従来どおりの挙動）。
+    """
+    if not csv_path.exists():
+        return {}
+    scores: dict[str, float] = {}
+    try:
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as file:
+            for row in csv.DictReader(file):
+                name = row.get("frame_name") or ""
+                if not name:
+                    continue
+                try:
+                    scores[name] = float(row.get("ai_score") or "")
+                except (TypeError, ValueError):
+                    continue
+    except Exception:
+        return {}
+    return scores
 
 
 def fit_within(image: np.ndarray, box: int) -> np.ndarray:
@@ -195,6 +226,7 @@ class FrameSelectorWindow(tk.Toplevel):
         self.on_selection_change = on_selection_change
 
         self.ng_info = load_ng_info(root / "logs" / "result.csv")
+        self.ai_scores = load_ai_scores(root / "logs" / "ai_scores.csv")
         self.all_cells: list[FrameCell] = []
         self.cells: list[FrameCell] = []
         self.selected_names: set[str] = set()
@@ -291,6 +323,7 @@ class FrameSelectorWindow(tk.Toplevel):
 
     def reload_from_disk(self) -> None:
         self.ng_info = load_ng_info(self.root_dir / "logs" / "result.csv")
+        self.ai_scores = load_ai_scores(self.root_dir / "logs" / "ai_scores.csv")
         self.rescan_selected()
         cells: list[FrameCell] = []
         if self.review_dir.exists():
@@ -429,6 +462,16 @@ class FrameSelectorWindow(tk.Toplevel):
                     font=("", 13, "bold"),
                     fill=AUDIO_COLOR,
                 )
+            ai_score = self.ai_scores.get(cell.path.name)
+            if ai_score is not None:
+                self.canvas.create_text(
+                    x + 6,
+                    y + box - 4,
+                    text=f"AI {round(ai_score * 100):.0f}",
+                    anchor=tk.SW,
+                    font=("", 10, "bold"),
+                    fill=self._ai_score_color(ai_score),
+                )
         rows = (len(self.cells) + self.columns - 1) // self.columns if self.cells else 0
         total_height = GAP + rows * (box + LABEL_H + GAP)
         self.canvas.configure(scrollregion=(0, 0, 1, max(total_height, 1)))
@@ -557,6 +600,14 @@ class FrameSelectorWindow(tk.Toplevel):
         self.after(80, self._poll_results)
 
     # -------------------------------------------------------- 音量ピーク解析
+
+    def _ai_score_color(self, ai_score: float) -> str:
+        score_100 = ai_score * 100
+        if score_100 >= AI_SCORE_HIGH_THRESHOLD:
+            return AI_SCORE_HIGH_COLOR
+        if score_100 >= AI_SCORE_MID_THRESHOLD:
+            return AI_SCORE_MID_COLOR
+        return AI_SCORE_LOW_COLOR
 
     def is_audio_peak(self, cell: FrameCell) -> bool:
         peaks = self.audio_peaks.get(cell.video_stem)
