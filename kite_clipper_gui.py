@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
+from tkinter import font as tkfont
 
 from frame_selector import FrameSelectorWindow
 
@@ -35,14 +37,34 @@ THUMBNAIL_DIR = ROOT / "work" / "thumbnails"
 THUMBNAIL_MAX_WIDTH = 320
 THUMBNAIL_MAX_HEIGHT = 240
 
-# ワークフローのメイン4ボタン（生成→フレーム選別→切り出し→結合）用のアクセントカラー。
+# アプリ全体のフォント。ttkの名前付きフォントと、サイズ指定つきの
+# 個別フォントタプルの両方でこのファミリーを使います。
+APP_FONT_FAMILY = "Meiryo UI"
+
+# ワークフローのメイン実行ボタン用のアクセントカラー。
 # ttkテーマ（Windowsのデフォルトテーマ）はbg/fg指定を無視するため、
-# この4つだけ classic な tk.Button を使って目立たせます。
-ACCENT_BG = "#1a73e8"
+# 各工程の主ボタンだけ classic な tk.Button を使って目立たせます。
+ACCENT_BG = "#2a78d6"
 ACCENT_FG = "white"
-ACCENT_ACTIVE_BG = "#1558b0"
+ACCENT_ACTIVE_BG = "#1d5aa8"
 ACCENT_ACTIVE_FG = "white"
 ACCENT_DISABLED_FG = "#c9d6ea"
+
+# 左ステッパーの配色（ワイヤーフレーム 1b 準拠）
+STEP_DONE_FG = "#2a9d5b"
+STEP_ACTIVE_BG = "#eaf2fc"
+STEP_IDLE_FG = "#1a1a1a"
+STEP_SUMMARY_FG = "#888888"
+DANGER_FG = "#c0392b"
+
+# 工程番号 → ステッパーに表示する名前
+STEP_LABELS = {
+    1: "① 素材",
+    2: "② フレーム生成",
+    3: "③ 選別",
+    4: "④ 切り出し",
+    5: "⑤ 結合",
+}
 
 
 def bundled_tool_path(tool_name: str) -> str:
@@ -53,7 +75,7 @@ def bundled_tool_path(tool_name: str) -> str:
 
 
 def _accent_button(parent: tk.Widget, text: str, command) -> tk.Button:
-    """ワークフローのメイン手順ボタン用に色付けした tk.Button を生成します。"""
+    """各工程のメイン実行ボタン用に色付けした tk.Button を生成します。"""
     return tk.Button(
         parent,
         text=text,
@@ -64,9 +86,9 @@ def _accent_button(parent: tk.Widget, text: str, command) -> tk.Button:
         activeforeground=ACCENT_ACTIVE_FG,
         disabledforeground=ACCENT_DISABLED_FG,
         relief=tk.RAISED,
-        padx=12,
-        pady=2,
-        font=("", 9, "bold"),
+        padx=14,
+        pady=3,
+        font=(APP_FONT_FAMILY, 9, "bold"),
     )
 
 
@@ -81,10 +103,22 @@ class KiteClipperGui(tk.Tk):
         # 画面からはみ出さないよう、起動サイズを画面の作業領域に合わせて調整します。
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
-        width = min(1100, screen_w - 80)
-        height = min(820, screen_h - 120)  # タスクバー分の余裕を見込む
+        width = min(1040, screen_w - 80)
+        height = min(700, screen_h - 120)  # タスクバー分の余裕を見込む
         self.geometry(f"{width}x{height}")
-        self.minsize(900, 560)
+        self.minsize(880, 560)
+        # ttk/tk 標準ウィジェットが参照する名前付きフォントを Meiryo UI に統一します。
+        for font_name in (
+            "TkDefaultFont",
+            "TkTextFont",
+            "TkMenuFont",
+            "TkHeadingFont",
+            "TkCaptionFont",
+            "TkSmallCaptionFont",
+            "TkIconFont",
+            "TkTooltipFont",
+        ):
+            tkfont.nametofont(font_name).configure(family=APP_FONT_FAMILY)
         self.clip_paths: list[Path] = []
         self.clip_durations: dict[Path, float] = {}
         self.clip_tags: dict[str, list[str]] = load_clip_tags()
@@ -111,145 +145,243 @@ class KiteClipperGui(tk.Tk):
 
         self.frame_selector: FrameSelectorWindow | None = None
         self.status_var = tk.StringVar(value="待機中")
-        self.counts_var = tk.StringVar(value="")
         self.total_duration_var = tk.StringVar(value="合計: 00:00.00")
         # CLI実行中に無効化するボタン（多重実行の防止）。tk.Button（アクセント色ボタン）も含むため tk.Widget で受けます。
         self.action_buttons: list[tk.Widget] = []
 
+        # 左ステッパー＋詳細パネル方式の状態
+        self.current_step = 1
+        self.next_step = 1
+        self.counts: dict[str, int] = {}
+        self.next_step_var = tk.StringVar(value="▶ 次: ① 素材")
+        self.materials_var = tk.StringVar(value="動画 0本 / 写真 0枚")
+        self.frames_status_var = tk.StringVar(value="")
+        self.select_status_var = tk.StringVar(value="")
+        self.cut_status_var = tk.StringVar(value="")
+        self.detail_panels: dict[int, ttk.Frame] = {}
+        self.step_rows: dict[int, dict[str, tk.Widget]] = {}
+        self.cleanup_dialog: tk.Toplevel | None = None
+
+        # ログは下部バーに最終行のみ表示し、クリックで全文を展開します。
+        self.log_visible = False
+        self.last_log_var = tk.StringVar(value="最終行: （まだログはありません）")
+
         self.create_widgets()
         self.refresh_all()
+        self.show_step(self.next_step)
 
+    # ------------------------------------------------------------------ UI構築
     def create_widgets(self) -> None:
-        # 低解像度の画面でも下部のボタンやログ欄が見切れないよう、
-        # メイン画面全体を Canvas + Scrollbar で縦スクロール可能にします。
-        canvas = tk.Canvas(self, highlightthickness=0)
-        v_scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=v_scrollbar.set)
-        v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._row_bg = self.cget("background")
 
-        main = ttk.Frame(canvas, padding=12)
-        main_window = canvas.create_window((0, 0), window=main, anchor="nw")
+        # ---- ヘッダー: タイトル / 「次にやること」バッジ / 状態 / 再読み込み
+        header = ttk.Frame(self, padding=(12, 10, 12, 8))
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="Media Clip Organizer", font=(APP_FONT_FAMILY, 15, "bold")).pack(side=tk.LEFT)
+        ttk.Button(header, text="再読み込み", command=self.refresh_all).pack(side=tk.RIGHT)
+        ttk.Label(header, textvariable=self.status_var).pack(side=tk.RIGHT, padx=(0, 10))
+        self.next_badge = tk.Label(
+            header,
+            textvariable=self.next_step_var,
+            bg=STEP_ACTIVE_BG,
+            fg=ACCENT_BG,
+            font=(APP_FONT_FAMILY, 9, "bold"),
+            padx=12,
+            pady=3,
+            cursor="hand2",
+        )
+        self.next_badge.pack(side=tk.RIGHT, padx=(0, 10))
+        self.next_badge.bind("<Button-1>", lambda _e: self.show_step(self.next_step))
 
-        def _on_main_configure(_event: object = None) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
+        ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
-        def _on_canvas_configure(event: tk.Event) -> None:
-            # 内部フレームの幅は常にcanvas幅へ追従させます。
-            canvas.itemconfigure(main_window, width=event.width)
-            # canvasの高さがmainの要求高さ以上ある大画面では、従来通り
-            # main（セクション4など）がcanvasいっぱいに広がる見た目を維持します。
-            # 収まらない場合は高さ指定を外し、自然な高さでスクロールさせます。
-            if event.height >= main.winfo_reqheight():
-                canvas.itemconfigure(main_window, height=event.height)
-            else:
-                # height=0 を指定すると、canvas window item は内部ウィジェットの
-                # 要求サイズ（自然な高さ）に戻ります（空文字はTclErrorになるため使えません）。
-                canvas.itemconfigure(main_window, height=0)
+        # ---- 下部: ログバー（最終行表示＋クリックで展開）
+        bottom = ttk.Frame(self, padding=(12, 4, 12, 8))
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        bar = ttk.Frame(bottom)
+        bar.pack(fill=tk.X)
+        self.log_toggle_button = ttk.Button(bar, text="▸ ログ", width=9, command=self.toggle_log)
+        self.log_toggle_button.pack(side=tk.LEFT)
+        ttk.Label(bar, textvariable=self.last_log_var, foreground="#888").pack(
+            side=tk.LEFT, padx=8, fill=tk.X
+        )
+        self.log_frame = ttk.Frame(bottom)
+        log_scroll = ttk.Scrollbar(self.log_frame)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text = tk.Text(self.log_frame, height=9, wrap=tk.WORD, yscrollcommand=log_scroll.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scroll.configure(command=self.log_text.yview)
+        # log_frame は toggle_log() が呼ばれるまで pack しません（折りたたみ状態）。
 
-        main.bind("<Configure>", _on_main_configure)
-        canvas.bind("<Configure>", _on_canvas_configure)
+        # ---- 中央: 左ステッパー ＋ 右詳細パネル
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        self._build_stepper(body)
+        self.detail_container = ttk.Frame(body)
+        self.detail_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
+        self._build_panel_materials()
+        self._build_panel_generate()
+        self._build_panel_select()
+        self._build_panel_cut()
+        self._build_panel_concat()
 
-        def _on_mousewheel(event: tk.Event) -> str | None:
-            # クリップ一覧やログ欄など、自前でホイールスクロールするウィジェットの上では
-            # canvas側のスクロールを行わず、そちらの操作を優先します。
-            widget = event.widget
-            while widget is not None:
-                widget_class = widget.winfo_class()
-                if widget_class in ("Listbox", "Text", "TCombobox"):
-                    return None
-                widget = getattr(widget, "master", None)
-            canvas.yview_scroll(-int(event.delta / 120), "units")
-            return "break"
+    def _build_stepper(self, parent: ttk.Frame) -> None:
+        outer = ttk.LabelFrame(parent, text="工程")
+        outer.pack(side=tk.LEFT, fill=tk.Y)
+        inner = ttk.Frame(outer, padding=(4, 4))
+        inner.pack(fill=tk.BOTH, expand=True)
 
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-
-        top = ttk.Frame(main)
-        top.pack(fill=tk.X)
-        ttk.Label(top, text="Media Clip Organizer", font=("", 15, "bold")).pack(side=tk.LEFT)
-        ttk.Label(top, textvariable=self.status_var).pack(side=tk.RIGHT)
-
-        folder_frame = ttk.LabelFrame(main, text="1. フォルダ")
-        folder_frame.pack(fill=tk.X, pady=(12, 8))
-        for label, folder in [
-            ("input/photos", ROOT / "input" / "photos"),
-            ("input/videos", ROOT / "input" / "videos"),
-            ("review/photos", ROOT / "review" / "photos"),
-            ("review/frames", ROOT / "review" / "frames"),
-            ("selected_frames", ROOT / "selected_frames"),
-            ("selected_clips", ROOT / "selected_clips"),
-            ("work", ROOT / "work"),
-            ("final", ROOT / "final"),
-        ]:
-            ttk.Button(folder_frame, text=label, command=lambda p=folder: self.open_folder(p)).pack(
-                side=tk.LEFT, padx=4, pady=8
+        for number in (1, 2, 3, 4, 5):
+            row = tk.Frame(
+                inner,
+                bg=self._row_bg,
+                highlightthickness=1,
+                highlightbackground=self._row_bg,
+                cursor="hand2",
             )
-        ttk.Button(folder_frame, text="再読み込み", command=self.refresh_all).pack(side=tk.RIGHT, padx=4)
+            mark = tk.Label(row, text="", width=2, bg=self._row_bg, font=(APP_FONT_FAMILY, 10, "bold"))
+            name = tk.Label(row, text=STEP_LABELS[number], bg=self._row_bg, fg=STEP_IDLE_FG, anchor=tk.W)
+            summary = tk.Label(row, text="", bg=self._row_bg, fg=STEP_SUMMARY_FG, font=(APP_FONT_FAMILY, 8))
+            mark.pack(side=tk.LEFT, padx=(6, 2), pady=7)
+            name.pack(side=tk.LEFT, pady=7)
+            summary.pack(side=tk.RIGHT, padx=(8, 6))
+            row.pack(fill=tk.X, pady=2)
+            for widget in (row, mark, name, summary):
+                widget.bind("<Button-1>", lambda _e, n=number: self.show_step(n))
+            self.step_rows[number] = {"row": row, "mark": mark, "name": name, "summary": summary}
 
-        counts = ttk.Label(main, textvariable=self.counts_var)
-        counts.pack(fill=tk.X, pady=(0, 8))
+        # フッター: 削除系操作の集約入口（実行内容は確認ダイアログで選択）
+        ttk.Separator(inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(10, 4))
+        tk.Button(
+            inner,
+            text="🗑 整理・削除…",
+            fg=DANGER_FG,
+            relief=tk.FLAT,
+            anchor=tk.W,
+            cursor="hand2",
+            command=self.open_cleanup_dialog,
+        ).pack(fill=tk.X, padx=2, pady=(0, 2))
 
-        generate_frame = ttk.LabelFrame(main, text="2. 候補写真と切り出しフレーム生成")
-        generate_frame.pack(fill=tk.X, pady=8)
-        ttk.Label(generate_frame, text="フレーム間隔(秒)").pack(side=tk.LEFT, padx=(8, 4))
+    # ---------------------------------------------------------- 各工程のパネル
+    def _panel_inner(self, number: int, title: str) -> ttk.Frame:
+        panel = ttk.LabelFrame(self.detail_container, text=title)
+        self.detail_panels[number] = panel
+        inner = ttk.Frame(panel, padding=12)
+        inner.pack(fill=tk.BOTH, expand=True)
+        return inner
+
+    def _build_panel_materials(self) -> None:
+        inner = self._panel_inner(1, "① 素材を用意")
+        ttk.Label(inner, text="input/videos に元動画、input/photos に元写真を入れてください。").pack(anchor=tk.W)
+        ttk.Label(inner, textvariable=self.materials_var, font=(APP_FONT_FAMILY, 11, "bold")).pack(
+            anchor=tk.W, pady=(10, 14)
+        )
+        row = ttk.Frame(inner)
+        row.pack(anchor=tk.W)
+        ttk.Button(row, text="📁 input/videos を開く", command=lambda: self.open_folder(ROOT / "input" / "videos")).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(row, text="📁 input/photos を開く", command=lambda: self.open_folder(ROOT / "input" / "photos")).pack(
+            side=tk.LEFT
+        )
+        ttk.Label(
+            inner,
+            text="素材を入れたら右上の「再読み込み」で本数を更新し、「② フレーム生成」へ進んでください。",
+            foreground="#888",
+        ).pack(anchor=tk.W, pady=(16, 0))
+
+    def _build_panel_generate(self) -> None:
+        inner = self._panel_inner(2, "② フレーム生成")
+        ttk.Label(
+            inner,
+            text="元動画から一定間隔でフレーム画像を抽出します（review/frames に出力）。\n写真は候補チェックのうえ review/photos にコピーされます。",
+        ).pack(anchor=tk.W)
+        row = ttk.Frame(inner)
+        row.pack(anchor=tk.W, pady=(12, 4))
+        ttk.Label(row, text="フレーム間隔(秒)").pack(side=tk.LEFT, padx=(0, 4))
         ttk.Combobox(
-            generate_frame,
+            row,
             textvariable=self.frame_interval,
             values=("1", "0.5", "0.25"),
             width=8,
-        ).pack(side=tk.LEFT, padx=4)
-        # ワークフロー手順①: 候補写真・切り出しフレームを生成
-        generate_button = _accent_button(generate_frame, "① 生成", self.generate_candidates)
-        generate_button.pack(side=tk.LEFT, padx=8)
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        generate_button = _accent_button(row, "フレームを生成", self.generate_candidates)
+        generate_button.pack(side=tk.LEFT)
         self.action_buttons.append(generate_button)
-        # 続く手順であることが分かるよう矢印を挟みます。
-        ttk.Label(generate_frame, text="→").pack(side=tk.LEFT)
-        # ワークフロー手順②: 生成したフレームを選別（action_buttonsには追加しない＝従来通り）
-        frame_selector_button = _accent_button(generate_frame, "② フレーム選別", self.open_frame_selector)
-        frame_selector_button.pack(side=tk.LEFT, padx=8)
-        ttk.Button(generate_frame, text="review/frames を開く", command=lambda: self.open_folder(ROOT / "review" / "frames")).pack(
-            side=tk.LEFT, padx=4
+        ttk.Label(inner, textvariable=self.frames_status_var, font=(APP_FONT_FAMILY, 11, "bold")).pack(
+            anchor=tk.W, pady=(10, 14)
         )
-        ttk.Button(
-            generate_frame,
-            text="selected_frames を開く",
-            command=lambda: self.open_folder(ROOT / "selected_frames"),
-        ).pack(side=tk.LEFT, padx=4)
+        row2 = ttk.Frame(inner)
+        row2.pack(anchor=tk.W)
+        ttk.Button(row2, text="📁 review/frames を開く", command=lambda: self.open_folder(ROOT / "review" / "frames")).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(row2, text="📁 review/photos を開く", command=lambda: self.open_folder(ROOT / "review" / "photos")).pack(
+            side=tk.LEFT
+        )
 
-        cut_frame = ttk.LabelFrame(main, text="3. selected_frames から動画切り出し")
-        cut_frame.pack(fill=tk.X, pady=8)
+    def _build_panel_select(self) -> None:
+        inner = self._panel_inner(3, "③ フレームを選別")
+        ttk.Label(
+            inner,
+            text="ビューアで残したいフレームを選ぶと selected_frames にコピーされます。\nAIスコア・提案区間・音量ピークを参考に選べます。",
+        ).pack(anchor=tk.W)
+        ttk.Label(inner, textvariable=self.select_status_var, font=(APP_FONT_FAMILY, 11, "bold")).pack(
+            anchor=tk.W, pady=(10, 14)
+        )
+        row = ttk.Frame(inner)
+        row.pack(anchor=tk.W)
+        _accent_button(row, "選別ビューアを開く", self.open_frame_selector).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(row, text="📁 selected_frames を開く", command=lambda: self.open_folder(ROOT / "selected_frames")).pack(
+            side=tk.LEFT
+        )
+        ttk.Label(
+            inner,
+            text="AI採点（スコア付与と区間提案）はビューア内の「AI採点を実行」から行えます。",
+            foreground="#888",
+        ).pack(anchor=tk.W, pady=(16, 0))
+        ttk.Label(
+            inner,
+            text="ビューアを閉じると採用数が更新されます。選び終えたら「④ 切り出し」へ進んでください。",
+            foreground="#888",
+        ).pack(anchor=tk.W, pady=(4, 0))
+
+    def _build_panel_cut(self) -> None:
+        inner = self._panel_inner(4, "④ 選択フレームから動画を切り出し")
+        ttk.Label(
+            inner,
+            text="selected_frames の連続した時間帯ごとに、元動画から selected_clips へ動画を切り出します。",
+        ).pack(anchor=tk.W)
+        row = ttk.Frame(inner)
+        row.pack(anchor=tk.W, pady=(12, 4))
         for label, var in [
             ("前余白", self.pre_roll),
             ("後余白", self.post_roll),
             ("分割間隔", self.split_gap),
         ]:
-            ttk.Label(cut_frame, text=label).pack(side=tk.LEFT, padx=(8, 4))
-            ttk.Entry(cut_frame, textvariable=var, width=7).pack(side=tk.LEFT, padx=4)
-        ttk.Checkbutton(cut_frame, text="高速コピー", variable=self.fast_copy).pack(side=tk.LEFT, padx=8)
-        # ワークフロー手順③: selected_frames から動画を切り出し
-        cut_button = _accent_button(cut_frame, "③ 切り出し", self.cut_from_selected_frames)
-        cut_button.pack(side=tk.LEFT, padx=8)
-        dry_run_button = ttk.Button(cut_frame, text="削除予定を確認", command=self.cleanup_after_cut_dry_run)
-        dry_run_button.pack(side=tk.LEFT, padx=4)
-        delete_button = ttk.Button(cut_frame, text="selected_frames を削除", command=self.cleanup_after_cut_delete)
-        delete_button.pack(side=tk.LEFT, padx=4)
-        self.action_buttons.extend([cut_button, dry_run_button, delete_button])
-        ttk.Checkbutton(cut_frame, text="review/framesも削除", variable=self.cleanup_review_frames).pack(
-            side=tk.LEFT, padx=8
+            ttk.Label(row, text=label).pack(side=tk.LEFT, padx=(0, 4))
+            ttk.Entry(row, textvariable=var, width=7).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(row, text="高速コピー", variable=self.fast_copy).pack(side=tk.LEFT, padx=(0, 12))
+        cut_button = _accent_button(row, "切り出しを実行", self.cut_from_selected_frames)
+        cut_button.pack(side=tk.LEFT)
+        self.action_buttons.append(cut_button)
+        ttk.Label(inner, textvariable=self.cut_status_var, font=(APP_FONT_FAMILY, 11, "bold")).pack(
+            anchor=tk.W, pady=(10, 14)
         )
-        ttk.Checkbutton(cut_frame, text="review/photosも削除", variable=self.cleanup_review_photos).pack(
-            side=tk.LEFT, padx=8
-        )
-        ttk.Checkbutton(cut_frame, text="workも削除", variable=self.cleanup_work).pack(side=tk.LEFT, padx=8)
-        ttk.Checkbutton(cut_frame, text="selected_clipsも削除", variable=self.cleanup_selected_clips).pack(
-            side=tk.LEFT, padx=8
-        )
+        ttk.Button(
+            inner, text="📁 selected_clips を開く", command=lambda: self.open_folder(ROOT / "selected_clips")
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            inner,
+            text="切り出し後の不要ファイル整理は、左下の「🗑 整理・削除…」から行えます。",
+            foreground="#888",
+        ).pack(anchor=tk.W, pady=(16, 0))
 
-        concat_frame = ttk.LabelFrame(main, text="4. selected_clips を結合")
-        concat_frame.pack(fill=tk.BOTH, expand=True, pady=8)
+    def _build_panel_concat(self) -> None:
+        concat_frame = self._panel_inner(5, "⑤ selected_clips を結合")
 
         normalize_frame = ttk.Frame(concat_frame)
-        normalize_frame.pack(fill=tk.X, padx=8, pady=(8, 0))
+        normalize_frame.pack(fill=tk.X)
         ttk.Label(normalize_frame, text="最終サイズ").pack(side=tk.LEFT, padx=(0, 4))
         normalize_combo = ttk.Combobox(
             normalize_frame,
@@ -268,13 +400,15 @@ class KiteClipperGui(tk.Tk):
             state="readonly",
         )
         fit_combo.pack(side=tk.LEFT, padx=4)
-        ttk.Label(normalize_frame, textvariable=self.concat_info_var).pack(side=tk.LEFT, padx=12)
+        ttk.Label(normalize_frame, textvariable=self.concat_info_var, foreground="#888").pack(
+            side=tk.LEFT, padx=12
+        )
         normalize_combo.bind("<<ComboboxSelected>>", self.update_concat_info)
         fit_combo.bind("<<ComboboxSelected>>", self.update_concat_info)
         self.update_concat_info()
 
         list_area = ttk.Frame(concat_frame)
-        list_area.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        list_area.pack(fill=tk.BOTH, expand=True, pady=8)
 
         # 選択クリップの詳細パネル（サムネイル・タグ入力・名前ボタンを1か所に集約）
         detail_frame = ttk.LabelFrame(list_area, text="選択クリップ")
@@ -313,26 +447,139 @@ class KiteClipperGui(tk.Tk):
         self.clip_list.bind("<<ListboxSelect>>", self.on_clip_select)
 
         total_frame = ttk.Frame(concat_frame)
-        total_frame.pack(fill=tk.X, padx=8, pady=(0, 6))
-        ttk.Label(total_frame, textvariable=self.total_duration_var, font=("", 11, "bold")).pack(side=tk.LEFT)
+        total_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(total_frame, textvariable=self.total_duration_var, font=(APP_FONT_FAMILY, 11, "bold")).pack(side=tk.LEFT)
         ttk.Label(total_frame, textvariable=self.person_totals_var).pack(side=tk.LEFT, padx=(16, 0))
 
         order_buttons = ttk.Frame(concat_frame)
-        order_buttons.pack(fill=tk.X, padx=8, pady=(0, 8))
-        ttk.Button(order_buttons, text="上へ", command=lambda: self.move_clip(-1)).pack(side=tk.LEFT, padx=4)
+        order_buttons.pack(fill=tk.X)
+        ttk.Button(order_buttons, text="上へ", command=lambda: self.move_clip(-1)).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(order_buttons, text="下へ", command=lambda: self.move_clip(1)).pack(side=tk.LEFT, padx=4)
         ttk.Button(order_buttons, text="クリップ再読み込み", command=self.refresh_clips).pack(side=tk.LEFT, padx=4)
-        # ワークフロー手順④: selected_clips を結合して final に出力
-        concat_button = _accent_button(order_buttons, "④ 結合", self.concat_selected_clips)
-        concat_button.pack(side=tk.LEFT, padx=12)
+        ttk.Button(order_buttons, text="📁 final を開く", command=lambda: self.open_folder(ROOT / "final")).pack(
+            side=tk.RIGHT
+        )
+        concat_button = _accent_button(order_buttons, "結合する ▶", self.concat_selected_clips)
+        concat_button.pack(side=tk.RIGHT, padx=12)
         self.action_buttons.append(concat_button)
-        ttk.Button(order_buttons, text="final を開く", command=lambda: self.open_folder(ROOT / "final")).pack(side=tk.LEFT, padx=4)
 
-        log_frame = ttk.LabelFrame(main, text="ログ")
-        log_frame.pack(fill=tk.BOTH, expand=False, pady=(8, 0))
-        self.log_text = tk.Text(log_frame, height=8, wrap=tk.WORD)
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+    # ------------------------------------------------------ ステッパーの状態管理
+    def show_step(self, step: int) -> None:
+        if step not in self.detail_panels:
+            return
+        self.current_step = step
+        for panel in self.detail_panels.values():
+            panel.pack_forget()
+        self.detail_panels[step].pack(fill=tk.BOTH, expand=True)
+        self.update_stepper()
 
+    def step_done_flags(self) -> dict[int, bool]:
+        counts = self.counts
+        return {
+            1: counts.get("input_videos", 0) + counts.get("input_photos", 0) > 0,
+            2: counts.get("review_frames", 0) + counts.get("review_photos", 0) > 0,
+            3: counts.get("selected_frames", 0) > 0,
+            4: counts.get("selected_clips", 0) > 0,
+            5: counts.get("final", 0) > 0,
+        }
+
+    def update_stepper(self) -> None:
+        if not self.step_rows:
+            return
+        done = self.step_done_flags()
+        self.next_step = next((n for n in (1, 2, 3, 4, 5) if not done[n]), 5)
+        self.next_step_var.set(f"▶ 次: {STEP_LABELS[self.next_step]}")
+
+        counts = self.counts
+        total = sum(self.clip_durations.get(path, 0.0) for path in self.clip_paths)
+        summaries = {
+            1: f"{counts.get('input_videos', 0)}本/{counts.get('input_photos', 0)}枚",
+            2: f"{counts.get('review_frames', 0)}枚",
+            3: f"{counts.get('selected_frames', 0)}採用",
+            4: f"{counts.get('selected_clips', 0)}本",
+            5: format_duration(total) if self.clip_paths else "",
+        }
+
+        for number, widgets in self.step_rows.items():
+            is_current = number == self.current_step
+            bg = STEP_ACTIVE_BG if is_current else self._row_bg
+            border = ACCENT_BG if is_current else self._row_bg
+            widgets["row"].configure(bg=bg, highlightbackground=border, highlightcolor=border)
+            if done[number]:
+                mark_text, mark_fg = "✔", STEP_DONE_FG
+            elif is_current:
+                mark_text, mark_fg = "▶", ACCENT_BG
+            else:
+                mark_text, mark_fg = "", STEP_SUMMARY_FG
+            widgets["mark"].configure(text=mark_text, fg=mark_fg, bg=bg)
+            widgets["name"].configure(
+                bg=bg,
+                fg=ACCENT_BG if is_current else STEP_IDLE_FG,
+                font=(APP_FONT_FAMILY, 9, "bold") if is_current else (APP_FONT_FAMILY, 9),
+            )
+            widgets["summary"].configure(
+                text=summaries[number],
+                bg=bg,
+                fg=ACCENT_BG if is_current else STEP_SUMMARY_FG,
+            )
+
+    # ---------------------------------------------------------------- ログ表示
+    def toggle_log(self) -> None:
+        if self.log_visible:
+            self.log_frame.pack_forget()
+            self.log_toggle_button.configure(text="▸ ログ")
+        else:
+            self.log_frame.pack(fill=tk.BOTH, pady=(4, 0))
+            self.log_toggle_button.configure(text="▾ ログ")
+        self.log_visible = not self.log_visible
+
+    # ------------------------------------------------------------ 整理・削除
+    def open_cleanup_dialog(self) -> None:
+        if self.cleanup_dialog is not None and self.cleanup_dialog.winfo_exists():
+            self.cleanup_dialog.lift()
+            self.cleanup_dialog.focus_set()
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("整理・削除")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        self.cleanup_dialog = dialog
+
+        frame = ttk.Frame(dialog, padding=14)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frame,
+            text=(
+                "切り出し後に不要になったファイルを整理します。\n"
+                "selected_frames は常に削除対象です。\n"
+                "元動画と input フォルダには触りません。"
+            ),
+        ).pack(anchor=tk.W)
+        checks = ttk.Frame(frame)
+        checks.pack(anchor=tk.W, pady=(10, 12))
+        for text, var in [
+            ("review/frames も削除", self.cleanup_review_frames),
+            ("review/photos も削除", self.cleanup_review_photos),
+            ("work も削除", self.cleanup_work),
+            ("selected_clips も削除", self.cleanup_selected_clips),
+        ]:
+            ttk.Checkbutton(checks, text=text, variable=var).pack(anchor=tk.W, pady=1)
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill=tk.X)
+        dry_run_button = ttk.Button(buttons, text="削除予定を確認", command=self.cleanup_after_cut_dry_run)
+        dry_run_button.pack(side=tk.LEFT)
+        delete_button = tk.Button(
+            buttons,
+            text="削除を実行…",
+            fg=DANGER_FG,
+            command=self.cleanup_after_cut_delete,
+        )
+        delete_button.pack(side=tk.LEFT, padx=8)
+        ttk.Button(buttons, text="閉じる", command=dialog.destroy).pack(side=tk.RIGHT)
+        self.action_buttons.extend([dry_run_button, delete_button])
+
+    # ---------------------------------------------------------------- 各種処理
     def open_frame_selector(self) -> None:
         if self.frame_selector is not None and self.frame_selector.winfo_exists():
             self.frame_selector.lift()
@@ -397,16 +644,46 @@ class KiteClipperGui(tk.Tk):
         ]:
             folder.mkdir(parents=True, exist_ok=True)
 
+    def ai_scoring_done(self) -> bool:
+        """AI採点が「現在の review/frames の内容」に対して実施済みかどうか。
+
+        logs/ai_scores.csv には過去の実行結果が残ることがあるため、ファイルの
+        有無だけでなく、採点されたフレームが現在も review/frames に存在するかで
+        判定します（1件でも一致すれば採点済みとみなします）。
+        """
+        csv_path = ROOT / "logs" / "ai_scores.csv"
+        if not csv_path.exists() or self.counts.get("review_frames", 0) == 0:
+            return False
+        frames_dir = ROOT / "review" / "frames"
+        try:
+            with csv_path.open("r", encoding="utf-8-sig", newline="") as file:
+                for row in csv.DictReader(file):
+                    name = row.get("frame_name") or ""
+                    if name and (frames_dir / name).exists():
+                        return True
+        except Exception:
+            return False
+        return False
+
     def refresh_counts(self) -> None:
-        counts = {
-            "元写真": count_files(ROOT / "input" / "photos"),
-            "元動画": count_files(ROOT / "input" / "videos"),
-            "候補写真": count_files(ROOT / "review" / "photos"),
-            "抽出フレーム": count_files(ROOT / "review" / "frames"),
-            "選択フレーム": count_files(ROOT / "selected_frames"),
-            "切り出し動画": count_files(ROOT / "selected_clips"),
+        self.counts = {
+            "input_photos": count_files(ROOT / "input" / "photos"),
+            "input_videos": count_files(ROOT / "input" / "videos"),
+            "review_photos": count_files(ROOT / "review" / "photos"),
+            "review_frames": count_files(ROOT / "review" / "frames"),
+            "selected_frames": count_files(ROOT / "selected_frames"),
+            "selected_clips": count_files(ROOT / "selected_clips"),
+            "final": count_files(ROOT / "final"),
         }
-        self.counts_var.set(" / ".join(f"{name}: {count}" for name, count in counts.items()))
+        counts = self.counts
+        self.materials_var.set(f"動画 {counts['input_videos']}本 / 写真 {counts['input_photos']}枚")
+        ai_state = "済" if self.ai_scoring_done() else "未"
+        self.frames_status_var.set(
+            f"抽出フレーム: {counts['review_frames']}枚 ／ 候補写真: {counts['review_photos']}枚"
+        )
+        self.select_status_var.set(f"採用 {counts['selected_frames']} / 全 {counts['review_frames']} 枚 ／ AI採点: {ai_state}")
+        self.cut_status_var.set(f"切り出し済みクリップ: {counts['selected_clips']}本")
+        self.update_stepper()
 
     def refresh_clips(self) -> None:
         self.clip_paths = sorted(
@@ -580,9 +857,10 @@ class KiteClipperGui(tk.Tk):
         total = sum(self.clip_durations.get(path, 0.0) for path in self.clip_paths)
         if not self.clip_paths:
             self.total_duration_var.set("合計: 00:00.00")
-            return
-        short_label = "ショート目安: 60秒以内" if total <= 60.0 else "ショート目安: 60秒超"
-        self.total_duration_var.set(f"合計: {format_duration(total)}  /  {short_label}")
+        else:
+            short_label = "ショート目安: 60秒以内" if total <= 60.0 else "ショート目安: 60秒超"
+            self.total_duration_var.set(f"合計: {format_duration(total)}  /  {short_label}")
+        self.update_stepper()
 
     def validate_number(self, label: str, value: str, allow_zero: bool) -> bool:
         try:
@@ -707,6 +985,8 @@ class KiteClipperGui(tk.Tk):
 
     def set_busy(self, busy: bool) -> None:
         state = tk.DISABLED if busy else tk.NORMAL
+        # 整理・削除ダイアログが閉じられた後のボタンなど、破棄済みウィジェットを除外します。
+        self.action_buttons = [button for button in self.action_buttons if button.winfo_exists()]
         for button in self.action_buttons:
             button.configure(state=state)
 
@@ -748,6 +1028,11 @@ class KiteClipperGui(tk.Tk):
     def append_log(self, message: str) -> None:
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
+        text = message.strip()
+        if text:
+            if len(text) > 90:
+                text = text[:90] + "…"
+            self.last_log_var.set("最終行: " + text)
 
     def show_cleanup_feedback(self, title: str) -> None:
         csv_path = ROOT / "logs" / "cleanup_after_cut.csv"
