@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from dataclasses import dataclass, field
@@ -46,6 +47,24 @@ AI_SCORE_MID_COLOR = "#ef6c00"
 AI_SCORE_LOW_COLOR = "#757575"
 AI_SCORE_HIGH_THRESHOLD = 70
 AI_SCORE_MID_THRESHOLD = 40
+
+# AI区間提案(logs/ai_segments.csv)のバンド表示。同一動画内で隣り合う区間を
+# 見分けられるよう、区間インデックス(0始まり)の偶奇で2色を交互に使います。
+# 既存のバッジ色(✔=SELECT_COLOR、NG=NG_COLOR、♪=AUDIO_COLOR、AI=AI_SCORE_*)と
+# 衝突しない色を選んでいます。
+SEGMENT_BAND_COLOR_EVEN = "#3949ab"
+SEGMENT_BAND_COLOR_ODD = "#00897b"
+SEGMENT_BAND_HEIGHT = 5
+# バンドがある場合、✔/NGバッジをこの分だけ下にずらして重なりを避けます。
+SEGMENT_BADGE_TOP_OFFSET = SEGMENT_BAND_HEIGHT + 3
+# フレーム時刻が区間に属するとみなす前後の許容秒数。
+SEGMENT_MATCH_TOLERANCE = 0.25
+
+# 「AI区間:」ドロップダウンの選択肢。
+SEGMENT_FILTER_ALL = "すべて"
+SEGMENT_FILTER_ONLY = "提案区間のみ"
+SEGMENT_FILTER_EXCLUDE = "提案区間以外"
+SEGMENT_FILTER_VALUES = [SEGMENT_FILTER_ALL, SEGMENT_FILTER_ONLY, SEGMENT_FILTER_EXCLUDE]
 
 # 音量ピーク判定: 1秒ごとのRMS音量(dB)が「動画全体の中央値+6dB」を超え、
 # かつ無音に近くない(-45dB以上)秒をピークとみなします。風切り音のような
@@ -119,6 +138,35 @@ def load_ai_scores(csv_path: Path) -> dict[str, float]:
     except Exception:
         return {}
     return scores
+
+
+def load_ai_segments(csv_path: Path) -> dict[str, list[tuple[float, float]]]:
+    """frame_scorer.py predict が出力する logs/ai_segments.csv を読み込みます。
+
+    ファイルが無い場合や壊れている場合は空辞書を返します（＝区間バンド表示なし、
+    従来どおりの挙動）。戻り値は video_stem -> [(start_sec, end_sec), ...]
+    (start_sec昇順)です。
+    """
+    if not csv_path.exists():
+        return {}
+    segments: dict[str, list[tuple[float, float]]] = {}
+    try:
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as file:
+            for row in csv.DictReader(file):
+                stem = row.get("video_stem") or ""
+                if not stem:
+                    continue
+                try:
+                    start_sec = float(row.get("start_sec") or "")
+                    end_sec = float(row.get("end_sec") or "")
+                except (TypeError, ValueError):
+                    continue
+                segments.setdefault(stem, []).append((start_sec, end_sec))
+    except Exception:
+        return {}
+    for stem in segments:
+        segments[stem].sort(key=lambda item: item[0])
+    return segments
 
 
 def fit_within(image: np.ndarray, box: int) -> np.ndarray:
@@ -227,6 +275,7 @@ class FrameSelectorWindow(tk.Toplevel):
 
         self.ng_info = load_ng_info(root / "logs" / "result.csv")
         self.ai_scores = load_ai_scores(root / "logs" / "ai_scores.csv")
+        self.ai_segments = load_ai_segments(root / "logs" / "ai_segments.csv")
         self.all_cells: list[FrameCell] = []
         self.cells: list[FrameCell] = []
         self.selected_names: set[str] = set()
@@ -240,15 +289,22 @@ class FrameSelectorWindow(tk.Toplevel):
         self.audio_peaks: dict[str, set[int]] = {}
         self.audio_gen = 0
         self.audio_queue: Queue[tuple[int, str, set[int]]] = Queue()
+        self.scoring_running = False
+        self.scoring_queue: Queue[tuple[int, str, str]] = Queue()
 
         self.filter_var = tk.StringVar(value="すべて")
         self.size_var = tk.StringVar(value=DEFAULT_SIZE)
         self.hide_ng_var = tk.BooleanVar(value=False)
+        self.segment_filter_var = tk.StringVar(value=SEGMENT_FILTER_ALL)
         self.stats_var = tk.StringVar(value="")
 
         self._build_widgets()
         self.reload_from_disk()
         self.after(80, self._poll_results)
+        # 初回ロード直後だけ、AI提案区間の一括採用を確認します（手動採用が既にある
+        # 場合は何も聞きません）。ウィンドウの初回描画が終わってから出すため
+        # after_idle を使います。
+        self.after_idle(self._maybe_offer_auto_adopt)
 
     # ---------------------------------------------------------------- UI構築
 
@@ -275,7 +331,27 @@ class FrameSelectorWindow(tk.Toplevel):
             bar, text="NG候補を隠す", variable=self.hide_ng_var, command=self.rebuild
         )
         self.hide_ng_check.pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Button(bar, text="再読み込み", command=self.reload_from_disk).pack(side=tk.LEFT)
+        ttk.Label(bar, text="AI区間:").pack(side=tk.LEFT)
+        self.segment_filter_box = ttk.Combobox(
+            bar,
+            textvariable=self.segment_filter_var,
+            state="readonly",
+            values=SEGMENT_FILTER_VALUES,
+            width=10,
+        )
+        self.segment_filter_box.pack(side=tk.LEFT, padx=(4, 12))
+        self.segment_filter_box.bind("<<ComboboxSelected>>", lambda _e: self.rebuild())
+        self.adopt_segments_button = ttk.Button(
+            bar, text="AI提案を採用", command=self.adopt_ai_segments
+        )
+        self.adopt_segments_button.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(bar, text="再読み込み", command=self.reload_from_disk).pack(
+            side=tk.LEFT, padx=(0, 12)
+        )
+        self.run_scoring_button = ttk.Button(
+            bar, text="AI採点を実行", command=self.run_ai_scoring
+        )
+        self.run_scoring_button.pack(side=tk.LEFT)
 
         info = ttk.Frame(self, padding=(10, 0, 10, 4))
         info.pack(fill=tk.X)
@@ -324,6 +400,7 @@ class FrameSelectorWindow(tk.Toplevel):
     def reload_from_disk(self) -> None:
         self.ng_info = load_ng_info(self.root_dir / "logs" / "result.csv")
         self.ai_scores = load_ai_scores(self.root_dir / "logs" / "ai_scores.csv")
+        self.ai_segments = load_ai_segments(self.root_dir / "logs" / "ai_segments.csv")
         self.rescan_selected()
         cells: list[FrameCell] = []
         if self.review_dir.exists():
@@ -356,6 +433,11 @@ class FrameSelectorWindow(tk.Toplevel):
         self.hide_ng_check.configure(state=tk.NORMAL if has_ng else tk.DISABLED)
         if not has_ng:
             self.hide_ng_var.set(False)
+        has_segments = any(self.ai_segments.values())
+        self.segment_filter_box.configure(state="readonly" if has_segments else tk.DISABLED)
+        if not has_segments:
+            self.segment_filter_var.set(SEGMENT_FILTER_ALL)
+        self.adopt_segments_button.configure(state=tk.NORMAL if has_segments else tk.DISABLED)
         self.audio_peaks = {}
         self.start_audio_analysis()
         self.rebuild()
@@ -370,11 +452,13 @@ class FrameSelectorWindow(tk.Toplevel):
 
     def rebuild(self) -> None:
         target = self.filter_var.get()
+        segment_filter = self.segment_filter_var.get()
         cells = [
             cell
             for cell in self.all_cells
             if (target == "すべて" or cell.video_stem == target)
             and not (self.hide_ng_var.get() and cell.is_ng)
+            and self._matches_segment_filter(cell, segment_filter)
         ]
         self.cells = cells
         self.focus_index = 0 if cells else None
@@ -430,6 +514,20 @@ class FrameSelectorWindow(tk.Toplevel):
                     x + box // 2, y + box // 2, image=cell.thumb
                 )
                 self.canvas.tag_lower(cell.img_id, cell.rect_id)
+            segment_index = self.segment_index_for(cell)
+            if segment_index is not None:
+                band_color = (
+                    SEGMENT_BAND_COLOR_EVEN if segment_index % 2 == 0 else SEGMENT_BAND_COLOR_ODD
+                )
+                self.canvas.create_rectangle(
+                    x,
+                    y,
+                    x + box,
+                    y + SEGMENT_BAND_HEIGHT,
+                    fill=band_color,
+                    outline="",
+                )
+            top_offset = SEGMENT_BADGE_TOP_OFFSET if segment_index is not None else 0
             label = f"{cell.time_sec:.1f}s" if cell.time_sec >= 0 else cell.path.stem[:16]
             if show_stem and cell.time_sec >= 0:
                 stem = cell.video_stem
@@ -443,11 +541,11 @@ class FrameSelectorWindow(tk.Toplevel):
                 fill="#333333",
             )
             if selected:
-                cell.check_id = self._create_check(x, y)
+                cell.check_id = self._create_check(x, y, top_offset)
             if cell.is_ng:
                 self.canvas.create_text(
                     x + box - 6,
-                    y + 6,
+                    y + 6 + top_offset,
                     text="NG",
                     anchor=tk.NE,
                     font=("", 10, "bold"),
@@ -486,15 +584,36 @@ class FrameSelectorWindow(tk.Toplevel):
             )
         self.update_focus_rect()
 
-    def _create_check(self, x: int, y: int) -> int:
+    def _create_check(self, x: int, y: int, top_offset: int = 0) -> int:
         return self.canvas.create_text(
             x + 8,
-            y + 4,
+            y + 4 + top_offset,
             text="✔",
             anchor=tk.NW,
             font=("", 13, "bold"),
             fill=SELECT_COLOR,
         )
+
+    def segment_index_for(self, cell: FrameCell) -> int | None:
+        """cell が logs/ai_segments.csv の提案区間に属していれば、その動画内での
+        区間インデックス(0始まり)を返します。属していなければ None です。
+        時刻の前後 SEGMENT_MATCH_TOLERANCE 秒までは同じ区間とみなします。
+        """
+        segments = self.ai_segments.get(cell.video_stem)
+        if not segments or cell.time_sec < 0:
+            return None
+        for index, (start_sec, end_sec) in enumerate(segments):
+            if start_sec - SEGMENT_MATCH_TOLERANCE <= cell.time_sec <= end_sec + SEGMENT_MATCH_TOLERANCE:
+                return index
+        return None
+
+    def _matches_segment_filter(self, cell: FrameCell, filter_value: str) -> bool:
+        """「AI区間:」ドロップダウンの選択肢に応じて cell を表示するかどうかを返します。"""
+        if filter_value == SEGMENT_FILTER_ONLY:
+            return self.segment_index_for(cell) is not None
+        if filter_value == SEGMENT_FILTER_EXCLUDE:
+            return self.segment_index_for(cell) is None
+        return True
 
     def update_focus_rect(self) -> None:
         if self.focus_rect_id:
@@ -597,6 +716,12 @@ class FrameSelectorWindow(tk.Toplevel):
             pass
         if audio_updated:
             self.redraw_all()
+        try:
+            while True:
+                returncode, stdout, stderr = self.scoring_queue.get_nowait()
+                self._handle_scoring_result(returncode, stdout, stderr)
+        except Empty:
+            pass
         self.after(80, self._poll_results)
 
     # -------------------------------------------------------- 音量ピーク解析
@@ -668,6 +793,70 @@ class FrameSelectorWindow(tk.Toplevel):
         cell.img_id = self.canvas.create_image(x + box // 2, y + box // 2, image=cell.thumb)
         self.canvas.tag_lower(cell.img_id, cell.rect_id)
         self.canvas.itemconfigure(cell.rect_id, fill="")
+
+    # -------------------------------------------------------------- AI採点の実行
+
+    def run_ai_scoring(self) -> None:
+        """「AI採点を実行」ボタンの処理です。frame_scorer.py predict をバック
+        グラウンドのサブプロセスで実行し、完了後に reload_from_disk() で結果を
+        反映します。UIはブロックしません。
+        """
+        if self.scoring_running:
+            return
+        if not messagebox.askyesno(
+            "AI採点を実行",
+            "AI採点(区間提案つき)を実行します。フレーム数によって数十秒かかることがあります。よろしいですか?",
+            parent=self,
+        ):
+            return
+        self.scoring_running = True
+        self.run_scoring_button.configure(state=tk.DISABLED, text="AI採点 実行中...")
+        threading.Thread(target=self._ai_scoring_worker, daemon=True).start()
+
+    def _ai_scoring_worker(self) -> None:
+        script_path = self.root_dir / "frame_scorer.py"
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script_path), "predict"],
+                cwd=self.root_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            self.scoring_queue.put((result.returncode, result.stdout or "", result.stderr or ""))
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.scoring_queue.put((-1, "", str(exc)))
+
+    def _handle_scoring_result(self, returncode: int, stdout: str, stderr: str) -> None:
+        self.scoring_running = False
+        if not self.winfo_exists():
+            return
+        self.run_scoring_button.configure(state=tk.NORMAL, text="AI採点を実行")
+        if returncode == 0:
+            self.reload_from_disk()
+            segment_count = sum(len(segments) for segments in self.ai_segments.values())
+            messagebox.showinfo(
+                "AI採点を実行",
+                f"AI採点が完了しました。(提案区間 {segment_count} 件)",
+                parent=self,
+            )
+        else:
+            detail = self._tail_lines(stderr) or self._tail_lines(stdout) or "(詳細不明)"
+            messagebox.showerror(
+                "AI採点を実行",
+                f"AI採点に失敗しました(終了コード {returncode})。\n\n{detail}",
+                parent=self,
+            )
+
+    @staticmethod
+    def _tail_lines(text: str, count: int = 8) -> str:
+        lines = [line for line in text.splitlines() if line.strip()]
+        return "\n".join(lines[-count:])
 
     # ------------------------------------------------------------ 選択操作
 
@@ -779,12 +968,16 @@ class FrameSelectorWindow(tk.Toplevel):
     def on_mousewheel(self, event: tk.Event) -> None:
         self.canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
 
-    def set_selected(self, index: int, target: bool) -> None:
-        cell = self.cells[index]
+    def _set_frame_selected_state(self, cell: FrameCell, target: bool) -> bool:
+        """cell の採用状態を実際に変更します(selected_frames へのコピー/削除、
+        selected_namesの更新)。キャンバス描画は行いません（呼び出し側の責務）。
+
+        状態が変わった場合はTrue、既に同じ状態だった場合やエラー時はFalseを返します。
+        """
         name = cell.path.name
         already = name in self.selected_names
         if target == already:
-            return
+            return False
         try:
             if target:
                 self.selected_dir.mkdir(parents=True, exist_ok=True)
@@ -799,6 +992,13 @@ class FrameSelectorWindow(tk.Toplevel):
                 self.selected_names.discard(name)
         except OSError as exc:
             messagebox.showerror("selected_frames を更新できません", str(exc), parent=self)
+            return False
+        return True
+
+    def set_selected(self, index: int, target: bool) -> None:
+        cell = self.cells[index]
+        changed = self._set_frame_selected_state(cell, target)
+        if not changed:
             return
         if cell.rect_id:
             self.canvas.itemconfigure(
@@ -808,7 +1008,9 @@ class FrameSelectorWindow(tk.Toplevel):
             )
         if target and not cell.check_id:
             x, y = self.cell_geometry(index)
-            cell.check_id = self._create_check(x, y)
+            segment_index = self.segment_index_for(cell)
+            top_offset = SEGMENT_BADGE_TOP_OFFSET if segment_index is not None else 0
+            cell.check_id = self._create_check(x, y, top_offset)
         elif not target and cell.check_id:
             self.canvas.delete(cell.check_id)
             cell.check_id = 0
@@ -819,6 +1021,70 @@ class FrameSelectorWindow(tk.Toplevel):
             self.on_selection_change()
         except Exception:
             pass
+
+    # -------------------------------------------------------- AI提案区間の採用
+
+    def _collect_unselected_segment_cells(self) -> list[FrameCell]:
+        """all_cells の中で、提案区間に属していてまだ未採用のセルを返します
+        (現在の絞り込み表示に関係なく、全フレームが対象です)。
+        """
+        return [
+            cell
+            for cell in self.all_cells
+            if cell.path.name not in self.selected_names and self.segment_index_for(cell) is not None
+        ]
+
+    def _adopt_cells(self, cells: list[FrameCell]) -> None:
+        """指定セルをまとめて採用します(selected_frames へコピー)。
+        set_selected と同じ採用処理(_set_frame_selected_state)を再利用し、
+        完了後にビューア全体を再構築して統計表示も更新します。
+        """
+        changed = False
+        for cell in cells:
+            if self._set_frame_selected_state(cell, True):
+                changed = True
+        if not changed:
+            return
+        self.rebuild()
+        try:
+            self.on_selection_change()
+        except Exception:
+            pass
+
+    def adopt_ai_segments(self) -> None:
+        """「AI提案を採用」ボタンの処理です。提案区間に属する未採用フレームを
+        確認の上、一括採用します。
+        """
+        cells = self._collect_unselected_segment_cells()
+        if not cells:
+            messagebox.showinfo(
+                "AI提案を採用", "採用できるAI提案区間のフレームがありません。", parent=self
+            )
+            return
+        if not messagebox.askyesno(
+            "AI提案を採用",
+            f"AI提案区間の {len(cells)} フレームを採用します。よろしいですか?",
+            parent=self,
+        ):
+            return
+        self._adopt_cells(cells)
+
+    def _maybe_offer_auto_adopt(self) -> None:
+        """ビューアを開いた直後、AI提案区間があり、かつ現在の採用が0件のときだけ、
+        一括採用してよいか自動で確認します。既に手動採用がある場合は何も聞きません
+        （ユーザーの選択を壊さないため）。
+        """
+        if not self.winfo_exists() or self.selected_names:
+            return
+        cells = self._collect_unselected_segment_cells()
+        if not cells:
+            return
+        if messagebox.askyesno(
+            "AI提案区間を採用",
+            f"AI提案区間の {len(cells)} フレームを採用します。よろしいですか?",
+            parent=self,
+        ):
+            self._adopt_cells(cells)
 
     # ------------------------------------------------------------ 統計表示
 

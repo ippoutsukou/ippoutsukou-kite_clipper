@@ -66,6 +66,14 @@ CLIP_LOGREG_C = 0.1
 CLIP_MODEL_RELATIVE_PATH = Path("vendor/clip/vision_model_quantized.onnx")
 CLIP_CACHE_RELATIVE_DIR = Path("work/embeddings")
 
+# Phase 2(区間提案)関連の既定値。segment_simulator.py のシミュレーションで実証済みの
+# 値と揃えています（segment_simulator.py の DEFAULT_ENTER/DEFAULT_EXIT/DEFAULT_SMOOTH_WINDOW
+# と同じ値。segment_simulator.py は変更禁止のためここに複製しています）。
+DEFAULT_SEGMENT_ENTER = 0.5
+DEFAULT_SEGMENT_EXIT = 0.4
+DEFAULT_SEGMENT_SMOOTH_WINDOW = 3
+AI_SEGMENTS_RELATIVE_PATH = Path("logs/ai_segments.csv")
+
 
 def resolve_root(root_arg: Path | None) -> Path:
     return root_arg.resolve() if root_arg else Path(__file__).resolve().parent
@@ -350,6 +358,117 @@ class AudioPeakLookup:
         return "1" if is_peak else "0"
 
 
+def smooth_scores(scores: list[float], window: int) -> list[float]:
+    """移動平均でスコアを平滑化します(窓=window、中央寄せ)。window<=1なら平滑化なしです。
+
+    segment_simulator.py の smooth_scores と完全に同じアルゴリズムです。区間提案の
+    挙動を一致させるため、segment_simulator.py を変更せずここに複製しています。
+    """
+    n = len(scores)
+    if window <= 1 or n == 0:
+        return list(scores)
+    half = window // 2
+    smoothed: list[float] = []
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        smoothed.append(sum(scores[lo:hi]) / (hi - lo))
+    return smoothed
+
+
+def build_segments_for_video(
+    times: list[float], raw_scores: list[float], enter: float, exit_: float, window: int
+) -> list[tuple[float, float, int, float]]:
+    """1動画分のフレーム時刻・スコアから、ヒステリシス方式で提案区間を作ります。
+
+    times は time_sec 昇順である前提です。戻り値は
+    (start_sec, end_sec, frame_count, mean_score) のリストです（mean_scoreは平滑化前の
+    raw_scores の区間内平均）。
+
+    区間化ロジックは segment_simulator.py の build_proposed_segments と同一です
+    （平滑化スコアが enter 以上で区間開始、exit 未満で区間終了。区間は
+    [開始フレーム時刻, 終了直前フレーム時刻]）。segment_simulator.py は変更禁止のため、
+    ここに同じロジックを複製しています。
+    """
+    if not times:
+        return []
+    scores = smooth_scores(raw_scores, window)
+
+    segments: list[tuple[float, float, int, float]] = []
+    in_segment = False
+    start_time = 0.0
+    last_high_time = 0.0
+    start_index = 0
+    for index, (time_sec, score) in enumerate(zip(times, scores)):
+        if not in_segment:
+            if score >= enter:
+                in_segment = True
+                start_time = time_sec
+                last_high_time = time_sec
+                start_index = index
+        else:
+            if score >= exit_:
+                last_high_time = time_sec
+            else:
+                frame_count = index - start_index
+                mean_score = sum(raw_scores[start_index:index]) / frame_count
+                segments.append((start_time, last_high_time, frame_count, mean_score))
+                in_segment = False
+    if in_segment:
+        frame_count = len(times) - start_index
+        mean_score = sum(raw_scores[start_index:]) / frame_count
+        segments.append((start_time, last_high_time, frame_count, mean_score))
+    return segments
+
+
+def group_scores_by_video(
+    scored_rows: list[tuple[str, str, float, list[float]]], proba: np.ndarray
+) -> dict[str, list[tuple[float, float]]]:
+    """scored_rows(frame_name, video_stem, time_sec, vector)とスコア配列から、
+    video_stem -> [(time_sec, ai_score), ...] (time_sec昇順)の辞書を作ります。
+
+    review/frames の走査順(パス文字列順)はtime_secの数値順と一致しない場合がある
+    （例: "t2.0" と "t10.0" の文字列比較では t10.0 が先に来る）ため、ここで明示的に
+    time_sec で数値ソートし直します。
+    """
+    grouped: dict[str, list[tuple[float, float]]] = {}
+    for (_frame_name, video_stem, time_sec, _vector), score in zip(scored_rows, proba):
+        grouped.setdefault(video_stem, []).append((time_sec, float(score)))
+    for video_stem in grouped:
+        grouped[video_stem].sort(key=lambda item: item[0])
+    return grouped
+
+
+def write_ai_segments_csv(
+    csv_path: Path,
+    grouped: dict[str, list[tuple[float, float]]],
+    enter: float,
+    exit_: float,
+    window: int,
+) -> list[tuple[str, int, float, float, int, float]]:
+    """動画ごとに区間化し、logs/ai_segments.csv (utf-8-sig、上書き)に書き出します。
+
+    戻り値はコンソールサマリー表示用に、全区間を
+    (video_stem, segment_index, start_sec, end_sec, frame_count, mean_score) として返します
+    (segment_index は動画ごとに1始まり)。
+    """
+    all_rows: list[tuple[str, int, float, float, int, float]] = []
+    for video_stem in sorted(grouped):
+        times = [item[0] for item in grouped[video_stem]]
+        raw_scores = [item[1] for item in grouped[video_stem]]
+        segments = build_segments_for_video(times, raw_scores, enter, exit_, window)
+        for segment_index, (start_sec, end_sec, frame_count, mean_score) in enumerate(segments, start=1):
+            all_rows.append((video_stem, segment_index, start_sec, end_sec, frame_count, mean_score))
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["video_stem", "segment_index", "start_sec", "end_sec", "frame_count", "mean_score"])
+        for video_stem, segment_index, start_sec, end_sec, frame_count, mean_score in all_rows:
+            writer.writerow([video_stem, segment_index, start_sec, end_sec, frame_count, f"{mean_score:.4f}"])
+    return all_rows
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="dataset/labels.csv の教師データからフレーム採用スコアを学習・予測します。"
@@ -406,6 +525,31 @@ def parse_args() -> argparse.Namespace:
     )
     predict_parser.add_argument(
         "--root", type=Path, default=None, help="プロジェクトルート（既定はこのスクリプトのあるフォルダ）"
+    )
+    predict_parser.add_argument(
+        "--enter",
+        type=float,
+        default=DEFAULT_SEGMENT_ENTER,
+        help=f"区間提案(logs/ai_segments.csv)の開始スコアしきい値（既定: {DEFAULT_SEGMENT_ENTER}）",
+    )
+    predict_parser.add_argument(
+        "--exit",
+        dest="exit_",
+        type=float,
+        default=DEFAULT_SEGMENT_EXIT,
+        help=f"区間提案(logs/ai_segments.csv)の終了スコアしきい値（既定: {DEFAULT_SEGMENT_EXIT}）",
+    )
+    predict_parser.add_argument(
+        "--smooth-window",
+        type=int,
+        default=DEFAULT_SEGMENT_SMOOTH_WINDOW,
+        help="区間提案のスコア平滑化の移動平均窓(フレーム数、中央寄せ。1で平滑化なし)"
+        f"（既定: {DEFAULT_SEGMENT_SMOOTH_WINDOW}）",
+    )
+    predict_parser.add_argument(
+        "--no-segments",
+        action="store_true",
+        help="区間提案CSV(logs/ai_segments.csv)を出力しません",
     )
 
     return parser.parse_args()
@@ -683,6 +827,10 @@ def cmd_predict(args: argparse.Namespace) -> int:
     model_path = resolve_path(root, args.model)
     out_path = resolve_path(root, args.out)
 
+    if not args.no_segments and args.enter <= args.exit_:
+        print(f"エラー: --enter({args.enter})は--exit({args.exit_})より大きい必要があります。")
+        return 1
+
     if not model_path.exists():
         print(f"エラー: モデルファイルが見つかりません: {model_path}")
         print("先に train を実行してください。")
@@ -791,6 +939,28 @@ def cmd_predict(args: argparse.Namespace) -> int:
     for (frame_name, _video_stem, _time_sec, _vector), score in ranked:
         print(f"{frame_name}: {float(score):.4f}")
     print(f"出力先: {out_path}")
+
+    if args.no_segments:
+        print("区間提案: --no-segments が指定されたため logs/ai_segments.csv は出力しません。")
+    else:
+        grouped = group_scores_by_video(scored_rows, proba)
+        segments_path = resolve_path(root, AI_SEGMENTS_RELATIVE_PATH)
+        all_segment_rows = write_ai_segments_csv(
+            segments_path, grouped, args.enter, args.exit_, args.smooth_window
+        )
+        counts_by_video: dict[str, int] = {video_stem: 0 for video_stem in grouped}
+        total_duration = 0.0
+        for video_stem, _segment_index, start_sec, end_sec, _frame_count, _mean_score in all_segment_rows:
+            counts_by_video[video_stem] += 1
+            total_duration += max(0.0, end_sec - start_sec)
+        print("--- 区間提案サマリー ---")
+        print(
+            f"パラメータ: enter={args.enter} / exit={args.exit_} / smooth-window={args.smooth_window}"
+        )
+        for video_stem in sorted(counts_by_video):
+            print(f"  {video_stem}: {counts_by_video[video_stem]} 区間")
+        print(f"全体: {len(all_segment_rows)} 区間 / 合計 {total_duration:.1f} 秒")
+        print(f"区間提案出力先: {segments_path}")
     return 0
 
 
