@@ -66,6 +66,34 @@ STEP_LABELS = {
     5: "⑤ 結合",
 }
 
+# 「最終サイズ」「表示方法」の内部値 ⇔ 画面表示用の日本語ラベル対応表。
+# CLIへ渡す値（vertical/horizontal/square/original, contain/cover）は
+# 一切変更せず、表示だけを日本語にするための変換に使います。
+NORMALIZE_CHOICES: list[tuple[str, str]] = [
+    ("vertical", "縦 9:16"),
+    ("horizontal", "横 16:9"),
+    ("square", "正方形 1:1"),
+    ("original", "元動画のサイズ"),
+]
+FIT_CHOICES: list[tuple[str, str]] = [
+    ("contain", "全体を収める"),
+    ("cover", "画面いっぱい"),
+]
+
+
+def _label_for_value(choices: list[tuple[str, str]], value: str) -> str:
+    for internal, label in choices:
+        if internal == value:
+            return label
+    return value
+
+
+def _value_for_label(choices: list[tuple[str, str]], label: str) -> str:
+    for internal, choice_label in choices:
+        if choice_label == label:
+            return internal
+    return choices[0][0]
+
 
 def bundled_tool_path(tool_name: str) -> str:
     bundled = app_base_dir() / "vendor" / "ffmpeg" / "windows-x64" / f"{tool_name}.exe"
@@ -159,8 +187,14 @@ class KiteClipperGui(tk.Tk):
         self.select_status_var = tk.StringVar(value="")
         self.cut_status_var = tk.StringVar(value="")
         self.detail_panels: dict[int, ttk.Frame] = {}
+        self.panel_footers: dict[int, ttk.Frame] = {}
+        self.panel_canvases: dict[int, tk.Canvas] = {}
         self.step_rows: dict[int, dict[str, tk.Widget]] = {}
         self.cleanup_dialog: tk.Toplevel | None = None
+
+        # 工程5「選択クリップ」のタグ編集トグル用の状態
+        self.clip_tags_summary_var = tk.StringVar(value="登場人物: （未設定）")
+        self.tag_editor_visible = False
 
         # ログは下部バーに最終行のみ表示し、クリックで全文を展開します。
         self.log_visible = False
@@ -225,6 +259,9 @@ class KiteClipperGui(tk.Tk):
         self._build_panel_cut()
         self._build_panel_concat()
 
+        # パネル本文のホイールスクロール。add="+" で既存のバインドを潰さないようにします。
+        self.bind_all("<MouseWheel>", self._on_panel_mousewheel, add="+")
+
     def _build_stepper(self, parent: ttk.Frame) -> None:
         outer = ttk.LabelFrame(parent, text="工程")
         outer.pack(side=tk.LEFT, fill=tk.Y)
@@ -263,15 +300,74 @@ class KiteClipperGui(tk.Tk):
         ).pack(fill=tk.X, padx=2, pady=(0, 2))
 
     # ---------------------------------------------------------- 各工程のパネル
-    def _panel_inner(self, number: int, title: str) -> ttk.Frame:
+    def _panel_inner(self, number: int, title: str) -> tuple[ttk.Frame, ttk.Frame]:
+        """各工程のパネルを「スクロール可能な本文＋下部固定フッター」の
+        2段構成で作ります。戻り値は (本文用の内側Frame, フッターFrame) です。
+        """
         panel = ttk.LabelFrame(self.detail_container, text=title)
         self.detail_panels[number] = panel
-        inner = ttk.Frame(panel, padding=12)
-        inner.pack(fill=tk.BOTH, expand=True)
-        return inner
+
+        # ---- 下部固定フッター（本文より先にpackすることで下端に固定されます）
+        footer = ttk.Frame(panel, padding=(12, 8))
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Separator(panel, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
+        self.panel_footers[number] = footer
+
+        # ---- 本文: Canvas + 縦Scrollbar + 内側Frame（スクロール可能）
+        body_area = ttk.Frame(panel)
+        body_area.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(body_area, highlightthickness=0, background=self._row_bg)
+        scrollbar = ttk.Scrollbar(body_area, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        inner = ttk.Frame(canvas, padding=12)
+        inner_window = canvas.create_window((0, 0), window=inner, anchor=tk.NW)
+
+        def _on_inner_configure(_event: object, _canvas: tk.Canvas = canvas) -> None:
+            _canvas.configure(scrollregion=_canvas.bbox("all"))
+
+        def _on_canvas_configure(
+            event: tk.Event, _canvas: tk.Canvas = canvas, _window: int = inner_window
+        ) -> None:
+            _canvas.itemconfigure(_window, width=event.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # マウスホイールはアプリ共通の _on_panel_mousewheel で処理するため、
+        # ここではパネル番号→Canvasの対応だけ登録します。
+        self.panel_canvases[number] = canvas
+
+        return inner, footer
+
+    def _on_panel_mousewheel(self, event: tk.Event) -> None:
+        """パネル本文のCanvasをマウスホイールでスクロールします。
+
+        Windowsではホイールイベントがフォーカス先へ届くことがあるため、
+        カーソル直下のウィジェットを起点に、所属するパネルCanvasを親方向へ
+        たどって特定します。リストやログ（Listbox/Text）の上では、それ自身の
+        スクロールに任せるため何もしません。
+        """
+        try:
+            widget = self.winfo_containing(event.x_root, event.y_root)
+        except (KeyError, tk.TclError):
+            return
+        if widget is None or widget.winfo_toplevel() is not self:
+            # 選別ビューアなど別ウィンドウ上のホイールには干渉しません。
+            return
+        canvases = set(self.panel_canvases.values())
+        while widget is not None:
+            if isinstance(widget, (tk.Listbox, tk.Text)):
+                return
+            if widget in canvases:
+                widget.yview_scroll(int(-event.delta / 120) * 3, "units")
+                return
+            widget = widget.master
 
     def _build_panel_materials(self) -> None:
-        inner = self._panel_inner(1, "① 素材を用意")
+        inner, footer = self._panel_inner(1, "① 素材を用意")
         ttk.Label(inner, text="input/videos に元動画、input/photos に元写真を入れてください。").pack(anchor=tk.W)
         ttk.Label(inner, textvariable=self.materials_var, font=(APP_FONT_FAMILY, 11, "bold")).pack(
             anchor=tk.W, pady=(10, 14)
@@ -286,12 +382,18 @@ class KiteClipperGui(tk.Tk):
         )
         ttk.Label(
             inner,
-            text="素材を入れたら右上の「再読み込み」で本数を更新し、「② フレーム生成」へ進んでください。",
+            text="素材を入れたら下の「再読み込みして次へ ▶」で本数を更新し、「② フレーム生成」へ進んでください。",
             foreground="#888",
         ).pack(anchor=tk.W, pady=(16, 0))
 
+        def _refresh_and_advance() -> None:
+            self.refresh_all()
+            self.show_step(2)
+
+        _accent_button(footer, "再読み込みして次へ ▶", _refresh_and_advance).pack(side=tk.RIGHT)
+
     def _build_panel_generate(self) -> None:
-        inner = self._panel_inner(2, "② フレーム生成")
+        inner, footer = self._panel_inner(2, "② フレーム生成")
         ttk.Label(
             inner,
             text="元動画から一定間隔でフレーム画像を抽出します（review/frames に出力）。\n写真は候補チェックのうえ review/photos にコピーされます。",
@@ -304,10 +406,7 @@ class KiteClipperGui(tk.Tk):
             textvariable=self.frame_interval,
             values=("1", "0.5", "0.25"),
             width=8,
-        ).pack(side=tk.LEFT, padx=(0, 12))
-        generate_button = _accent_button(row, "フレームを生成", self.generate_candidates)
-        generate_button.pack(side=tk.LEFT)
-        self.action_buttons.append(generate_button)
+        ).pack(side=tk.LEFT)
         ttk.Label(inner, textvariable=self.frames_status_var, font=(APP_FONT_FAMILY, 11, "bold")).pack(
             anchor=tk.W, pady=(10, 14)
         )
@@ -320,8 +419,12 @@ class KiteClipperGui(tk.Tk):
             side=tk.LEFT
         )
 
+        generate_button = _accent_button(footer, "フレームを生成", self.generate_candidates)
+        generate_button.pack(side=tk.RIGHT)
+        self.action_buttons.append(generate_button)
+
     def _build_panel_select(self) -> None:
-        inner = self._panel_inner(3, "③ フレームを選別")
+        inner, footer = self._panel_inner(3, "③ フレームを選別")
         ttk.Label(
             inner,
             text="ビューアで残したいフレームを選ぶと selected_frames にコピーされます。\nAIスコア・提案区間・音量ピークを参考に選べます。",
@@ -329,11 +432,8 @@ class KiteClipperGui(tk.Tk):
         ttk.Label(inner, textvariable=self.select_status_var, font=(APP_FONT_FAMILY, 11, "bold")).pack(
             anchor=tk.W, pady=(10, 14)
         )
-        row = ttk.Frame(inner)
-        row.pack(anchor=tk.W)
-        _accent_button(row, "選別ビューアを開く", self.open_frame_selector).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Button(row, text="📁 selected_frames を開く", command=lambda: self.open_folder(ROOT / "selected_frames")).pack(
-            side=tk.LEFT
+        ttk.Button(inner, text="📁 selected_frames を開く", command=lambda: self.open_folder(ROOT / "selected_frames")).pack(
+            anchor=tk.W
         )
         ttk.Label(
             inner,
@@ -346,8 +446,10 @@ class KiteClipperGui(tk.Tk):
             foreground="#888",
         ).pack(anchor=tk.W, pady=(4, 0))
 
+        _accent_button(footer, "選別ビューアを開く", self.open_frame_selector).pack(side=tk.RIGHT)
+
     def _build_panel_cut(self) -> None:
-        inner = self._panel_inner(4, "④ 選択フレームから動画を切り出し")
+        inner, footer = self._panel_inner(4, "④ 選択フレームから動画を切り出し")
         ttk.Label(
             inner,
             text="selected_frames の連続した時間帯ごとに、元動画から selected_clips へ動画を切り出します。",
@@ -361,10 +463,17 @@ class KiteClipperGui(tk.Tk):
         ]:
             ttk.Label(row, text=label).pack(side=tk.LEFT, padx=(0, 4))
             ttk.Entry(row, textvariable=var, width=7).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Checkbutton(row, text="高速コピー", variable=self.fast_copy).pack(side=tk.LEFT, padx=(0, 12))
-        cut_button = _accent_button(row, "切り出しを実行", self.cut_from_selected_frames)
-        cut_button.pack(side=tk.LEFT)
-        self.action_buttons.append(cut_button)
+        ttk.Checkbutton(row, text="高速コピー", variable=self.fast_copy).pack(side=tk.LEFT)
+        ttk.Label(
+            inner,
+            text=(
+                "高速コピー: 再エンコードせずコピーするため処理が速く、おすすめです。"
+                "カット位置がキーフレーム単位になるため、クリップの前後が少しずれることがあります。"
+            ),
+            foreground="#888",
+            wraplength=520,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(4, 4))
         ttk.Label(inner, textvariable=self.cut_status_var, font=(APP_FONT_FAMILY, 11, "bold")).pack(
             anchor=tk.W, pady=(10, 14)
         )
@@ -377,40 +486,63 @@ class KiteClipperGui(tk.Tk):
             foreground="#888",
         ).pack(anchor=tk.W, pady=(16, 0))
 
+        cut_button = _accent_button(footer, "切り出しを実行", self.cut_from_selected_frames)
+        cut_button.pack(side=tk.RIGHT)
+        self.action_buttons.append(cut_button)
+
     def _build_panel_concat(self) -> None:
-        concat_frame = self._panel_inner(5, "⑤ selected_clips を結合")
+        concat_frame, footer = self._panel_inner(5, "⑤ selected_clips を結合")
 
         normalize_frame = ttk.Frame(concat_frame)
         normalize_frame.pack(fill=tk.X)
         ttk.Label(normalize_frame, text="最終サイズ").pack(side=tk.LEFT, padx=(0, 4))
+        self.normalize_display_var = tk.StringVar()
         normalize_combo = ttk.Combobox(
             normalize_frame,
-            textvariable=self.normalize_mode,
-            values=("vertical", "horizontal", "square", "original"),
-            width=12,
+            textvariable=self.normalize_display_var,
+            values=[label for _value, label in NORMALIZE_CHOICES],
+            width=14,
             state="readonly",
         )
         normalize_combo.pack(side=tk.LEFT, padx=4)
         ttk.Label(normalize_frame, text="表示方法").pack(side=tk.LEFT, padx=(12, 4))
+        self.fit_display_var = tk.StringVar()
         fit_combo = ttk.Combobox(
             normalize_frame,
-            textvariable=self.fit_mode,
-            values=("contain", "cover"),
-            width=10,
+            textvariable=self.fit_display_var,
+            values=[label for _value, label in FIT_CHOICES],
+            width=12,
             state="readonly",
         )
         fit_combo.pack(side=tk.LEFT, padx=4)
-        ttk.Label(normalize_frame, textvariable=self.concat_info_var, foreground="#888").pack(
-            side=tk.LEFT, padx=12
-        )
-        normalize_combo.bind("<<ComboboxSelected>>", self.update_concat_info)
-        fit_combo.bind("<<ComboboxSelected>>", self.update_concat_info)
+        ttk.Label(
+            normalize_frame,
+            textvariable=self.concat_info_var,
+            foreground="#888",
+            wraplength=420,
+            justify=tk.LEFT,
+        ).pack(side=tk.LEFT, padx=12)
+
+        # 表示ラベルの初期値は内部値（normalize_mode/fit_mode）から逆引きします。
+        self.normalize_display_var.set(_label_for_value(NORMALIZE_CHOICES, self.normalize_mode.get()))
+        self.fit_display_var.set(_label_for_value(FIT_CHOICES, self.fit_mode.get()))
+
+        def _on_normalize_selected(_event: object = None) -> None:
+            self.normalize_mode.set(_value_for_label(NORMALIZE_CHOICES, self.normalize_display_var.get()))
+            self.update_concat_info()
+
+        def _on_fit_selected(_event: object = None) -> None:
+            self.fit_mode.set(_value_for_label(FIT_CHOICES, self.fit_display_var.get()))
+            self.update_concat_info()
+
+        normalize_combo.bind("<<ComboboxSelected>>", _on_normalize_selected)
+        fit_combo.bind("<<ComboboxSelected>>", _on_fit_selected)
         self.update_concat_info()
 
         list_area = ttk.Frame(concat_frame)
         list_area.pack(fill=tk.BOTH, expand=True, pady=8)
 
-        # 選択クリップの詳細パネル（サムネイル・タグ入力・名前ボタンを1か所に集約）
+        # 選択クリップの詳細パネル（サムネイル・タグ表示・タグ編集を1か所に集約）
         detail_frame = ttk.LabelFrame(list_area, text="選択クリップ")
         detail_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
         thumb_holder = ttk.Frame(detail_frame, width=THUMBNAIL_MAX_WIDTH + 8, height=THUMBNAIL_MAX_HEIGHT + 8)
@@ -425,18 +557,32 @@ class KiteClipperGui(tk.Tk):
             wraplength=THUMBNAIL_MAX_WIDTH,
         ).pack(fill=tk.X, padx=6, pady=(0, 4))
 
-        tag_row = ttk.Frame(detail_frame)
-        tag_row.pack(fill=tk.X, padx=6, pady=(0, 2))
+        # 通常時に表示する読み取り専用のタグ要約ラベル。
+        ttk.Label(
+            detail_frame,
+            textvariable=self.clip_tags_summary_var,
+            wraplength=THUMBNAIL_MAX_WIDTH,
+        ).pack(anchor=tk.W, padx=6, pady=(0, 2))
+        self.tag_editor_toggle_button = ttk.Button(
+            detail_frame, text="タグを編集…", command=self.toggle_tag_editor
+        )
+        self.tag_editor_toggle_button.pack(anchor=tk.W, padx=6, pady=(0, 6))
+
+        # タグ編集UI（Entry・名前ボタン等）は「タグを編集…」を押すまで隠しておきます。
+        self.tag_editor_frame = ttk.Frame(detail_frame)
+
+        tag_row = ttk.Frame(self.tag_editor_frame)
+        tag_row.pack(fill=tk.X, pady=(0, 2))
         ttk.Label(tag_row, text="登場人物").pack(side=tk.LEFT, padx=(0, 4))
         tag_entry = ttk.Entry(tag_row, textvariable=self.tag_entry_var)
         tag_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         tag_entry.bind("<Return>", lambda _event: self.apply_tags_from_entry())
         ttk.Button(tag_row, text="タグ設定", command=self.apply_tags_from_entry).pack(side=tk.LEFT)
-        ttk.Label(detail_frame, text="カンマ区切り / 空欄で設定すると解除").pack(anchor=tk.W, padx=6)
+        ttk.Label(self.tag_editor_frame, text="カンマ区切り / 空欄で設定すると解除").pack(anchor=tk.W)
 
-        ttk.Label(detail_frame, text="名前ボタン（クリックで付け外し）").pack(anchor=tk.W, padx=6, pady=(6, 0))
-        self.name_buttons_frame = ttk.Frame(detail_frame)
-        self.name_buttons_frame.pack(fill=tk.X, padx=6, pady=(2, 6))
+        ttk.Label(self.tag_editor_frame, text="名前ボタン（クリックで付け外し）").pack(anchor=tk.W, pady=(6, 0))
+        self.name_buttons_frame = ttk.Frame(self.tag_editor_frame)
+        self.name_buttons_frame.pack(fill=tk.X, pady=(2, 6))
 
         scrollbar = ttk.Scrollbar(list_area)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -456,12 +602,23 @@ class KiteClipperGui(tk.Tk):
         ttk.Button(order_buttons, text="上へ", command=lambda: self.move_clip(-1)).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(order_buttons, text="下へ", command=lambda: self.move_clip(1)).pack(side=tk.LEFT, padx=4)
         ttk.Button(order_buttons, text="クリップ再読み込み", command=self.refresh_clips).pack(side=tk.LEFT, padx=4)
-        ttk.Button(order_buttons, text="📁 final を開く", command=lambda: self.open_folder(ROOT / "final")).pack(
-            side=tk.RIGHT
+
+        ttk.Button(footer, text="📁 final を開く", command=lambda: self.open_folder(ROOT / "final")).pack(
+            side=tk.LEFT
         )
-        concat_button = _accent_button(order_buttons, "結合する ▶", self.concat_selected_clips)
-        concat_button.pack(side=tk.RIGHT, padx=12)
+        concat_button = _accent_button(footer, "結合する ▶", self.concat_selected_clips)
+        concat_button.pack(side=tk.RIGHT)
         self.action_buttons.append(concat_button)
+
+    def toggle_tag_editor(self) -> None:
+        """工程5「選択クリップ」のタグ編集UI（Entry・名前ボタン等）の表示/非表示を切り替えます。"""
+        self.tag_editor_visible = not self.tag_editor_visible
+        if self.tag_editor_visible:
+            self.tag_editor_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+            self.tag_editor_toggle_button.configure(text="タグ編集を閉じる")
+        else:
+            self.tag_editor_frame.pack_forget()
+            self.tag_editor_toggle_button.configure(text="タグを編集…")
 
     # ------------------------------------------------------ ステッパーの状態管理
     def show_step(self, step: int) -> None:
@@ -607,16 +764,16 @@ class KiteClipperGui(tk.Tk):
 
     def update_concat_info(self, _event: object = None) -> None:
         # 選択中の「最終サイズ／表示方法」でどう結合されるかを説明するラベルを更新します。
-        fit_note = "（contain=全体表示 / cover=画面いっぱい）"
+        fit_note = "（全体を収める=余白付きで全体表示 / 画面いっぱい=はみ出す部分を切り取り）"
         mode = self.normalize_mode.get()
         if mode == "original":
-            text = "original: 無劣化で結合します（全クリップの形式が同一である必要あり）"
+            text = "元動画のサイズ: 無劣化で結合します（全クリップの形式が同一である必要あり）"
         elif mode == "vertical":
-            text = f"vertical: 1080×1920 / 30fps に再エンコードして結合します{fit_note}"
+            text = f"縦 9:16: 1080×1920 / 30fps に再エンコードして結合します{fit_note}"
         elif mode == "horizontal":
-            text = f"horizontal: 1920×1080 / 30fps に再エンコードして結合します{fit_note}"
+            text = f"横 16:9: 1920×1080 / 30fps に再エンコードして結合します{fit_note}"
         elif mode == "square":
-            text = f"square: 1080×1080 / 30fps に再エンコードして結合します{fit_note}"
+            text = f"正方形 1:1: 1080×1080 / 30fps に再エンコードして結合します{fit_note}"
         else:
             text = ""
         self.concat_info_var.set(text)
@@ -699,16 +856,16 @@ class KiteClipperGui(tk.Tk):
 
     def redraw_clip_list(self, selected_index: int | None = None) -> None:
         self.clip_list.delete(0, tk.END)
-        for path in self.clip_paths:
-            self.clip_list.insert(tk.END, self.clip_display_text(path))
+        for index, path in enumerate(self.clip_paths):
+            self.clip_list.insert(tk.END, self.clip_display_text(index, path))
         if selected_index is not None:
             self.clip_list.selection_set(selected_index)
 
-    def clip_display_text(self, path: Path) -> str:
+    def clip_display_text(self, index: int, path: Path) -> str:
         duration = format_duration(self.clip_durations.get(path, 0.0))
         names = self.clip_tags.get(path.name, [])
         tag_text = f"  [{', '.join(names)}]" if names else ""
-        return f"{path.name}    {duration}{tag_text}"
+        return f"{index + 1:2d}. {path.name}    {duration}{tag_text}"
 
     def selected_clip_index(self) -> int | None:
         selected = self.clip_list.curselection()
@@ -725,8 +882,17 @@ class KiteClipperGui(tk.Tk):
             return
         clip = self.clip_paths[index]
         self.selected_clip_var.set(clip.name)
-        self.tag_entry_var.set(", ".join(self.clip_tags.get(clip.name, [])))
+        names = self.clip_tags.get(clip.name, [])
+        self.tag_entry_var.set(", ".join(names))
+        self.update_clip_tags_summary(names)
         self.request_thumbnail(clip)
+
+    def update_clip_tags_summary(self, names: list[str]) -> None:
+        """工程5の読み取り専用タグ要約ラベルを更新します。"""
+        if names:
+            self.clip_tags_summary_var.set("登場人物: " + ", ".join(names))
+        else:
+            self.clip_tags_summary_var.set("登場人物: （未設定）")
 
     def apply_tags_from_entry(self) -> None:
         index = self.selected_clip_index()
@@ -757,6 +923,7 @@ class KiteClipperGui(tk.Tk):
             self.clip_tags.pop(clip.name, None)
         save_clip_tags(self.clip_tags)
         self.tag_entry_var.set(", ".join(names))
+        self.update_clip_tags_summary(names)
         self.redraw_clip_list(selected_index=index)
         self.update_person_totals()
         self.rebuild_name_buttons()

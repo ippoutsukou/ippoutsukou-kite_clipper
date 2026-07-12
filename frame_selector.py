@@ -75,6 +75,31 @@ AUDIO_SAMPLE_RATE = 8000
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+# kite_clipper_gui.py の _accent_button と同じ配色（青のアクセントボタン）。
+# このファイルは kite_clipper_gui.py に依存しない単独のTopLevelウィンドウ
+# のため、色定義とヘルパー関数をここに複製しています。
+ACCENT_BG = "#2a78d6"
+ACCENT_FG = "white"
+ACCENT_ACTIVE_BG = "#1d5aa8"
+ACCENT_ACTIVE_FG = "white"
+
+
+def _accent_button(parent: tk.Widget, text: str, command) -> tk.Button:
+    """kite_clipper_gui.py の _accent_button と同じ配色の tk.Button を生成します。"""
+    return tk.Button(
+        parent,
+        text=text,
+        command=command,
+        bg=ACCENT_BG,
+        fg=ACCENT_FG,
+        activebackground=ACCENT_ACTIVE_BG,
+        activeforeground=ACCENT_ACTIVE_FG,
+        relief=tk.RAISED,
+        padx=14,
+        pady=3,
+        font=("", 9, "bold"),
+    )
+
 
 @dataclass
 class FrameCell:
@@ -364,6 +389,18 @@ class FrameSelectorWindow(tk.Toplevel):
             ),
             foreground="#666666",
         ).pack(side=tk.RIGHT)
+
+        # 下部固定フッター: 選別を終える導線。body（キャンバス）より先にpackする
+        # ことで下端に固定し、bodyが残りの領域を占めるようにします。
+        footer = ttk.Frame(self, padding=(10, 6))
+        ttk.Label(
+            footer,
+            text="✓ 選択は自動で保存されます。選び終えたら「選別を終える」を押すか、そのままウィンドウを閉じてください。",
+            foreground="#666666",
+        ).pack(side=tk.LEFT)
+        _accent_button(footer, "選別を終える（閉じる）", self.destroy).pack(side=tk.RIGHT)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Separator(self, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
 
         body = ttk.Frame(self)
         body.pack(fill=tk.BOTH, expand=True)
