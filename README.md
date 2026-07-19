@@ -73,3 +73,36 @@ python .\kite_clipper.py --blur-threshold 120 --dark-threshold 70 --min-width 12
 
 同梱する場合は、FFmpeg のライセンス文、ソース入手先、ビルド情報を
 `vendor/ffmpeg/windows-x64/` に残してください。
+
+## 配布版（インストール不要の実行ファイル）
+
+Python をインストールしていない Windows PC でも使えるように、GUI・CLI を
+実行ファイル化した配布パッケージを GitHub Releases で公開しています。
+
+- ダウンロード: [Releases ページ](https://github.com/ippoutsukou/ippoutsukou-kite_clipper/releases) から
+  `kite_clipper_release_YYYYMMDD.zip` を取得してください。
+- 展開後、`kite_clipper_gui.exe` をダブルクリックすると GUI が起動します。
+- コード署名を行っていないため、初回起動時に Windows Defender
+  SmartScreen が「発行元不明」の警告を表示することがあります。
+  内容を確認のうえ「詳細情報」→「実行」を選んでください。
+
+### 同梱パッケージの構成
+
+```text
+kite_clipper_gui.exe   # GUI 本体
+kite_clipper.exe       # CLI 本体（GUI から内部的に呼び出されます）
+vendor/ffmpeg/         # 同梱 FFmpeg（LGPL 版）
+vendor/clip/           # CLIP 画像特徴量モデル（ONNX）
+models/                # AI スコアリング用学習済みモデル
+input/ logs/ work/ ...  # 実行時に使う作業用フォルダ（初期状態は空）
+```
+
+### 同梱ソフトウェアのライセンス
+
+- **FFmpeg**: LGPL 版を同梱しています（`--enable-gpl` / `--enable-nonfree`
+  を含まないビルド）。ライセンス文・ソース入手先・ビルド情報は
+  `vendor/ffmpeg/windows-x64/` 内に同梱しています。
+- **CLIP ViT-B/32 (ONNX 量子化版)**: OpenAI CLIP（MIT License）を
+  [Xenova/clip-vit-base-patch32](https://huggingface.co/Xenova/clip-vit-base-patch32)
+  で ONNX 変換したものを使用しています。詳細は `vendor/clip/SOURCE.txt`
+  を参照してください。

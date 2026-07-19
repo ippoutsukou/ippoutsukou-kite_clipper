@@ -2,6 +2,14 @@
 __pycache__/
 *.py[cod]
 backup/
+build/
+dist/
+*.spec
+*.bak
+作業ログ.txt
+
+# 配布用の同梱バイナリ・モデルはリポジトリに含めない（Releasesのzipで配布）
+vendor/
 
 # 入力データと生成物はコミットしない
 input/photos/*
@@ -34,3 +42,5 @@ logs/*
 *.key
 secrets/
 credentials/
+/dataset/
+/models/

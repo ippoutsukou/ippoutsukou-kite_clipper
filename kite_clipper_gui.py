@@ -7,10 +7,12 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
 from tkinter import font as tkfont
+from typing import Callable
 
 from frame_selector import FrameSelectorWindow
 
@@ -36,6 +38,12 @@ CLIP_TAGS_FILE = ROOT / "logs" / "clip_tags.json"
 THUMBNAIL_DIR = ROOT / "work" / "thumbnails"
 THUMBNAIL_MAX_WIDTH = 320
 THUMBNAIL_MAX_HEIGHT = 240
+
+# おまかせモード（自動切り出し）関連の設定。
+FRAME_SCORER_MODEL_PATH = ROOT / "models" / "frame_scorer.pkl"
+AI_SEGMENTS_CSV = ROOT / "logs" / "ai_segments.csv"
+OMAKASE_PROCESSED_FILE = ROOT / "logs" / "omakase_processed.json"
+OMAKASE_POLL_INTERVAL_MS = 3000
 
 # アプリ全体のフォント。ttkの名前付きフォントと、サイズ指定つきの
 # 個別フォントタプルの両方でこのファミリーを使います。
@@ -124,6 +132,33 @@ def ffmpeg_path(path: Path) -> str:
     return path.resolve().as_posix()
 
 
+def safe_stem(path: Path) -> str:
+    # kite_clipper.py の safe_stem と同じロジックです。GUIはCLIをsubprocess経由で
+    # 使う構成のため、CLIモジュールをimportせずここに複製しています
+    # （frame_selector.py の FRAME_NAME_PATTERN 複製と同じ方針）。
+    return "".join(char if char.isalnum() or char in "-_" else "_" for char in path.stem)
+
+
+def load_ai_segment_video_stems(csv_path: Path) -> set[str]:
+    """logs/ai_segments.csv に区間提案がある video_stem の集合を返します。
+
+    おまかせモードで「区間提案が0件だった」を判定するために使います。
+    ファイルが無い・壊れている場合は空集合を返します。
+    """
+    if not csv_path.exists():
+        return set()
+    stems: set[str] = set()
+    try:
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as file:
+            for row in csv.DictReader(file):
+                stem = row.get("video_stem") or ""
+                if stem:
+                    stems.add(stem)
+    except Exception:
+        return set()
+    return stems
+
+
 class KiteClipperGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -199,6 +234,16 @@ class KiteClipperGui(tk.Tk):
         # ログは下部バーに最終行のみ表示し、クリックで全文を展開します。
         self.log_visible = False
         self.last_log_var = tk.StringVar(value="最終行: （まだログはありません）")
+
+        # おまかせモード（自動切り出し）の状態
+        self.busy = False  # run_cli/run_frame_scorer_predict実行中かどうか（set_busyで更新）
+        self.omakase_mode = tk.BooleanVar(value=False)
+        self.omakase_status_var = tk.StringVar(value="")
+        self.omakase_poll_after_id: str | None = None
+        self.omakase_running = False  # 自動パイプライン(抽出→採点→切り出し)実行中かどうか
+        # ファイル名 -> (直近ポーリングでのサイズ, そのサイズが何回連続で観測されたか)
+        self.omakase_pending_sizes: dict[str, tuple[int, int]] = {}
+        self.omakase_processed: dict[str, dict[str, float]] = self._load_omakase_processed()
 
         self.create_widgets()
         self.refresh_all()
@@ -385,6 +430,29 @@ class KiteClipperGui(tk.Tk):
             text="素材を入れたら下の「再読み込みして次へ ▶」で本数を更新し、「② フレーム生成」へ進んでください。",
             foreground="#888",
         ).pack(anchor=tk.W, pady=(16, 0))
+
+        ttk.Separator(inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(16, 10))
+        ttk.Checkbutton(
+            inner,
+            text="おまかせモード（自動切り出し）",
+            variable=self.omakase_mode,
+            command=self.on_omakase_toggle,
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            inner,
+            text=(
+                "ONの間、input/videos に置かれた新しい動画を自動検知し、"
+                "フレーム抽出→AI採点→AI提案区間からの切り出しまでを自動実行します"
+                "（selected_clips に出力、結合は行いません）。"
+                "AI採点モデル（models/frame_scorer.pkl）が未学習の場合は使えません。"
+            ),
+            foreground="#888",
+            wraplength=520,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Label(inner, textvariable=self.omakase_status_var, foreground=ACCENT_BG).pack(
+            anchor=tk.W, pady=(6, 0)
+        )
 
         def _refresh_and_advance() -> None:
             self.refresh_all()
@@ -1131,7 +1199,18 @@ class KiteClipperGui(tk.Tk):
             args.append("--fast-copy")
         self.run_cli(args, "動画結合中")
 
-    def run_cli(self, args: list[str], label: str) -> None:
+    def run_cli(
+        self,
+        args: list[str],
+        label: str,
+        on_done: Callable[[int], None] | None = None,
+    ) -> None:
+        """kite_clipper.py（exe化時はkite_clipper.exe）を args 付きで実行します。
+
+        on_done を指定すると、完了時に既定の on_command_done の代わりにそちらを
+        呼びます。おまかせモードの自動パイプラインで複数コマンドを連結する際に
+        使い、完了処理（set_busy(False)や再読み込み）を最後の1回だけにします。
+        """
         if getattr(sys, "frozen", False):
             if not CLI_EXE.exists():
                 messagebox.showerror(
@@ -1144,20 +1223,39 @@ class KiteClipperGui(tk.Tk):
             command = [str(CLI_EXE), *args]
         else:
             command = [str(PYTHON), str(ROOT / "kite_clipper.py"), *args]
+        self._run_command(command, label, on_done)
+
+    def run_frame_scorer_predict(
+        self,
+        label: str,
+        on_done: Callable[[int], None] | None = None,
+    ) -> None:
+        """frame_scorer.py predict を実行します（おまかせモードのAI採点ステップ用）。"""
+        command = [str(PYTHON), str(ROOT / "frame_scorer.py"), "predict"]
+        self._run_command(command, label, on_done)
+
+    def _run_command(
+        self,
+        command: list[str],
+        label: str,
+        on_done: Callable[[int], None] | None = None,
+    ) -> None:
         self.set_busy(True)
         self.status_var.set(label)
         self.append_log("> " + " ".join(command))
-        thread = threading.Thread(target=self._run_cli_worker, args=(command,), daemon=True)
+        callback = on_done or self.on_command_done
+        thread = threading.Thread(target=self._run_cli_worker, args=(command, callback), daemon=True)
         thread.start()
 
     def set_busy(self, busy: bool) -> None:
+        self.busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
         # 整理・削除ダイアログが閉じられた後のボタンなど、破棄済みウィジェットを除外します。
         self.action_buttons = [button for button in self.action_buttons if button.winfo_exists()]
         for button in self.action_buttons:
             button.configure(state=state)
 
-    def _run_cli_worker(self, command: list[str]) -> None:
+    def _run_cli_worker(self, command: list[str], callback: Callable[[int], None]) -> None:
         try:
             # CLI(Python)の標準出力をUTF-8に固定し、ログ欄の文字化けを防ぎます。
             env = os.environ.copy()
@@ -1177,10 +1275,10 @@ class KiteClipperGui(tk.Tk):
             for line in process.stdout:
                 self.after(0, self.append_log, line.rstrip())
             return_code = process.wait()
-            self.after(0, self.on_command_done, return_code)
+            self.after(0, callback, return_code)
         except Exception as exc:
             self.after(0, self.append_log, f"ERROR: {exc}")
-            self.after(0, self.on_command_done, 1)
+            self.after(0, callback, 1)
 
     def on_command_done(self, return_code: int) -> None:
         self.set_busy(False)
@@ -1191,6 +1289,200 @@ class KiteClipperGui(tk.Tk):
         elif self.last_action == "cleanup_delete":
             self.show_cleanup_feedback("削除が完了しました")
         self.last_action = None
+
+    # ------------------------------------------------------------ おまかせモード
+    def on_omakase_toggle(self) -> None:
+        """「おまかせモード（自動切り出し）」チェックボックスの切り替え処理です。"""
+        if self.omakase_mode.get():
+            if not FRAME_SCORER_MODEL_PATH.exists():
+                messagebox.showwarning(
+                    "おまかせモード",
+                    "AI採点モデルが未学習のためおまかせモードは使えません"
+                    "（WORKFLOW.md 手順4.6参照）。",
+                )
+                self.omakase_mode.set(False)
+                return
+            self.omakase_status_var.set("おまかせモード: 監視中...")
+            self.append_log("おまかせモード: input/videos の監視を開始しました。")
+            self._schedule_omakase_poll()
+        else:
+            self.omakase_status_var.set("")
+            self.append_log("おまかせモード: 監視を停止しました。")
+            if self.omakase_poll_after_id is not None:
+                self.after_cancel(self.omakase_poll_after_id)
+                self.omakase_poll_after_id = None
+
+    def _schedule_omakase_poll(self) -> None:
+        if not self.omakase_mode.get():
+            return
+        self.omakase_poll_after_id = self.after(OMAKASE_POLL_INTERVAL_MS, self._omakase_poll)
+
+    def _omakase_poll(self) -> None:
+        self.omakase_poll_after_id = None
+        if not self.omakase_mode.get():
+            return
+        try:
+            self._omakase_check_and_start()
+        finally:
+            # トグルOFFなら次のポーリングは仕掛けない（監視停止）。
+            self._schedule_omakase_poll()
+
+    def _omakase_check_and_start(self) -> None:
+        """input/videos を確認し、未処理かつサイズが安定した新規動画があれば
+        自動パイプラインを開始します。他のコマンド実行中(busy)なら何もせず、
+        次のポーリングで再試行します。
+        """
+        if self.busy or self.omakase_running:
+            return
+        videos_dir = ROOT / "input" / "videos"
+        if not videos_dir.exists():
+            return
+
+        current: dict[str, tuple[int, float]] = {}
+        try:
+            for path in sorted(videos_dir.iterdir()):
+                if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+                    stat = path.stat()
+                    current[path.name] = (stat.st_size, stat.st_mtime)
+        except OSError:
+            return
+
+        # 監視対象から消えたファイル（削除やリネーム）の追跡情報を掃除します。
+        for name in list(self.omakase_pending_sizes.keys()):
+            if name not in current:
+                del self.omakase_pending_sizes[name]
+
+        target_name: str | None = None
+        for name, (size, _mtime) in current.items():
+            if name in self.omakase_processed:
+                continue
+            previous = self.omakase_pending_sizes.get(name)
+            if previous is not None and previous[0] == size:
+                stable_count = previous[1] + 1
+            else:
+                stable_count = 1
+            self.omakase_pending_sizes[name] = (size, stable_count)
+            # 2回連続のポーリングで同じサイズ = コピー中ではないとみなします。
+            if stable_count >= 2 and target_name is None:
+                target_name = name
+
+        if target_name is None:
+            return
+
+        self.omakase_pending_sizes.pop(target_name, None)
+        self._omakase_start_pipeline(videos_dir / target_name)
+
+    def _omakase_start_pipeline(self, video_path: Path) -> None:
+        self.omakase_running = True
+        only_video = video_path.name
+        pre_roll = self.pre_roll.get() or "1"
+        post_roll = self.post_roll.get() or "1"
+        frame_interval = self.frame_interval.get() or "1"
+
+        self.omakase_status_var.set(f"おまかせ: {video_path.name} を処理中...")
+        self.append_log(f"おまかせモード: 新しい動画を検出しました: {video_path.name}")
+        self.append_log("おまかせ: フレーム抽出中...")
+        self.run_cli(
+            ["--frame-interval", frame_interval, "--only-video", only_video],
+            "おまかせ: フレーム抽出中...",
+            on_done=lambda code: self._omakase_after_extract(video_path, code, pre_roll, post_roll),
+        )
+
+    def _omakase_after_extract(
+        self, video_path: Path, return_code: int, pre_roll: str, post_roll: str
+    ) -> None:
+        if return_code != 0:
+            self._omakase_abort(video_path, f"フレーム抽出に失敗しました（終了コード {return_code}）")
+            return
+        self.append_log("おまかせ: AI採点中...")
+        self.run_frame_scorer_predict(
+            "おまかせ: AI採点中...",
+            on_done=lambda code: self._omakase_after_predict(video_path, code, pre_roll, post_roll),
+        )
+
+    def _omakase_after_predict(
+        self, video_path: Path, return_code: int, pre_roll: str, post_roll: str
+    ) -> None:
+        if return_code != 0:
+            self._omakase_abort(video_path, f"AI採点に失敗しました（終了コード {return_code}）")
+            return
+        if safe_stem(video_path) not in load_ai_segment_video_stems(AI_SEGMENTS_CSV):
+            self.append_log(f"おまかせ: {video_path.name} は区間提案なし（切り出しスキップ）。")
+            self._omakase_finish(video_path)
+            return
+        self.append_log("おまかせ: AI提案区間から切り出し中...")
+        args = [
+            "--cut-from-ai-segments",
+            "--only-video",
+            video_path.name,
+            "--pre-roll",
+            pre_roll,
+            "--post-roll",
+            post_roll,
+        ]
+        if self.fast_copy.get():
+            args.append("--fast-copy")
+        self.run_cli(
+            args,
+            "おまかせ: 切り出し中...",
+            on_done=lambda code: self._omakase_after_cut(video_path, code),
+        )
+
+    def _omakase_after_cut(self, video_path: Path, return_code: int) -> None:
+        if return_code != 0:
+            self._omakase_abort(video_path, f"切り出しに失敗しました（終了コード {return_code}）")
+            return
+        self.append_log(f"おまかせ: {video_path.name} の自動切り出しが完了しました。")
+        self._omakase_finish(video_path)
+
+    def _omakase_abort(self, video_path: Path, reason: str) -> None:
+        # 処理済みとしては記録せず、次のポーリングで再試行できるようにします。
+        self.append_log(f"おまかせ: {reason}（{video_path.name}）。この動画の自動処理を中断しました。")
+        self.omakase_running = False
+        self.set_busy(False)
+        self.status_var.set(f"おまかせ: エラー（{video_path.name}）")
+        self.omakase_status_var.set("おまかせモード: 監視中..." if self.omakase_mode.get() else "")
+        self.refresh_all()
+
+    def _omakase_finish(self, video_path: Path) -> None:
+        self._record_omakase_processed(video_path)
+        self.omakase_running = False
+        self.set_busy(False)
+        self.status_var.set("待機中")
+        self.omakase_status_var.set("おまかせモード: 監視中..." if self.omakase_mode.get() else "")
+        self.refresh_all()
+
+    def _record_omakase_processed(self, video_path: Path) -> None:
+        try:
+            stat = video_path.stat()
+        except OSError:
+            return
+        self.omakase_processed[video_path.name] = {
+            "size": stat.st_size,
+            "mtime": stat.st_mtime,
+            "processed_at": time.time(),
+        }
+        self._save_omakase_processed()
+
+    def _load_omakase_processed(self) -> dict[str, dict[str, float]]:
+        if not OMAKASE_PROCESSED_FILE.exists():
+            return {}
+        try:
+            with OMAKASE_PROCESSED_FILE.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+            if isinstance(data, dict):
+                return data
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            pass
+        return {}
+
+    def _save_omakase_processed(self) -> None:
+        OMAKASE_PROCESSED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with OMAKASE_PROCESSED_FILE.open("w", encoding="utf-8") as file:
+                json.dump(self.omakase_processed, file, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            self.append_log(f"おまかせモード: 処理済み記録の保存に失敗しました: {exc}")
 
     def append_log(self, message: str) -> None:
         self.log_text.insert(tk.END, message + "\n")

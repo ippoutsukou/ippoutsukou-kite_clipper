@@ -194,10 +194,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="削除せず、削除予定だけを表示します")
     parser.add_argument("--confirm-delete", action="store_true", help="review/photos と review/frames のファイル削除を実行します")
     parser.add_argument("--cut-from-selected-frames", action="store_true", help="selected_frames の連続フレーム範囲から動画を切り出します")
+    parser.add_argument(
+        "--cut-from-ai-segments",
+        action="store_true",
+        help="logs/ai_segments.csv のAI提案区間から直接動画を切り出します（おまかせモード用）",
+    )
     parser.add_argument("--split-gap", type=float, default=2.0, help="この秒数より離れた selected_frames を別クリップにします")
     parser.add_argument("--pre-roll", type=float, default=1.0, help="切り出し開始を選択範囲の何秒前にするか")
     parser.add_argument("--post-roll", type=float, default=1.0, help="切り出し終了を選択範囲の何秒後にするか")
     parser.add_argument("--fast-copy", action="store_true", help="再エンコードせず高速に切り出します。カット位置は少しずれる場合があります")
+    parser.add_argument(
+        "--only-video",
+        type=str,
+        default=None,
+        help="ファイル名またはstemを指定して、その動画だけを処理対象にします（フレーム抽出・--cut-from-ai-segmentsで有効）",
+    )
     parser.add_argument("--cleanup-after-cut", action="store_true", help="動画切り出し後に不要になった選択フレームを整理します")
     parser.add_argument("--include-review-frames", action="store_true", help="cleanup-after-cutでreview/framesも整理対象にします")
     parser.add_argument("--include-review-photos", action="store_true", help="cleanup-after-cutでreview/photosも整理対象にします")
@@ -657,6 +668,30 @@ def safe_stem(path: Path) -> str:
     return "".join(char if char.isalnum() or char in "-_" else "_" for char in path.stem)
 
 
+def video_name_candidates(video_path: Path) -> set[str]:
+    # --only-video の照合用に、ファイル名 / 拡張子なしstem / safe_stem の
+    # いずれで指定されても一致するよう候補を作ります。
+    return {video_path.name.lower(), video_path.stem.lower(), safe_stem(video_path).lower()}
+
+
+def only_video_matches(candidates: set[str], only_value: str) -> bool:
+    value = only_value.strip().lower()
+    if not value:
+        return False
+    if value in candidates:
+        return True
+    if "." in value:
+        return value.rsplit(".", 1)[0] in candidates
+    return False
+
+
+def filter_videos_by_only(videos: list[Path], only_value: str | None) -> list[Path]:
+    # --only-video 未指定時は従来どおり全動画を処理します。
+    if not only_value:
+        return videos
+    return [video for video in videos if only_video_matches(video_name_candidates(video), only_value)]
+
+
 def write_image(path: Path, image: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     success, encoded = cv2.imencode(path.suffix or ".jpg", image)
@@ -699,6 +734,38 @@ def write_result_csv(csv_path: Path, rows: list[dict[str, object]]) -> None:
         "message",
     ]
     write_dict_csv(csv_path, fieldnames, rows)
+
+
+def merge_result_rows_for_only_video(
+    csv_path: Path,
+    new_rows: list[dict[str, object]],
+    targeted_video_paths: list[Path],
+) -> list[dict[str, object]]:
+    # --only-video 指定時はこの実行で処理した動画分しか new_rows に含まれないため、
+    # 既存の result.csv から「対象外の動画のフレーム行」を読み直して残し、
+    # 他の動画の採点・選別情報を消さないようにします。写真行は毎回全件処理される
+    # ため、旧い写真行は今回の結果で置き換えます。
+    if not csv_path.exists():
+        return new_rows
+
+    targeted = {str(path.resolve()) for path in targeted_video_paths}
+    kept_rows: list[dict[str, object]] = []
+    try:
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as file:
+            reader = csv.DictReader(file)
+            for row in reader:
+                row_type = row.get("type", "")
+                if row_type in ("photo", "photo_copy"):
+                    continue
+                source_path = row.get("source_path", "")
+                if source_path in targeted:
+                    continue
+                kept_rows.append(dict(row))
+    except Exception:
+        logging.exception("result.csv の読み込みに失敗したため、今回の結果のみで上書きします: %s", csv_path)
+        return new_rows
+
+    return kept_rows + new_rows
 
 
 def photo_row(photo: PhotoAnalysis) -> dict[str, object]:
@@ -903,6 +970,136 @@ def cut_from_selected_frames(
     print(f"切り出し完了: {ok_count} 件")
     print(f"エラー: {error_count} 件")
     print(f"CSV: {logs / 'clip_cuts.csv'}")
+    print(f"出力先: {selected_clips}")
+    return 0
+
+
+def read_ai_segments_csv(
+    csv_path: Path,
+    videos_by_stem: dict[str, Path],
+    only_video: str | None,
+) -> dict[str, list[tuple[int, float, float, int, float]]]:
+    # (segment_index, start_sec, end_sec, frame_count, mean_score) を動画stemごとに集めます。
+    segments_by_video: dict[str, list[tuple[int, float, float, int, float]]] = {}
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            video_stem = row.get("video_stem") or ""
+            if not video_stem:
+                continue
+            if only_video:
+                candidates = {video_stem.lower()}
+                video_path = videos_by_stem.get(video_stem)
+                if video_path is not None:
+                    candidates |= video_name_candidates(video_path)
+                if not only_video_matches(candidates, only_video):
+                    continue
+            try:
+                segment_index = int(row["segment_index"])
+                start_sec = float(row["start_sec"])
+                end_sec = float(row["end_sec"])
+                frame_count = int(row["frame_count"])
+                mean_score = float(row["mean_score"])
+            except (KeyError, TypeError, ValueError):
+                logging.exception("ai_segments.csv の行を解析できません: %s", row)
+                continue
+            segments_by_video.setdefault(video_stem, []).append(
+                (segment_index, start_sec, end_sec, frame_count, mean_score)
+            )
+    return segments_by_video
+
+
+def cut_from_ai_segments(
+    root: Path,
+    pre_roll: float,
+    post_roll: float,
+    fast_copy: bool,
+    only_video: str | None,
+) -> int:
+    # logs/ai_segments.csv (frame_scorer.py predict の区間提案)から直接切り出す、
+    # おまかせモード用のモードです。selected_frames を経由しません。
+    logs = root / "logs"
+    setup_logging(logs)
+    input_videos = root / "input" / "videos"
+    selected_clips = root / "selected_clips"
+    selected_clips.mkdir(parents=True, exist_ok=True)
+    auto_clip_cuts_csv = logs / "auto_clip_cuts.csv"
+
+    segments_csv = logs / "ai_segments.csv"
+    if not segments_csv.exists():
+        message = f"区間提案CSVが見つかりません: {segments_csv}"
+        logging.error(message)
+        print(f"エラー: {message}")
+        print("先に frame_scorer.py predict を実行してください。")
+        return 1
+
+    videos_by_stem = {safe_stem(video): video for video in iter_files(input_videos, VIDEO_EXTENSIONS)}
+
+    try:
+        segments_by_video = read_ai_segments_csv(segments_csv, videos_by_stem, only_video)
+    except Exception as exc:
+        logging.exception("ai_segments.csv の読み込みエラー")
+        print(f"エラー: 区間提案CSVを読み込めません: {exc}")
+        return 1
+
+    rows: list[dict[str, object]] = []
+
+    if not segments_by_video:
+        message = "区間提案が0件です（切り出し対象なし）"
+        print(message)
+        write_clip_cuts_csv(auto_clip_cuts_csv, rows)
+        print(f"CSV: {auto_clip_cuts_csv}")
+        print(f"出力先: {selected_clips}")
+        return 0
+
+    jobs: list[CutJob] = []
+    for video_stem, segments in sorted(segments_by_video.items()):
+        video_path = videos_by_stem.get(video_stem)
+        if not video_path:
+            message = f"元動画が見つかりません: {video_stem}"
+            logging.error(message)
+            for segment_index, start_sec, end_sec, _frame_count, _mean_score in segments:
+                rows.append(
+                    clip_cut_row(video_stem, "", "", "", start_sec, end_sec, "", "error", message)
+                )
+            continue
+
+        duration = get_video_duration(video_path)
+        for segment_index, start_sec, end_sec, frame_count, mean_score in sorted(segments):
+            clipped_start = max(0.0, start_sec - max(0.0, pre_roll))
+            clipped_end = end_sec + max(0.0, post_roll)
+            if duration > 0:
+                clipped_end = min(duration, clipped_end)
+            clipped_start = min(clipped_start, clipped_end)
+            if clipped_end <= clipped_start:
+                clipped_end = clipped_start + 0.5
+
+            output_name = (
+                f"{video_stem}__aiclip{segment_index:03d}"
+                f"__t{format_timestamp(clipped_start)}_t{format_timestamp(clipped_end)}.mp4"
+            )
+            output_path = unique_output_path(selected_clips, output_name)
+            jobs.append(
+                CutJob(
+                    video_stem=video_stem,
+                    video_path=video_path,
+                    output_path=output_path,
+                    start_sec=clipped_start,
+                    end_sec=clipped_end,
+                    first_frame=Path(f"ai_segment{segment_index}_score{mean_score:.3f}"),
+                    last_frame=Path(f"ai_frames{frame_count}"),
+                    frame_count=frame_count,
+                )
+            )
+
+    rows.extend(run_cut_jobs(jobs, fast_copy))
+
+    write_clip_cuts_csv(auto_clip_cuts_csv, rows)
+    ok_count = sum(1 for row in rows if row["status"] == "ok")
+    error_count = sum(1 for row in rows if row["status"] == "error")
+    print(f"AI区間からの切り出し完了: {ok_count} 件")
+    print(f"エラー: {error_count} 件")
+    print(f"CSV: {auto_clip_cuts_csv}")
     print(f"出力先: {selected_clips}")
     return 0
 
@@ -1540,6 +1737,14 @@ def main() -> int:
             args.post_roll,
             args.fast_copy,
         )
+    if args.cut_from_ai_segments:
+        return cut_from_ai_segments(
+            root,
+            args.pre_roll,
+            args.post_roll,
+            args.fast_copy,
+            args.only_video,
+        )
     if args.concat_selected_clips:
         return concat_selected_clips(
             root,
@@ -1585,8 +1790,12 @@ def main() -> int:
             rows.append(error_row("photo_copy", review_photos, str(exc)))
         rows.extend(photo_row(photo) for photo in photos)
 
+    target_videos = filter_videos_by_only(iter_files(input_videos, VIDEO_EXTENSIONS), args.only_video)
+    if args.only_video and not target_videos:
+        print(f"対象動画が見つかりません: {args.only_video}")
+
     frame_jobs: list[tuple[Path, Path]] = []
-    for video_path in iter_files(input_videos, VIDEO_EXTENSIONS):
+    for video_path in target_videos:
         try:
             frames = extract_video_frames(video_path, review_frames, args.frame_interval)
             frame_jobs.extend((video_path, frame_path) for frame_path in frames)
@@ -1603,6 +1812,11 @@ def main() -> int:
             args.min_height,
         )
     )
+
+    if args.only_video:
+        # --only-video 指定時は対象外の動画のフレーム行を result.csv から
+        # 消さないよう、既存の内容とマージしてから書き出します。
+        rows = merge_result_rows_for_only_video(logs / "result.csv", rows, target_videos)
 
     write_result_csv(logs / "result.csv", rows)
     print(f"完了: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
