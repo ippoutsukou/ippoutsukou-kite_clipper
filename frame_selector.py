@@ -7,7 +7,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import threading
 import tkinter as tk
 from dataclasses import dataclass, field
@@ -18,6 +17,8 @@ from typing import Callable
 
 import cv2
 import numpy as np
+
+from frame_scorer_launcher import build_predict_command
 
 # kite_clipper.py のフレーム命名規則と同じもの。GUIはCLIをsubprocess経由で使う
 # 構成のため、CLIモジュールをimportせずここに複製しています。
@@ -851,12 +852,11 @@ class FrameSelectorWindow(tk.Toplevel):
         threading.Thread(target=self._ai_scoring_worker, daemon=True).start()
 
     def _ai_scoring_worker(self) -> None:
-        script_path = self.root_dir / "frame_scorer.py"
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         try:
             result = subprocess.run(
-                [sys.executable, str(script_path), "predict"],
+                build_predict_command(self.root_dir),
                 cwd=self.root_dir,
                 capture_output=True,
                 text=True,

@@ -89,13 +89,16 @@ Python をインストールしていない Windows PC でも使えるように�
 ### 同梱パッケージの構成
 
 ```text
-kite_clipper_gui.exe   # GUI 本体
+kite_clipper_gui.exe   # GUI 本体（AI 採点処理の frame_scorer.py を内蔵）
 kite_clipper.exe       # CLI 本体（GUI から内部的に呼び出されます）
 vendor/ffmpeg/         # 同梱 FFmpeg（LGPL 版）
 vendor/clip/           # CLIP 画像特徴量モデル（ONNX）
 models/                # AI スコアリング用学習済みモデル
 input/ logs/ work/ ...  # 実行時に使う作業用フォルダ（初期状態は空）
 ```
+
+`frame_scorer.py` は `kite_clipper_gui.exe` に内蔵されるため、配布フォルダへ
+別途 `.py` ファイルを同梱する必要はありません。
 
 ### 同梱ソフトウェアのライセンス
 

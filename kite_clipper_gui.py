@@ -10,10 +10,12 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
+from queue import Empty, Queue
 from tkinter import messagebox, ttk
 from tkinter import font as tkfont
 from typing import Callable
 
+from frame_scorer_launcher import FRAME_SCORER_ARGV_FLAG, build_predict_command
 from frame_selector import FrameSelectorWindow
 
 
@@ -24,15 +26,16 @@ def app_base_dir() -> Path:
 
 
 ROOT = app_base_dir()
-PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
-if not PYTHON.exists():
-    PYTHON = Path(sys.executable)
+PYTHON = Path(build_predict_command(ROOT)[0])
 CLI_EXE = ROOT / "kite_clipper.exe"
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv"}
 
 # exe化したGUIから子プロセスを起動した際にコンソール窓が点滅しないようにします。
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+CLI_WATCHDOG_TIMEOUT_SECONDS = 30 * 60
+CLI_WATCHDOG_POLL_INTERVAL_SECONDS = 1.0
+CLI_TERMINATE_GRACE_SECONDS = 5.0
 
 CLIP_TAGS_FILE = ROOT / "logs" / "clip_tags.json"
 THUMBNAIL_DIR = ROOT / "work" / "thumbnails"
@@ -1231,7 +1234,7 @@ class KiteClipperGui(tk.Tk):
         on_done: Callable[[int], None] | None = None,
     ) -> None:
         """frame_scorer.py predict を実行します（おまかせモードのAI採点ステップ用）。"""
-        command = [str(PYTHON), str(ROOT / "frame_scorer.py"), "predict"]
+        command = build_predict_command(ROOT)
         self._run_command(command, label, on_done)
 
     def _run_command(
@@ -1256,6 +1259,30 @@ class KiteClipperGui(tk.Tk):
             button.configure(state=state)
 
     def _run_cli_worker(self, command: list[str], callback: Callable[[int], None]) -> None:
+        if not command:
+            self.after(0, self.append_log, "ERROR: 実行コマンドが空です")
+            self.after(0, callback, 1)
+            return
+
+        executable = Path(command[0])
+        if not executable.is_file():
+            self.after(0, self.append_log, f"ERROR: 実行ファイルが見つかりません: {executable}")
+            self.after(0, callback, 1)
+            return
+
+        if (
+            getattr(sys, "frozen", False)
+            and executable.resolve() == Path(sys.executable).resolve()
+            and (len(command) < 2 or command[1] != FRAME_SCORER_ARGV_FLAG)
+        ):
+            self.after(
+                0,
+                self.append_log,
+                "ERROR: 内部サブコマンドなしでGUI自身を誤って起動しようとしました",
+            )
+            self.after(0, callback, 1)
+            return
+
         try:
             # CLI(Python)の標準出力をUTF-8に固定し、ログ欄の文字化けを防ぎます。
             env = os.environ.copy()
@@ -1272,9 +1299,54 @@ class KiteClipperGui(tk.Tk):
                 creationflags=CREATE_NO_WINDOW,
             )
             assert process.stdout is not None
-            for line in process.stdout:
-                self.after(0, self.append_log, line.rstrip())
-            return_code = process.wait()
+            output_queue: Queue[str | None] = Queue()
+
+            def read_output() -> None:
+                try:
+                    for line in process.stdout:
+                        output_queue.put(line)
+                finally:
+                    output_queue.put(None)
+
+            reader = threading.Thread(target=read_output, daemon=True)
+            reader.start()
+            last_output_at = time.monotonic()
+            watchdog_triggered = False
+
+            while True:
+                try:
+                    line = output_queue.get(timeout=CLI_WATCHDOG_POLL_INTERVAL_SECONDS)
+                except Empty:
+                    if process.poll() is not None:
+                        break
+                    if time.monotonic() - last_output_at < CLI_WATCHDOG_TIMEOUT_SECONDS:
+                        continue
+
+                    watchdog_triggered = True
+                    self.after(
+                        0,
+                        self.append_log,
+                        (
+                            "ERROR: 一定時間、出力もプロセス終了も確認できなかったため"
+                            f"処理を中止しました（{CLI_WATCHDOG_TIMEOUT_SECONDS}秒）"
+                        ),
+                    )
+                    process.terminate()
+                    try:
+                        process.wait(timeout=CLI_TERMINATE_GRACE_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    break
+                else:
+                    if line is None:
+                        if process.poll() is not None:
+                            break
+                        continue
+                    last_output_at = time.monotonic()
+                    self.after(0, self.append_log, line.rstrip())
+
+            return_code = 1 if watchdog_triggered else process.wait()
             self.after(0, callback, return_code)
         except Exception as exc:
             self.after(0, self.append_log, f"ERROR: {exc}")
@@ -1622,6 +1694,45 @@ def format_duration(seconds: float) -> str:
     return f"{minutes:02d}:{remain:05.2f}"
 
 
-if __name__ == "__main__":
+def _run_frame_scorer(args: list[str]) -> int:
+    original_argv = sys.argv
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    fallback_streams = []
+    try:
+        if sys.stdout is None:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")
+            fallback_streams.append(sys.stdout)
+        if sys.stderr is None:
+            sys.stderr = open(os.devnull, "w", encoding="utf-8")
+            fallback_streams.append(sys.stderr)
+
+        import frame_scorer
+
+        sys.argv = ["frame_scorer", *args]
+        return frame_scorer.main()
+    except Exception as exc:
+        print(f"frame_scorer の実行に失敗しました: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        sys.argv = original_argv
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        for stream in fallback_streams:
+            stream.close()
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if argv and argv[0] == FRAME_SCORER_ARGV_FLAG:
+        return _run_frame_scorer(argv[1:])
+    if argv:
+        print(f"不明な引数です: {argv}", file=sys.stderr)
+        return 2
     app = KiteClipperGui()
     app.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
