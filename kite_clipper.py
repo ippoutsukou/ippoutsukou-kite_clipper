@@ -20,6 +20,8 @@ from typing import Iterable
 import cv2
 import numpy as np
 
+import sport_profile
+
 try:
     cv2.setLogLevel(0)
 except AttributeError:
@@ -30,6 +32,18 @@ PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv"}
 FRAME_NAME_PATTERN = re.compile(r"^(?P<video_stem>.+)__t(?P<time>\d+(?:\.\d+)?)$")
 LEGACY_FRAME_NAME_PATTERN = re.compile(r"^(?P<video_stem>.+)_(?P<number>\d{6})$")
+
+# マルチスポーツ対応前からのハードコード既定値。プロファイル（profiles/<sport>.json）に
+# 該当キーが無かった場合の最終フォールバックとしてのみ使う（優先順位: CLI明示 > プロファイル > これ）。
+DEFAULT_BLUR_THRESHOLD = 120.0
+DEFAULT_DARK_THRESHOLD = 70.0
+DEFAULT_MIN_WIDTH = 1280
+DEFAULT_MIN_HEIGHT = 720
+DEFAULT_SIMILARITY_THRESHOLD = 10
+DEFAULT_FRAME_INTERVAL = 1.0
+DEFAULT_SPLIT_GAP = 2.0
+DEFAULT_PRE_ROLL = 1.0
+DEFAULT_POST_ROLL = 1.0
 
 
 def app_base_dir() -> Path:
@@ -184,12 +198,32 @@ def parse_args() -> argparse.Namespace:
         description="カイトボードの写真・動画をOpenCVベースで整理します。"
     )
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="作業ルートフォルダ")
-    parser.add_argument("--blur-threshold", type=float, default=120.0, help="これ未満をブレ候補にします")
-    parser.add_argument("--dark-threshold", type=float, default=70.0, help="平均輝度がこれ未満なら暗い候補にします")
-    parser.add_argument("--min-width", type=int, default=1280, help="最低幅")
-    parser.add_argument("--min-height", type=int, default=720, help="最低高さ")
-    parser.add_argument("--similarity-threshold", type=int, default=10, help="pHashのハミング距離しきい値")
-    parser.add_argument("--frame-interval", type=float, default=1.0, help="動画フレーム抽出間隔（秒）")
+    parser.add_argument(
+        "--sport",
+        type=str,
+        default=None,
+        help=f"使用するスポーツプロファイルID（profiles/<id>.json。既定: {sport_profile.DEFAULT_SPORT_ID}）",
+    )
+    parser.add_argument(
+        "--blur-threshold", type=float, default=None, help="これ未満をブレ候補にします（既定: プロファイル由来）"
+    )
+    parser.add_argument(
+        "--dark-threshold",
+        type=float,
+        default=None,
+        help="平均輝度がこれ未満なら暗い候補にします（既定: プロファイル由来）",
+    )
+    parser.add_argument("--min-width", type=int, default=None, help="最低幅（既定: プロファイル由来）")
+    parser.add_argument("--min-height", type=int, default=None, help="最低高さ（既定: プロファイル由来）")
+    parser.add_argument(
+        "--similarity-threshold",
+        type=int,
+        default=None,
+        help="pHashのハミング距離しきい値（既定: プロファイル由来）",
+    )
+    parser.add_argument(
+        "--frame-interval", type=float, default=None, help="動画フレーム抽出間隔（秒）（既定: プロファイル由来）"
+    )
     parser.add_argument("--cleanup-review", action="store_true", help="review配下の確認済み候補を整理します")
     parser.add_argument("--dry-run", action="store_true", help="削除せず、削除予定だけを表示します")
     parser.add_argument("--confirm-delete", action="store_true", help="review/photos と review/frames のファイル削除を実行します")
@@ -199,9 +233,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="logs/ai_segments.csv のAI提案区間から直接動画を切り出します（おまかせモード用）",
     )
-    parser.add_argument("--split-gap", type=float, default=2.0, help="この秒数より離れた selected_frames を別クリップにします")
-    parser.add_argument("--pre-roll", type=float, default=1.0, help="切り出し開始を選択範囲の何秒前にするか")
-    parser.add_argument("--post-roll", type=float, default=1.0, help="切り出し終了を選択範囲の何秒後にするか")
+    parser.add_argument(
+        "--split-gap",
+        type=float,
+        default=None,
+        help="この秒数より離れた selected_frames を別クリップにします（既定: プロファイル由来）",
+    )
+    parser.add_argument(
+        "--pre-roll", type=float, default=None, help="切り出し開始を選択範囲の何秒前にするか（既定: プロファイル由来）"
+    )
+    parser.add_argument(
+        "--post-roll", type=float, default=None, help="切り出し終了を選択範囲の何秒後にするか（既定: プロファイル由来）"
+    )
     parser.add_argument("--fast-copy", action="store_true", help="再エンコードせず高速に切り出します。カット位置は少しずれる場合があります")
     parser.add_argument(
         "--only-video",
@@ -230,6 +273,40 @@ def parse_args() -> argparse.Namespace:
         help="正規化時の表示方法。containは全体表示、coverは画面いっぱいです",
     )
     return parser.parse_args()
+
+
+def resolve_sport_profile(args: argparse.Namespace) -> sport_profile.SportProfile:
+    """`--sport` からプロファイルを読み込み、cv/segment系の未指定引数にプロファイル値を埋める。
+
+    優先順位は 明示指定(CLI) > プロファイル値 > 従来のハードコード既定値。
+    `args` はこの関数の中で書き換える（呼び出し側は以降 args.blur_threshold 等をそのまま使える）。
+    """
+    sport_id = args.sport if args.sport is not None else sport_profile.DEFAULT_SPORT_ID
+    profile = sport_profile.load_profile(app_base_dir(), sport_id)
+
+    cv = profile.cv
+    segment = profile.segment
+
+    if args.blur_threshold is None:
+        args.blur_threshold = cv.get("blur_threshold", DEFAULT_BLUR_THRESHOLD)
+    if args.dark_threshold is None:
+        args.dark_threshold = cv.get("dark_threshold", DEFAULT_DARK_THRESHOLD)
+    if args.min_width is None:
+        args.min_width = cv.get("min_width", DEFAULT_MIN_WIDTH)
+    if args.min_height is None:
+        args.min_height = cv.get("min_height", DEFAULT_MIN_HEIGHT)
+    if args.similarity_threshold is None:
+        args.similarity_threshold = cv.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD)
+    if args.frame_interval is None:
+        args.frame_interval = cv.get("frame_interval", DEFAULT_FRAME_INTERVAL)
+    if args.split_gap is None:
+        args.split_gap = segment.get("split_gap", DEFAULT_SPLIT_GAP)
+    if args.pre_roll is None:
+        args.pre_roll = segment.get("pre_roll", DEFAULT_PRE_ROLL)
+    if args.post_roll is None:
+        args.post_roll = segment.get("post_roll", DEFAULT_POST_ROLL)
+
+    return profile
 
 
 def setup_logging(log_dir: Path) -> None:
@@ -328,6 +405,7 @@ def analyze_frame(
     dark_threshold: float,
     min_width: int,
     min_height: int,
+    profile: sport_profile.SportProfile,
 ) -> FrameAnalysis:
     image = read_image(path)
     if image is None:
@@ -339,7 +417,10 @@ def analyze_frame(
     brightness = float(np.mean(gray))
     megapixels = (width * height) / 1_000_000.0
     has_person = detect_person_candidate(image)
-    has_kite = detect_kite_candidate(image)
+    # has_kite_candidate: 競技固有の器材候補フラグ。互換性のため列名・フィールド名は kite のまま。
+    # 検出アルゴリズム本体（detect_kite_candidate）は変更せず、equipment_detector によって
+    # 呼ぶかどうかだけを sport_profile.detect_equipment_candidate() が振り分ける。
+    has_kite = sport_profile.detect_equipment_candidate(image, profile, kite_detector=detect_kite_candidate)
     is_empty = detect_empty_scene(image)
     ng_reasons: list[str] = []
     if not has_person and not has_kite:
@@ -371,10 +452,11 @@ def analyze_frame_task(
     dark_threshold: float,
     min_width: int,
     min_height: int,
+    profile: sport_profile.SportProfile,
 ) -> tuple[Path, FrameAnalysis | None, str]:
     # ProcessPoolExecutorの子プロセスで実行するため、例外は文字列にして持ち帰ります。
     try:
-        analysis = analyze_frame(frame_path, blur_threshold, dark_threshold, min_width, min_height)
+        analysis = analyze_frame(frame_path, blur_threshold, dark_threshold, min_width, min_height, profile)
         return frame_path, analysis, ""
     except Exception as exc:
         return frame_path, None, str(exc)
@@ -1674,6 +1756,7 @@ def analyze_frames(
     dark_threshold: float,
     min_width: int,
     min_height: int,
+    profile: sport_profile.SportProfile,
 ) -> list[dict[str, object]]:
     if not frame_jobs:
         return []
@@ -1687,7 +1770,7 @@ def analyze_frames(
 
     if max_workers == 1 or len(frame_paths) <= 4:
         results = [
-            analyze_frame_task(frame_path, blur_threshold, dark_threshold, min_width, min_height)
+            analyze_frame_task(frame_path, blur_threshold, dark_threshold, min_width, min_height, profile)
             for frame_path in frame_paths
         ]
     else:
@@ -1700,6 +1783,7 @@ def analyze_frames(
                     [dark_threshold] * len(frame_paths),
                     [min_width] * len(frame_paths),
                     [min_height] * len(frame_paths),
+                    [profile] * len(frame_paths),
                 )
             )
 
@@ -1715,6 +1799,11 @@ def analyze_frames(
 
 def main() -> int:
     args = parse_args()
+    try:
+        profile = resolve_sport_profile(args)
+    except sport_profile.ProfileError as exc:
+        print(f"スポーツプロファイルの読み込みに失敗しました: {exc}", file=sys.stderr)
+        return 2
     root = args.root.resolve()
     ensure_runtime_dirs(root)
     if args.cleanup_review:
@@ -1810,6 +1899,7 @@ def main() -> int:
             args.dark_threshold,
             args.min_width,
             args.min_height,
+            profile,
         )
     )
 
