@@ -85,21 +85,30 @@
 **目標データ量（実用ライン）**: 動画15〜25本 / 総ラベル2,000〜4,000枚 / うち正例300〜600枚
 根拠と最小ラインは MULTI_SPORT_SPEC.md 6章を参照。
 
-### windsurf
+**着手順**: 2026-08-12 にユーザーの判断で **wing を先行**することにした（当初は windsurf 先行の想定だった）。
 
-- [ ] 4-1 動画の収集（**5セッション以上に分散**。同一セッション偏重は交差検証を楽観的にする）
-- [ ] 4-2 フレーム抽出とラベリング（`record_labels.py --sport windsurf`）
-- [ ] 4-3 `frame_scorer.py train --sport windsurf` を実行し PR-AUC を確認
-- [ ] 4-4 `segment_simulator.py` で enter/exit/split_gap を実測し、`profiles/windsurf.json` の暫定値を確定値に更新
-      → 測定結果は `multi_sport/tuning_windsurf.md` に残す
+### wing（先行）
 
-### wing
+- [ ] 4-1 動画の収集（**5セッション以上に分散**。同一セッション偏重は交差検証を楽観的にする）🟡 収集中
+- [ ] 4-2 フレーム抽出とラベリング（`record_labels.py --sport wing`）🟡 進行中
+- [ ] 4-3 `frame_scorer.py train --sport wing` を実行し PR-AUC を確認
+- [ ] 4-4 しきい値の実測と確定（`segment_simulator.py` → `profiles/wing.json` の暫定値を更新）
+      → 測定結果は `multi_sport/tuning_wing.md` に残す
+      → ジャンプが短く1.0秒間隔では取りこぼす可能性あり。`--frame-interval 0.5` の要否もここで判断
+
+### windsurf（後続）
 
 - [ ] 4-5 動画の収集
-- [ ] 4-6 フレーム抽出とラベリング
+- [ ] 4-6 フレーム抽出とラベリング（`record_labels.py --sport windsurf`）
 - [ ] 4-7 学習と PR-AUC 確認
-- [ ] 4-8 しきい値の実測と確定（`multi_sport/tuning_wing.md`）
-      → ジャンプが短く1.0秒間隔では取りこぼす可能性あり。`--frame-interval 0.5` の要否もここで判断
+- [ ] 4-8 しきい値の実測と確定（`multi_sport/tuning_windsurf.md`）
+      → ウィンドのジャイブは3〜8秒と長い。`split_gap` / `pre_roll` / `post_roll` を特に見直すこと
+
+> **作業中の注意（Phase 3 完了までの暫定）**
+> CLI で `--sport wing` を実行すると `logs/active_profile.json` が wing になる。
+> GUI はまだ `--sport` を渡さないため kite として動き、混在ガードに引っかかって終了コード2で停止する。
+> GUI 作業に戻る前に `--cleanup-review --confirm-delete` で整理するか、`logs/active_profile.json` を削除する。
+> Phase 3（3-1〜3-3）が入れば解消する。
 
 ---
 
