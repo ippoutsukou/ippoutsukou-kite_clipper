@@ -286,6 +286,7 @@ class FrameSelectorWindow(tk.Toplevel):
         root: Path,
         get_cut_params: Callable[[], tuple[float, float, float]],
         on_selection_change: Callable[[], None],
+        get_predict_extra_args: Callable[[], list[str]] | None = None,
     ) -> None:
         super().__init__(master)
         self.title("フレーム選別 (review/frames → selected_frames)")
@@ -298,6 +299,10 @@ class FrameSelectorWindow(tk.Toplevel):
         self.cache_dir = root / "work" / "frame_thumbs"
         self.get_cut_params = get_cut_params
         self.on_selection_change = on_selection_change
+        # 呼び出し元（KiteClipperGui）から現在選択中の競技IDを都度取得するためのコールバック。
+        # `frame_scorer.py predict` に `--sport` を渡すために使う（マルチスポーツ対応）。
+        # 未指定時は空リスト（=既定の kite で動く旧来の挙動）。
+        self.get_predict_extra_args = get_predict_extra_args or (lambda: [])
 
         self.ng_info = load_ng_info(root / "logs" / "result.csv")
         self.ai_scores = load_ai_scores(root / "logs" / "ai_scores.csv")
@@ -856,7 +861,7 @@ class FrameSelectorWindow(tk.Toplevel):
         env["PYTHONIOENCODING"] = "utf-8"
         try:
             result = subprocess.run(
-                build_predict_command(self.root_dir),
+                build_predict_command(self.root_dir, extra=self.get_predict_extra_args()),
                 cwd=self.root_dir,
                 capture_output=True,
                 text=True,

@@ -1,5 +1,20 @@
 # Media Clip Organizer 作業手順書
 
+## 0. 競技（スポーツプロファイル）を選ぶ
+
+このアプリはカイトボード専用ではなく、`profiles/*.json` で定義した競技プロファイルを
+切り替えて使えます（対応: カイトボード / ウィンドサーフィン / ウィングフォイル）。
+教師データ・学習済みモデルは競技ごとに `dataset/<sport_id>/` `models/<sport_id>/` に
+分かれます（カイトボードのみ後方互換のため `dataset/labels.csv` `models/frame_scorer.pkl` のまま）。
+
+- GUI: 画面上部（工程ステッパーの上）の「競技」ドロップダウンから選びます。選択は
+  `logs/gui_settings.json` に保存され、次回起動時も復元されます。処理実行中は切り替えできません。
+- CLI: 各コマンドに `--sport <id>` を付けます（未指定時は既定の `kite`）。例: `--sport windsurf`。
+
+前回と異なる競技の中間生成物（`review/frames` 等）が残ったまま切り替えようとすると、
+誤判定を防ぐため確認が入ります（GUIは確認ダイアログ、CLIは終了コード2での停止）。
+詳しくは README.md の「競技（スポーツプロファイル）の切り替え」を参照してください。
+
 ## 1. 元データを入れる
 
 写真:
@@ -117,7 +132,10 @@ logs/result.csv  # 判定結果
 .\.venv\Scripts\python.exe .\frame_scorer.py predict
 ```
 
-GUIのビューアの「AI採点を実行」ボタンからも同じ処理を実行できます。CLIを開かずに、フレーム選別ビューアだけで採点から区間提案までを完結させたい場合はこちらが便利です。
+カイトボード以外の競技を使う場合は `--sport` を付けます（例: `--sport windsurf`）。
+モデルパス・しきい値は指定した競技のプロファイル（`profiles/<sport>.json`）から解決されます。
+
+GUIのビューアの「AI採点を実行」ボタンからも同じ処理を実行できます（GUI上部で選択中の競技が自動的に使われます）。CLIを開かずに、フレーム選別ビューアだけで採点から区間提案までを完結させたい場合はこちらが便利です。
 
 出力:
 
@@ -295,6 +313,7 @@ dataset/frames/<動画名>/  # 学習用の縮小画像(長辺640px)
 --no-images              CSVのみ記録し、画像コピーをしません
 --max-side N             コピーする画像の長辺ピクセルを変更します（既定640）
 --allow-empty-selection  採用フレームが0件でも、全フレームをNGとして記録します
+--sport <id>             出力先を profiles/<id>.json の paths.dataset にします（既定 kite）
 ```
 
 この手順は任意です。実行しなくても手順5以降に影響はありません。
@@ -308,7 +327,11 @@ dataset/frames/<動画名>/  # 学習用の縮小画像(長辺640px)
 .\.venv\Scripts\python.exe .\frame_scorer.py train
 ```
 
-出力:
+カイトボード以外の競技を学習する場合は `--sport` を付けます（例: `--sport windsurf`）。
+入力（`dataset/<sport>/labels.csv`）・出力先（`models/<sport>/frame_scorer.pkl`）は
+指定した競技のプロファイルから解決されます。
+
+出力（`--sport` 未指定＝kiteの場合）:
 
 ```text
 models/frame_scorer.pkl     # 学習済みモデル

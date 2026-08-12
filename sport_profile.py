@@ -145,7 +145,11 @@ def load_profile(root: Path, sport_id: str) -> SportProfile:
 
 
 def list_profiles(root: Path) -> list[SportProfile]:
-    """`<root>/profiles/*.json` を走査し、SportProfile のリストを返す（表示名順ではなくファイル名順）。"""
+    """`<root>/profiles/*.json` を走査し、SportProfile のリストを返す（表示名順ではなくファイル名順）。
+
+    1件でも読み込みに失敗すると `ProfileError` を送出して全体を止める。CLI 用の厳格な挙動であり、
+    GUI のドロップダウン生成にはこの関数をそのまま使わない（3-0）。GUI 側は `list_profiles_lenient()` を使う。
+    """
     profiles_dir = _profiles_dir(root)
     if not profiles_dir.is_dir():
         raise ProfileError(
@@ -153,6 +157,50 @@ def list_profiles(root: Path) -> list[SportProfile]:
             "profiles/ をリポジトリ直下（またはexeと同じ場所）に配置してください。"
         )
     return [load_profile(root, path.stem) for path in sorted(profiles_dir.glob("*.json"))]
+
+
+def list_profiles_lenient(root: Path) -> tuple[list[SportProfile], list[tuple[str, str]]]:
+    """GUI用の緩い一覧取得。読めたプロファイルだけを返し、読めなかったものはエラーとして分けて返す。
+
+    `list_profiles()` と異なり例外を送出しない（1ファイルの不備でGUIが起動不能になるのを避けるため。
+    仕様書 TASKS.md Phase3 3-0 に対応）。
+
+    戻り値: (読み込めた SportProfile のリスト, [(ファイル名, エラー理由), ...])
+    `profiles/` フォルダ自体が無い場合は、空のプロファイル一覧と
+    フォルダ不在を1件のエラーとして返す（例外は送出しない）。
+    """
+    profiles_dir = _profiles_dir(root)
+    if not profiles_dir.is_dir():
+        return [], [(PROFILES_DIRNAME, f"プロファイルフォルダが見つかりません: {profiles_dir}")]
+
+    profiles: list[SportProfile] = []
+    errors: list[tuple[str, str]] = []
+    for path in sorted(profiles_dir.glob("*.json")):
+        try:
+            profiles.append(load_profile(root, path.stem))
+        except ProfileError as exc:
+            errors.append((path.name, str(exc)))
+    return profiles, errors
+
+
+def find_residual_artifacts(root: Path) -> list[str]:
+    """混在ガード対象のフォルダ・CSVに中身が残っているかを、`active_profile.json` の内容とは
+    無関係に確認する（GUIの競技切り替え確認ダイアログ用。仕様書 2.5 / TASKS.md 3-1）。
+
+    `check_profile_switch()` は「前回の sport_id と食い違う場合」に限定して判定するが、
+    GUIの切り替え確認ダイアログは「そもそも中間生成物が残っているか」だけを見たいため、
+    判定ロジック（対象フォルダ・CSV）を共有しつつ、こちらは無条件に走査する。
+    """
+    findings: list[str] = []
+    for relative in _GUARD_TARGET_RELATIVE_DIRS:
+        count = _count_files_recursive(root / relative)
+        if count > 0:
+            findings.append(f"{relative} に {count} 件の未処理データが残っています。")
+    for relative in _GUARD_TARGET_RELATIVE_CSV_FILES:
+        count = _count_csv_data_rows(root / relative)
+        if count > 0:
+            findings.append(f"{relative} に {count} 件の未処理データが残っています。")
+    return findings
 
 
 def detect_equipment_candidate(image, profile: SportProfile, kite_detector) -> bool:
@@ -221,16 +269,7 @@ def check_profile_switch(root: Path, sport_id: str, allow_switch: bool) -> None:
     if not previous_sport_id or previous_sport_id == sport_id:
         return
 
-    findings: list[str] = []
-    for relative in _GUARD_TARGET_RELATIVE_DIRS:
-        count = _count_files_recursive(root / relative)
-        if count > 0:
-            findings.append(f"{relative} に {count} 件の未処理データが残っています。")
-    for relative in _GUARD_TARGET_RELATIVE_CSV_FILES:
-        count = _count_csv_data_rows(root / relative)
-        if count > 0:
-            findings.append(f"{relative} に {count} 件の未処理データが残っています。")
-
+    findings = find_residual_artifacts(root)
     if not findings:
         return
 

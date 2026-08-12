@@ -15,6 +15,7 @@ from tkinter import messagebox, ttk
 from tkinter import font as tkfont
 from typing import Callable
 
+import sport_profile
 from frame_scorer_launcher import FRAME_SCORER_ARGV_FLAG, build_predict_command
 from frame_selector import FrameSelectorWindow
 
@@ -43,10 +44,14 @@ THUMBNAIL_MAX_WIDTH = 320
 THUMBNAIL_MAX_HEIGHT = 240
 
 # おまかせモード（自動切り出し）関連の設定。
-FRAME_SCORER_MODEL_PATH = ROOT / "models" / "frame_scorer.pkl"
+# AI採点モデルのパスは競技（スポーツプロファイル）ごとに異なるため、固定パスの定数は持たず、
+# 選択中プロファイルの model_path を都度参照します（KiteClipperGui.current_model_path()）。
 AI_SEGMENTS_CSV = ROOT / "logs" / "ai_segments.csv"
 OMAKASE_PROCESSED_FILE = ROOT / "logs" / "omakase_processed.json"
 OMAKASE_POLL_INTERVAL_MS = 3000
+
+# GUIで選択中の競技（スポーツプロファイル）の永続化先。
+GUI_SETTINGS_FILE = ROOT / "logs" / "gui_settings.json"
 
 # アプリ全体のフォント。ttkの名前付きフォントと、サイズ指定つきの
 # 個別フォントタプルの両方でこのファミリーを使います。
@@ -162,6 +167,29 @@ def load_ai_segment_video_stems(csv_path: Path) -> set[str]:
     return stems
 
 
+def load_gui_settings() -> dict:
+    """`logs/gui_settings.json` を読み込みます。存在しない・壊れている場合は空dictを返します
+    （GUIの起動を絶対に止めないため、推測フォールバックはこの関数の外＝呼び出し側で行います）。
+    """
+    if not GUI_SETTINGS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(GUI_SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_gui_settings(settings: dict) -> None:
+    GUI_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        GUI_SETTINGS_FILE.write_text(
+            json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass  # 選択状態の永続化に失敗しても、GUIの動作自体は継続させます。
+
+
 class KiteClipperGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -248,9 +276,46 @@ class KiteClipperGui(tk.Tk):
         self.omakase_pending_sizes: dict[str, tuple[int, int]] = {}
         self.omakase_processed: dict[str, dict[str, float]] = self._load_omakase_processed()
 
+        # ---- 競技（スポーツプロファイル）選択の状態（マルチスポーツ対応 Phase 3）
+        # 起動不能を避けるため list_profiles_lenient() を使い、読めなかったものは
+        # ログへの警告に留める（3-0）。ログ欄はこの時点でまだ存在しないため、
+        # 警告文はいったん保留し、create_widgets() の後にまとめて出力します。
+        self._pending_startup_warnings: list[str] = []
+        profiles, profile_errors = sport_profile.list_profiles_lenient(ROOT)
+        for filename, reason in profile_errors:
+            self._pending_startup_warnings.append(
+                f"警告: スポーツプロファイル '{filename}' を読み込めませんでした（{reason}）"
+            )
+        self.sport_profiles: dict[str, sport_profile.SportProfile] = {p.id: p for p in profiles}
+        self.sport_ids_ordered: list[str] = [p.id for p in profiles]
+
+        saved_settings = load_gui_settings()
+        saved_sport_id = saved_settings.get("sport_id") if isinstance(saved_settings, dict) else None
+        if saved_sport_id in self.sport_profiles:
+            initial_sport_id = saved_sport_id
+        else:
+            if sport_profile.DEFAULT_SPORT_ID in self.sport_profiles:
+                initial_sport_id = sport_profile.DEFAULT_SPORT_ID
+            elif self.sport_ids_ordered:
+                initial_sport_id = self.sport_ids_ordered[0]
+            else:
+                initial_sport_id = None  # プロファイルが1件も読めなかった場合（極端なケース）
+            if saved_sport_id and saved_sport_id != initial_sport_id:
+                self._pending_startup_warnings.append(
+                    f"警告: 保存されていた競技 '{saved_sport_id}' のプロファイルが見つからないため、"
+                    f"既定（{initial_sport_id or '（利用可能な競技なし）'}）に戻しました。"
+                )
+        self.sport_id_var = tk.StringVar(value=initial_sport_id or "")
+        # 混在ガードに引っかかった際、「そのまま続行する」を選んだ場合に True になります。
+        # True の間は CLI 呼び出しに --allow-profile-switch を自動付与します。
+        self.allow_profile_switch = False
+
         self.create_widgets()
         self.refresh_all()
         self.show_step(self.next_step)
+        for message in self._pending_startup_warnings:
+            self.append_log(message)
+        self._pending_startup_warnings.clear()
 
     # ------------------------------------------------------------------ UI構築
     def create_widgets(self) -> None:
@@ -274,6 +339,25 @@ class KiteClipperGui(tk.Tk):
         )
         self.next_badge.pack(side=tk.RIGHT, padx=(0, 10))
         self.next_badge.bind("<Button-1>", lambda _e: self.show_step(self.next_step))
+
+        ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+        # ---- 競技（スポーツプロファイル）選択バー。ステッパーより上に配置します（仕様書 2.5）。
+        sport_bar = ttk.Frame(self, padding=(12, 6, 12, 6))
+        sport_bar.pack(fill=tk.X)
+        ttk.Label(sport_bar, text="競技:", font=(APP_FONT_FAMILY, 9, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+        self.sport_display_var = tk.StringVar()
+        self.sport_combo = ttk.Combobox(
+            sport_bar, textvariable=self.sport_display_var, state="readonly", width=20
+        )
+        self.sport_combo.pack(side=tk.LEFT)
+        self.sport_combo.bind("<<ComboboxSelected>>", self.on_sport_selected)
+        self._refresh_sport_combo_values()
+        ttk.Label(
+            sport_bar,
+            text="（処理実行中は切り替えできません）",
+            foreground="#888",
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
@@ -761,6 +845,189 @@ class KiteClipperGui(tk.Tk):
             self.log_toggle_button.configure(text="▾ ログ")
         self.log_visible = not self.log_visible
 
+    # ------------------------------------------------------ 競技（スポーツプロファイル）
+    def current_profile(self) -> sport_profile.SportProfile | None:
+        """現在GUIで選択中の競技のプロファイルを返します。
+
+        プロファイルが1件も読み込めなかった極端なケースでは None を返します
+        （呼び出し側は `--sport` を付けずに従来どおり CLI 側の既定(kite)に解決させます）。
+        """
+        return self.sport_profiles.get(self.sport_id_var.get())
+
+    def current_model_path(self) -> Path:
+        """選択中プロファイルのAI採点モデルパスを返します（3-2。旧 FRAME_SCORER_MODEL_PATH の代替）。"""
+        profile = self.current_profile()
+        if profile is not None:
+            return profile.model_path
+        # プロファイルが1件も読めなかった場合のみ、後方互換のため旧来のkite固定パスにフォールバックします。
+        return ROOT / "models" / "frame_scorer.pkl"
+
+    def current_sport_display_name(self) -> str:
+        profile = self.current_profile()
+        return profile.display_name if profile is not None else self.sport_id_var.get() or "（未選択）"
+
+    def current_predict_extra_args(self) -> list[str]:
+        """frame_scorer.py predict に渡す `--sport` / `--allow-profile-switch` 追加引数。
+
+        FrameSelectorWindow（ビューア内「AI採点を実行」）から都度呼ばれるコールバックです。
+        """
+        args: list[str] = []
+        profile = self.current_profile()
+        if profile is not None:
+            args = ["--sport", profile.id]
+        if self.allow_profile_switch:
+            args.append("--allow-profile-switch")
+        return args
+
+    def _refresh_sport_combo_values(self) -> None:
+        labels = [self.sport_profiles[sid].display_name for sid in self.sport_ids_ordered]
+        self.sport_combo.configure(values=labels)
+        profile = self.current_profile()
+        self.sport_display_var.set(profile.display_name if profile is not None else "")
+
+    def on_sport_selected(self, _event: object = None) -> None:
+        label = self.sport_display_var.get()
+        new_id = next(
+            (sid for sid in self.sport_ids_ordered if self.sport_profiles[sid].display_name == label),
+            None,
+        )
+        if new_id is None or new_id == self.sport_id_var.get():
+            self._refresh_sport_combo_values()
+            return
+        if self.busy:
+            # コンボボックスは busy 時 disabled にしているため通常は到達しませんが、保険で戻します。
+            self._refresh_sport_combo_values()
+            return
+        self._guarded(new_id, lambda: self._finish_sport_switch(new_id))
+
+    def _finish_sport_switch(self, new_sport_id: str) -> None:
+        self.sport_id_var.set(new_sport_id)
+        self._refresh_sport_combo_values()
+        save_gui_settings({"sport_id": new_sport_id})
+        name = self.current_sport_display_name()
+        self.append_log(f"競技を切り替えました: {name}")
+        self.status_var.set(f"競技: {name}")
+        if self.omakase_mode.get():
+            # AI採点モデルが競技ごとに変わるため、おまかせモードは一旦解除して再確認を促します。
+            self.omakase_mode.set(False)
+            self.omakase_status_var.set("")
+            self.append_log("おまかせモード: 競技切り替えのため監視を停止しました。必要なら再度ONにしてください。")
+            if self.omakase_poll_after_id is not None:
+                self.after_cancel(self.omakase_poll_after_id)
+                self.omakase_poll_after_id = None
+        self.refresh_all()
+
+    def _guarded(self, sport_id: str, run_after: Callable[[], None]) -> None:
+        """混在ガード（sport_profile.check_profile_switch）を事前チェックしてから run_after を実行します。
+
+        引っかかった場合は run_cli を呼ばずに確認ダイアログを出し、ユーザーの選択後に run_after を
+        再実行します（中心課題：GUIが謎の終了コード2で停止する経路を塞ぐため。TASKS.md 3-1）。
+        """
+        try:
+            sport_profile.check_profile_switch(ROOT, sport_id, self.allow_profile_switch)
+        except sport_profile.ProfileSwitchGuardError:
+            findings = sport_profile.find_residual_artifacts(ROOT)
+            self._show_guard_dialog(sport_id, findings, run_after)
+            return
+        run_after()
+
+    def _show_guard_dialog(
+        self, sport_id: str, findings: list[str], run_after: Callable[[], None]
+    ) -> None:
+        display_name = self.sport_profiles[sport_id].display_name if sport_id in self.sport_profiles else sport_id
+        dialog = tk.Toplevel(self)
+        dialog.title("競技の切り替え")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=14)
+        frame.pack(fill=tk.BOTH, expand=True)
+        message = (
+            f"「{display_name}」に切り替えようとしていますが、前回の競技の中間生成物が残っています。\n\n"
+            + "\n".join(findings)
+            + "\n\nこのまま処理を続けると、別競技のフレームを誤ったモデルで採点する事故につながります。"
+            "\nいずれかを選んでください。"
+        )
+        ttk.Label(frame, text=message, wraplength=440, justify=tk.LEFT).pack(anchor=tk.W)
+
+        def _on_cleanup() -> None:
+            dialog.destroy()
+            self._cleanup_then(sport_id, run_after)
+
+        def _on_continue() -> None:
+            dialog.destroy()
+            self.allow_profile_switch = True
+            self.append_log(
+                "競技切り替え: 中間生成物の混在を承知のうえで続行します（--allow-profile-switch）。"
+            )
+            run_after()
+
+        def _on_cancel() -> None:
+            dialog.destroy()
+            self._refresh_sport_combo_values()  # コンボボックスの表示を選択前の状態に戻します。
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill=tk.X, pady=(14, 0))
+        _accent_button(buttons, "整理してから切り替える", _on_cleanup).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="そのまま続行する", command=_on_continue).pack(side=tk.LEFT, padx=8)
+        ttk.Button(buttons, text="キャンセル", command=_on_cancel).pack(side=tk.RIGHT)
+        dialog.protocol("WM_DELETE_WINDOW", _on_cancel)
+
+    def _cleanup_then(self, sport_id: str, run_after: Callable[[], None]) -> None:
+        """「整理してから切り替える」を選んだ際の整理パイプライン。
+
+        --cleanup-review と --cleanup-after-cut（selected_frames等）をCLI経由で実行し、
+        最後に logs/ai_scores.csv・logs/ai_segments.csv をGUI側で直接削除します
+        （どちらもCLIの既存コマンドでは削除対象になっていないため。cleanup-after-cut は
+        混在ガード自体の対象コマンドのため、ここでは整理目的と明示して --allow-profile-switch を付けます）。
+        """
+        self.append_log("競技切り替え: 中間生成物を整理しています…")
+        self._run_cli_raw(
+            ["--sport", sport_id, "--cleanup-review", "--confirm-delete"],
+            "整理中(1/2)",
+            on_done=lambda code: self._cleanup_then_step2(code, sport_id, run_after),
+        )
+
+    def _cleanup_then_step2(self, return_code: int, sport_id: str, run_after: Callable[[], None]) -> None:
+        if return_code != 0:
+            self.on_command_done(return_code)
+            messagebox.showerror(
+                "整理に失敗しました",
+                f"review の整理に失敗しました（終了コード {return_code}）。競技の切り替えを中止しました。",
+            )
+            self._refresh_sport_combo_values()
+            return
+        self._run_cli_raw(
+            [
+                "--sport", sport_id, "--allow-profile-switch",
+                "--cleanup-after-cut", "--confirm-delete",
+                "--include-review-frames", "--include-review-photos",
+            ],
+            "整理中(2/2)",
+            on_done=lambda code: self._cleanup_then_step3(code, sport_id, run_after),
+        )
+
+    def _cleanup_then_step3(self, return_code: int, sport_id: str, run_after: Callable[[], None]) -> None:
+        if return_code != 0:
+            self.on_command_done(return_code)
+            messagebox.showerror(
+                "整理に失敗しました",
+                f"selected_frames 等の整理に失敗しました（終了コード {return_code}）。競技の切り替えを中止しました。",
+            )
+            self._refresh_sport_combo_values()
+            return
+        for csv_name in ("ai_scores.csv", "ai_segments.csv"):
+            csv_path = ROOT / "logs" / csv_name
+            try:
+                if csv_path.exists():
+                    csv_path.unlink()
+            except OSError as exc:
+                self.append_log(f"警告: {csv_path} を削除できませんでした（{exc}）")
+        self.append_log("競技切り替え: 整理が完了しました。")
+        self.on_command_done(0)
+        run_after()
+
     # ------------------------------------------------------------ 整理・削除
     def open_cleanup_dialog(self) -> None:
         if self.cleanup_dialog is not None and self.cleanup_dialog.winfo_exists():
@@ -818,6 +1085,7 @@ class KiteClipperGui(tk.Tk):
             ROOT,
             get_cut_params=self.current_cut_params,
             on_selection_change=self.refresh_counts,
+            get_predict_extra_args=self.current_predict_extra_args,
         )
 
     def current_cut_params(self) -> tuple[float, float, float]:
@@ -1210,9 +1478,40 @@ class KiteClipperGui(tk.Tk):
     ) -> None:
         """kite_clipper.py（exe化時はkite_clipper.exe）を args 付きで実行します。
 
-        on_done を指定すると、完了時に既定の on_command_done の代わりにそちらを
-        呼びます。おまかせモードの自動パイプラインで複数コマンドを連結する際に
-        使い、完了処理（set_busy(False)や再読み込み）を最後の1回だけにします。
+        実行前に混在ガードを事前チェックします（_guarded）。問題なければ現在選択中の競技の
+        `--sport` を自動付与して実行します。`--allow-profile-switch` を承知済みの場合はそれも
+        自動付与します（3-3）。on_done を指定すると、完了時に既定の on_command_done の代わりに
+        そちらを呼びます。おまかせモードの自動パイプラインで複数コマンドを連結する際に使い、
+        完了処理（set_busy(False)や再読み込み）を最後の1回だけにします。
+        """
+        profile = self.current_profile()
+        sport_id = profile.id if profile is not None else sport_profile.DEFAULT_SPORT_ID
+        self._guarded(sport_id, lambda: self._run_cli_with_sport(args, label, on_done))
+
+    def _run_cli_with_sport(
+        self,
+        args: list[str],
+        label: str,
+        on_done: Callable[[int], None] | None = None,
+    ) -> None:
+        full_args = list(args)
+        profile = self.current_profile()
+        if profile is not None:
+            full_args = ["--sport", profile.id, *full_args]
+        if self.allow_profile_switch:
+            full_args.append("--allow-profile-switch")
+        self._run_cli_raw(full_args, label, on_done)
+
+    def _run_cli_raw(
+        self,
+        args: list[str],
+        label: str,
+        on_done: Callable[[int], None] | None = None,
+    ) -> None:
+        """混在ガードの事前チェックや `--sport` の自動付与を行わず、与えられた args を
+        そのまま kite_clipper.py（exe化時は kite_clipper.exe）に渡して実行します。
+        競技切り替えの整理パイプライン（_cleanup_then 系）など、既にガード解決フローの
+        中にいて `--sport` / `--allow-profile-switch` を呼び出し側で組み立て済みの場合に使います。
         """
         if getattr(sys, "frozen", False):
             if not CLI_EXE.exists():
@@ -1233,8 +1532,22 @@ class KiteClipperGui(tk.Tk):
         label: str,
         on_done: Callable[[int], None] | None = None,
     ) -> None:
-        """frame_scorer.py predict を実行します（おまかせモードのAI採点ステップ用）。"""
-        command = build_predict_command(ROOT)
+        """frame_scorer.py predict を実行します（おまかせモードのAI採点ステップ用）。
+
+        run_cli と同様に混在ガードを事前チェックしたうえで `--sport` を自動付与します。
+        """
+        profile = self.current_profile()
+        sport_id = profile.id if profile is not None else sport_profile.DEFAULT_SPORT_ID
+        self._guarded(sport_id, lambda: self._run_frame_scorer_predict_now(label, on_done))
+
+    def _run_frame_scorer_predict_now(
+        self,
+        label: str,
+        on_done: Callable[[int], None] | None = None,
+    ) -> None:
+        profile = self.current_profile()
+        extra = ["--allow-profile-switch"] if self.allow_profile_switch else []
+        command = build_predict_command(ROOT, sport=(profile.id if profile is not None else None), extra=extra)
         self._run_command(command, label, on_done)
 
     def _run_command(
@@ -1257,6 +1570,8 @@ class KiteClipperGui(tk.Tk):
         self.action_buttons = [button for button in self.action_buttons if button.winfo_exists()]
         for button in self.action_buttons:
             button.configure(state=state)
+        # 処理実行中は競技の切り替えを禁止します（仕様書 2.5）。
+        self.sport_combo.configure(state=(tk.DISABLED if busy else "readonly"))
 
     def _run_cli_worker(self, command: list[str], callback: Callable[[int], None]) -> None:
         if not command:
@@ -1366,11 +1681,11 @@ class KiteClipperGui(tk.Tk):
     def on_omakase_toggle(self) -> None:
         """「おまかせモード（自動切り出し）」チェックボックスの切り替え処理です。"""
         if self.omakase_mode.get():
-            if not FRAME_SCORER_MODEL_PATH.exists():
+            if not self.current_model_path().exists():
                 messagebox.showwarning(
                     "おまかせモード",
-                    "AI採点モデルが未学習のためおまかせモードは使えません"
-                    "（WORKFLOW.md 手順4.6参照）。",
+                    f"{self.current_sport_display_name()}のAI採点モデルが未学習のため"
+                    "おまかせモードは使えません（WORKFLOW.md 手順4.6参照）。",
                 )
                 self.omakase_mode.set(False)
                 return

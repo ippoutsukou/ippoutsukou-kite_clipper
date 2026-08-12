@@ -49,6 +49,40 @@ python .\kite_clipper.py --blur-threshold 120 --dark-threshold 70 --min-width 12
 ## 出力 CSV
 
 `logs/result.csv` には、写真ごとの判定結果、選択有無、コピー先、動画フレームの抽出結果、エラー行が保存されます。
+
+## 競技（スポーツプロファイル）の切り替え
+
+このアプリはカイトボード専用ではなく、`profiles/*.json` で定義した競技プロファイルを
+切り替えて使えます（現時点で対応: カイトボード / ウィンドサーフィン / ウィングフォイル）。
+
+競技によって変わるのは器材検出の有無・区間提案パラメータ・教師データとモデルの保存先だけで、
+パイプライン本体（フレーム抽出・CLIP採点・切り出し・結合・GUI）はすべて共通です。
+教師データとモデルは競技ごとに `dataset/<sport_id>/labels.csv` / `models/<sport_id>/frame_scorer.pkl`
+に分かれます（カイトボードのみ後方互換のため従来どおり `dataset/labels.csv` / `models/frame_scorer.pkl`）。
+
+### CLI での切り替え
+
+各スクリプトに `--sport <id>` を指定します（未指定時は既定の `kite`）。
+
+```powershell
+python .\kite_clipper.py --sport windsurf
+python .\record_labels.py --sport windsurf
+python .\frame_scorer.py train --sport windsurf
+python .\frame_scorer.py predict --sport windsurf
+```
+
+前回と異なる競技の中間生成物（`review/frames` / `selected_frames` / `logs/ai_scores.csv` /
+`logs/ai_segments.csv`）が残ったまま別競技を実行しようとすると、誤判定を防ぐため
+処理前に停止します（終了コード2）。表示される案内に従い、
+`python kite_clipper.py --cleanup-review --confirm-delete` で整理するか、
+`--allow-profile-switch` を付けて混在を承知のうえで続行してください。
+
+### GUI での切り替え
+
+GUI 上部（ステッパーの上）の「競技」ドロップダウンから選べます。選択状態は
+`logs/gui_settings.json` に保存され、次回起動時に復元されます。処理実行中は切り替えできません。
+中間生成物が残った状態で切り替えようとすると確認ダイアログが出て、
+「整理してから切り替える」「そのまま続行する」「キャンセル」のいずれかを選べます。
 ## FFmpeg の同梱配布
 
 このアプリは `vendor/ffmpeg/windows-x64/ffmpeg.exe` と
