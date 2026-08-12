@@ -127,9 +127,27 @@ kite_clipper_gui.exe   # GUI 本体（AI 採点処理の frame_scorer.py を内�
 kite_clipper.exe       # CLI 本体（GUI から内部的に呼び出されます）
 vendor/ffmpeg/         # 同梱 FFmpeg（LGPL 版）
 vendor/clip/           # CLIP 画像特徴量モデル（ONNX）
-models/                # AI スコアリング用学習済みモデル
+models/                # AI スコアリング用学習済みモデル（競技ごとのサブフォルダを含む）
 input/ logs/ work/ ...  # 実行時に使う作業用フォルダ（初期状態は空）
 ```
+
+スポーツプロファイル（`profiles/*.json`）は両方の exe に内蔵されるため、
+配布フォルダに個別に置く必要はありません（GUI は `_internal/profiles/`、
+CLI は exe 内部に展開されます）。
+
+### 配布パッケージを作り直す手順
+
+`kite_clipper.py` や `profiles/*.json` を変更した場合は、**GUI と CLI の両方**を
+ビルドし直してください。片方だけ更新すると、GUI と CLI で競技の扱いが食い違います。
+
+```powershell
+.\.venv\Scripts\pyinstaller.exe kite_clipper_gui.spec --noconfirm
+.\.venv\Scripts\pyinstaller.exe kite_clipper.spec --noconfirm
+```
+
+`--noconfirm` は出力フォルダを作り直すため、`dist/kite_clipper_gui/` に手で
+配置した `vendor/` や `models/` は消えます。配布物の組み立ては
+`dist/kite_clipper_distribution/` など別フォルダで行ってください。
 
 `frame_scorer.py` は `kite_clipper_gui.exe` に内蔵されるため、配布フォルダへ
 別途 `.py` ファイルを同梱する必要はありません。

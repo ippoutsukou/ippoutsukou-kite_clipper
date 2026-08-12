@@ -4,7 +4,11 @@ __pycache__/
 backup/
 build/
 dist/
+# PyInstaller が自動生成する .spec は除外するが、手で調整した配布用ビルド設定は
+# リポジトリで管理する（失うとビルド手順を復元できないため）
 *.spec
+!kite_clipper_gui.spec
+!kite_clipper.spec
 *.bak
 作業ログ.txt
 
