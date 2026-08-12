@@ -205,6 +205,11 @@ def parse_args() -> argparse.Namespace:
         help=f"使用するスポーツプロファイルID（profiles/<id>.json。既定: {sport_profile.DEFAULT_SPORT_ID}）",
     )
     parser.add_argument(
+        "--allow-profile-switch",
+        action="store_true",
+        help="前回と異なる競技を指定した際の混在ガードをバイパスします（中間生成物の混在を承知のうえで続行）",
+    )
+    parser.add_argument(
         "--blur-threshold", type=float, default=None, help="これ未満をブレ候補にします（既定: プロファイル由来）"
     )
     parser.add_argument(
@@ -1806,6 +1811,16 @@ def main() -> int:
         return 2
     root = args.root.resolve()
     ensure_runtime_dirs(root)
+
+    # 混在ガード（仕様書 2.4）。--cleanup-review は混在を解消するための救済コマンドなので対象外にする
+    # （ここでブロックすると、ガードで示した対処法そのものが実行できなくなってしまう）。
+    if not args.cleanup_review:
+        try:
+            sport_profile.check_profile_switch(root, profile.id, args.allow_profile_switch)
+        except sport_profile.ProfileSwitchGuardError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
     if args.cleanup_review:
         return cleanup_review(root, args.confirm_delete, args.dry_run)
     if args.cleanup_after_cut:
@@ -1912,6 +1927,8 @@ def main() -> int:
     print(f"完了: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"CSV: {logs / 'result.csv'}")
     print(f"エラーログ: {logs / 'error.log'}")
+    # 混在ガード（仕様書 2.4）用に、今回使用した競技を記録する。
+    sport_profile.write_active_profile(root, profile.id)
     return 0
 
 

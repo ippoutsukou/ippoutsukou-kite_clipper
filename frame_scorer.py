@@ -21,10 +21,13 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from clip_embedder import CLIP_EMBED_DIM, ClipEmbedder
+import sport_profile
 
 # kite_clipper.py / record_labels.py のフレーム命名規則と同じもの。frame_scorer.py は
 # kite_clipper.py・record_labels.py からは完全に独立させるため、ここに複製しています
-# （CLIP画像埋め込みの実装だけは同一プロジェクト内の clip_embedder.py を再利用します）。
+# （CLIP画像埋め込みの実装だけは同一プロジェクト内の clip_embedder.py を再利用します。
+# sport_profile.py は他プロジェクトモジュールを import しない末端モジュールなので、
+# 制約C-4に抵触せず import してよい）。
 FRAME_NAME_PATTERN = re.compile(r"^(?P<video_stem>.+)__t(?P<time>\d+(?:\.\d+)?)$")
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -81,6 +84,23 @@ def resolve_root(root_arg: Path | None) -> Path:
 
 def resolve_path(root: Path, value: Path) -> Path:
     return value if value.is_absolute() else root / value
+
+
+def app_base_dir() -> Path:
+    """プロファイル（profiles/<sport>.json）の探索基準。`--root`（作業フォルダ）とは別物。
+
+    kite_clipper.py の app_base_dir() と同じ考え方（PyInstaller配布時は exe と同じ場所）だが、
+    frame_scorer.py は kite_clipper.py を import しない設計方針（制約C-4）のためここに複製する。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def resolve_sport_profile(sport_arg: str | None) -> sport_profile.SportProfile:
+    """`--sport` からプロファイルを読み込む（cv/segment等の既定値はここでは埋めない。呼び出し側で解決する）。"""
+    sport_id = sport_arg if sport_arg is not None else sport_profile.DEFAULT_SPORT_ID
+    return sport_profile.load_profile(app_base_dir(), sport_id)
 
 
 def compute_medians(rows: list[dict[str, str]]) -> dict[str, float]:
@@ -481,17 +501,28 @@ def parse_args() -> argparse.Namespace:
     train_parser.add_argument(
         "--dataset",
         type=Path,
-        default=Path("dataset/labels.csv"),
-        help="学習データCSVのパス（既定: dataset/labels.csv）",
+        default=None,
+        help="学習データCSVのパス（既定: プロファイルの paths.dataset。無指定時 dataset/labels.csv 相当）",
     )
     train_parser.add_argument(
         "--model-out",
         type=Path,
-        default=Path("models/frame_scorer.pkl"),
-        help="保存するモデルファイルのパス（既定: models/frame_scorer.pkl）",
+        default=None,
+        help="保存するモデルファイルのパス（既定: プロファイルの paths.model。無指定時 models/frame_scorer.pkl 相当）",
     )
     train_parser.add_argument(
         "--root", type=Path, default=None, help="プロジェクトルート（既定はこのスクリプトのあるフォルダ）"
+    )
+    train_parser.add_argument(
+        "--sport",
+        type=str,
+        default=None,
+        help=f"使用するスポーツプロファイルID（profiles/<id>.json。既定: {sport_profile.DEFAULT_SPORT_ID}）",
+    )
+    train_parser.add_argument(
+        "--allow-profile-switch",
+        action="store_true",
+        help="前回と異なる競技を指定した際の混在ガードをバイパスします（中間生成物の混在を承知のうえで続行）",
     )
     train_parser.add_argument(
         "--features",
@@ -514,8 +545,8 @@ def parse_args() -> argparse.Namespace:
     predict_parser.add_argument(
         "--model",
         type=Path,
-        default=Path("models/frame_scorer.pkl"),
-        help="読み込むモデルファイルのパス（既定: models/frame_scorer.pkl）",
+        default=None,
+        help="読み込むモデルファイルのパス（既定: プロファイルの paths.model。無指定時 models/frame_scorer.pkl 相当）",
     )
     predict_parser.add_argument(
         "--out",
@@ -527,24 +558,35 @@ def parse_args() -> argparse.Namespace:
         "--root", type=Path, default=None, help="プロジェクトルート（既定はこのスクリプトのあるフォルダ）"
     )
     predict_parser.add_argument(
+        "--sport",
+        type=str,
+        default=None,
+        help=f"使用するスポーツプロファイルID（profiles/<id>.json。既定: {sport_profile.DEFAULT_SPORT_ID}）",
+    )
+    predict_parser.add_argument(
+        "--allow-profile-switch",
+        action="store_true",
+        help="前回と異なる競技を指定した際の混在ガードをバイパスします（中間生成物の混在を承知のうえで続行）",
+    )
+    predict_parser.add_argument(
         "--enter",
         type=float,
-        default=DEFAULT_SEGMENT_ENTER,
-        help=f"区間提案(logs/ai_segments.csv)の開始スコアしきい値（既定: {DEFAULT_SEGMENT_ENTER}）",
+        default=None,
+        help=f"区間提案(logs/ai_segments.csv)の開始スコアしきい値（既定: プロファイルの segment.enter。無指定時 {DEFAULT_SEGMENT_ENTER}）",
     )
     predict_parser.add_argument(
         "--exit",
         dest="exit_",
         type=float,
-        default=DEFAULT_SEGMENT_EXIT,
-        help=f"区間提案(logs/ai_segments.csv)の終了スコアしきい値（既定: {DEFAULT_SEGMENT_EXIT}）",
+        default=None,
+        help=f"区間提案(logs/ai_segments.csv)の終了スコアしきい値（既定: プロファイルの segment.exit。無指定時 {DEFAULT_SEGMENT_EXIT}）",
     )
     predict_parser.add_argument(
         "--smooth-window",
         type=int,
-        default=DEFAULT_SEGMENT_SMOOTH_WINDOW,
+        default=None,
         help="区間提案のスコア平滑化の移動平均窓(フレーム数、中央寄せ。1で平滑化なし)"
-        f"（既定: {DEFAULT_SEGMENT_SMOOTH_WINDOW}）",
+        f"（既定: プロファイルの segment.smooth_window。無指定時 {DEFAULT_SEGMENT_SMOOTH_WINDOW}）",
     )
     predict_parser.add_argument(
         "--no-segments",
@@ -619,8 +661,21 @@ def build_train_report(
 
 def cmd_train(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
-    dataset_path = resolve_path(root, args.dataset)
-    model_out_path = resolve_path(root, args.model_out)
+    try:
+        profile = resolve_sport_profile(args.sport)
+    except sport_profile.ProfileError as exc:
+        print(f"スポーツプロファイルの読み込みに失敗しました: {exc}", file=sys.stderr)
+        return 2
+    try:
+        sport_profile.check_profile_switch(root, profile.id, args.allow_profile_switch)
+    except sport_profile.ProfileSwitchGuardError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    # 優先順位: CLI明示 > プロファイル値(paths.dataset/paths.model) > 従来のハードコード既定値。
+    # プロファイル値は既に app_base_dir() 基準の絶対パスに解決済みなので resolve_path() を通さない。
+    dataset_path = resolve_path(root, args.dataset) if args.dataset is not None else profile.dataset_path
+    model_out_path = resolve_path(root, args.model_out) if args.model_out is not None else profile.model_path
     features_mode: str = args.features
     ambiguous_sec: float = args.ambiguous_sec
 
@@ -824,11 +879,29 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 def cmd_predict(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
-    model_path = resolve_path(root, args.model)
-    out_path = resolve_path(root, args.out)
+    try:
+        profile = resolve_sport_profile(args.sport)
+    except sport_profile.ProfileError as exc:
+        print(f"スポーツプロファイルの読み込みに失敗しました: {exc}", file=sys.stderr)
+        return 2
+    try:
+        sport_profile.check_profile_switch(root, profile.id, args.allow_profile_switch)
+    except sport_profile.ProfileSwitchGuardError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
-    if not args.no_segments and args.enter <= args.exit_:
-        print(f"エラー: --enter({args.enter})は--exit({args.exit_})より大きい必要があります。")
+    # 優先順位: CLI明示 > プロファイル値 > 従来のハードコード既定値。
+    model_path = resolve_path(root, args.model) if args.model is not None else profile.model_path
+    out_path = resolve_path(root, args.out)
+    segment = profile.segment
+    enter = args.enter if args.enter is not None else segment.get("enter", DEFAULT_SEGMENT_ENTER)
+    exit_ = args.exit_ if args.exit_ is not None else segment.get("exit", DEFAULT_SEGMENT_EXIT)
+    smooth_window = (
+        args.smooth_window if args.smooth_window is not None else segment.get("smooth_window", DEFAULT_SEGMENT_SMOOTH_WINDOW)
+    )
+
+    if not args.no_segments and enter <= exit_:
+        print(f"エラー: --enter({enter})は--exit({exit_})より大きい必要があります。")
         return 1
 
     if not model_path.exists():
@@ -946,7 +1019,7 @@ def cmd_predict(args: argparse.Namespace) -> int:
         grouped = group_scores_by_video(scored_rows, proba)
         segments_path = resolve_path(root, AI_SEGMENTS_RELATIVE_PATH)
         all_segment_rows = write_ai_segments_csv(
-            segments_path, grouped, args.enter, args.exit_, args.smooth_window
+            segments_path, grouped, enter, exit_, smooth_window
         )
         counts_by_video: dict[str, int] = {video_stem: 0 for video_stem in grouped}
         total_duration = 0.0
@@ -955,12 +1028,16 @@ def cmd_predict(args: argparse.Namespace) -> int:
             total_duration += max(0.0, end_sec - start_sec)
         print("--- 区間提案サマリー ---")
         print(
-            f"パラメータ: enter={args.enter} / exit={args.exit_} / smooth-window={args.smooth_window}"
+            f"パラメータ: enter={enter} / exit={exit_} / smooth-window={smooth_window}"
         )
         for video_stem in sorted(counts_by_video):
             print(f"  {video_stem}: {counts_by_video[video_stem]} 区間")
         print(f"全体: {len(all_segment_rows)} 区間 / 合計 {total_duration:.1f} 秒")
         print(f"区間提案出力先: {segments_path}")
+    # 混在ガード（仕様書 2.4）用に、今回使用した競技を記録する。
+    # review/frames を読み ai_scores.csv/ai_segments.csv を書く predict のタイミングでのみ記録する
+    # （train は dataset/<sport>/labels.csv のみを読み、共有作業フォルダの状態には触れないため対象外）。
+    sport_profile.write_active_profile(root, profile.id)
     return 0
 
 

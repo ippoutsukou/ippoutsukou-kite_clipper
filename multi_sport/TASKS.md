@@ -10,8 +10,8 @@
 |---|---|---|---|
 | 0 | 設計 | ✅ 完了 | 4/4 |
 | 1 | MVP（プロファイル機構と kite の等価性確保） | ✅ 完了 | 6/6 |
-| 2 | 競技追加（windsurf / wing） | ⬜ 未着手 | 0/5 |
-| 3 | GUI・配布 | ⬜ 未着手 | 0/7 |
+| 2 | 競技追加（windsurf / wing） | ✅ 完了 | 5/5 |
+| 3 | GUI・配布 | ⬜ 未着手 | 0/8 |
 | 4 | 実データ運用（コード変更なし） | ⬜ 未着手 | 0/8 |
 
 状態記号: ⬜ 未着手 / 🟡 作業中 / ✅ 完了 / ⛔ ブロック中 / ⏭ 見送り
@@ -51,11 +51,11 @@
 
 ## Phase 2: 競技追加
 
-- [ ] 2-1 `profiles/windsurf.json` / `profiles/wing.json` を作成（`equipment_detector` は `"none"`、しきい値は kite と同値の暫定値）
-- [ ] 2-2 `record_labels.py` に `--sport` を追加し、出力先を `paths.dataset` に
-- [ ] 2-3 `frame_scorer.py` の train / predict に `--sport` を追加
-- [ ] 2-4 混在ガード実装（`logs/active_profile.json` + `--allow-profile-switch`、終了コード2）
-- [ ] 2-5 検証: 既存 pkl が `--sport kite` で読める（V-2）／ `--sport windsurf` が通し実行できる（V-3）／ 混在ガードが働く（V-4）
+- [x] 2-1 `profiles/windsurf.json` / `profiles/wing.json` を作成（`equipment_detector` は `"none"`、しきい値は kite と同値の暫定値） — 2026-08-12 完了
+- [x] 2-2 `record_labels.py` に `--sport` を追加し、出力先を `paths.dataset` に — 2026-08-12 完了
+- [x] 2-3 `frame_scorer.py` の train / predict に `--sport` を追加 — 2026-08-12 完了
+- [x] 2-4 混在ガード実装（`logs/active_profile.json` + `--allow-profile-switch`、終了コード2） — 2026-08-12 完了
+- [x] 2-5 検証: 既存 pkl が `--sport kite` で読める（V-2）／ `--sport windsurf` が通し実行できる（V-3）／ 混在ガードが働く（V-4） — 2026-08-12 完了
 
 ---
 
@@ -71,6 +71,12 @@
 - [ ] 3-4 `kite_clipper_gui.spec` の `datas` に `profiles/` を追加
 - [ ] 3-5 README.md / WORKFLOW.md に競技切り替え手順を追記
 - [ ] 3-6 検証: GUI 切り替えの永続化（V-5）／ PyInstaller ビルド後の exe で競技一覧が出る（V-6）
+- [ ] 3-7 CLIPモデルパスの解決基準の不整合を検討（**既存の挙動。Phase 2 で作り込んだものではない**）
+      `frame_scorer.py:720` の `clip_model_path = root / CLIP_MODEL_RELATIVE_PATH` は `--root`（作業フォルダ）基準。
+      一方 `profiles/` と `paths.model` は `app_base_dir()`（アプリ設置場所）基準になった。
+      通常運用では両者が同じフォルダなので顕在化しないが、`--root` を別の場所にすると
+      CLIPモデルだけ見つからなくなる。GUI改修時に基準を揃えるか判断する。
+      挙動変更を伴うため、揃える場合は単独で回帰確認すること。
 
 ---
 
@@ -163,6 +169,96 @@ Phase 1 は既存挙動を1ミリも変えないのが目的。1-0 のベース�
    - `is_dark`: 既定値では 0/20 True → 明示値(200)では 20/20 True
    - `is_low_resolution`: 既定値では 0/20 True → 明示値(99999)では 20/20 True
    → プロファイル値（既定 120/70/1280）に上書きされず、CLI明示値がそのまま効いていることを確認
+
+## Phase 2 実装ログ（2026-08-12）
+
+- 新規: `profiles/windsurf.json` / `profiles/wing.json`
+  - `equipment_detector` は `"none"`、cv/segment のしきい値は kite と同値の暫定値（推測での別値は入れていない）
+  - `paths.dataset` は `dataset/windsurf/labels.csv` / `dataset/wing/labels.csv`、`paths.model` は
+    `models/windsurf/frame_scorer.pkl` / `models/wing/frame_scorer.pkl`
+  - `display_name` は「ウィンドサーフィン」「ウィングフォイル」
+- 変更: `sport_profile.py`
+  - 混在ガードの共通関数を新設（3ファイルへのコピペを避けるため）。
+    `check_profile_switch(root, sport_id, allow_switch)` が `ProfileSwitchGuardError` を送出、
+    `write_active_profile(root, sport_id)` が `logs/active_profile.json` を書き出す
+  - ガード対象は `review/frames` / `selected_frames`（再帰的にファイル数をカウント）と
+    `logs/ai_scores.csv` / `logs/ai_segments.csv`（ヘッダを除いたデータ行数をカウント）
+  - `active_profile.json` が存在しない・壊れている場合はガード判定をスキップする
+    （導入前のワークフォルダや初回実行を誤ってブロックしないため。仕様書に明記はないが、
+    「推測でフォールバックしない」原則とは別に、安全側に倒す実装判断として追記）
+- 変更: `kite_clipper.py`
+  - `--allow-profile-switch` を追加
+  - `main()` の冒頭（`--cleanup-review` 以外）で `sport_profile.check_profile_switch()` を呼び、
+    `ProfileSwitchGuardError` はメッセージを表示して終了コード2で停止
+  - `--cleanup-review` はガード対象から除外（ガードが示す対処法そのものが実行できなくなるため）
+  - メインパイプライン（フレーム抽出・分析）が成功した最後に `sport_profile.write_active_profile()` を呼ぶ
+    （`--cut-from-*` / `--cleanup-after-cut` / `--concat-selected-clips` 等の補助コマンドでは書き込まない。
+    理由: これらは `--sport` を明示しなくても既定値 kite に解決されてしまうため、書き込むと
+    実際には触れていない競技で `active_profile.json` を上書きしてしまう恐れがあるため）
+- 変更: `frame_scorer.py`
+  - `import sport_profile` を追加（末端モジュールのため制約C-4に抵触しない）
+  - `app_base_dir()` を複製実装（`kite_clipper.py` を import しない方針のため）
+  - `resolve_sport_profile(sport_arg)` を新設し、train/predict 両サブコマンドで使用
+  - train: `--dataset` / `--model-out` の `default` を `None` に変更し、無指定時はプロファイルの
+    `paths.dataset` / `paths.model` を使う（CLI明示 > プロファイル > 従来のハードコード既定値の順）
+  - predict: `--model` の `default` を `None` に変更し同様に解決。`--enter` / `--exit` /
+    `--smooth-window` も `default=None` にし、`profile.segment` の値で解決
+  - train/predict 冒頭で `sport_profile.check_profile_switch()` を呼び、
+    `ProfileSwitchGuardError` は終了コード2で停止
+  - predict 成功時のみ `sport_profile.write_active_profile()` を呼ぶ（train は `review/frames` 等の
+    共有作業フォルダに触れないため対象外とした）
+  - モデル保存先ディレクトリ（`models/windsurf/` 等）は既存の `model_out_path.parent.mkdir()` が
+    そのままカバーするため追加変更不要だった
+- 変更: `record_labels.py`
+  - `import sport_profile` と `app_base_dir()` を追加、`--sport` を追加
+  - 出力先を固定の `dataset/labels.csv` から `profile.dataset_path`（既定 kite で従来と同じパス）に変更。
+    `dataset_frames_dir` も `profile.dataset_path.parent / "frames"` から導出するよう変更
+  - 混在ガードは実装対象外（引き継ぎメモの指定どおり `kite_clipper.py` / `frame_scorer.py` のみに実装）
+
+### 検証結果（隔離ワークスペース使用、ユーザーの作業フォルダ・real dataset/models は変更していない）
+
+- **V-1（回帰）**: `scratchpad/baseline_ws` を再利用し、`review/` `logs/` `selected_*` `selected_clips` `final` `work`
+  を `shutil.rmtree` で削除してから実行。
+  - `--sport` 省略 → `logs/result.csv` と `multi_sport/baseline/result_before.csv` の `diff` が完全ゼロ
+  - `--sport kite` 明示 → 同上、`diff` 完全ゼロ
+  - いずれも `logs/active_profile.json` に `{"sport_id": "kite", ...}` が書き出されることを確認
+- **V-2**: `frame_scorer.py predict --sport kite --root <隔離WS>` を実行。
+  `profile.model_path` がプロジェクト本体の `models/frame_scorer.pkl`（実在・読み込み成功）に解決されることを確認。
+  `joblib.load()` は例外なく完了し、その後は隔離WS内に `vendor/clip/vision_model_quantized.onnx` が
+  無いために別エラーで停止した（CLIP埋め込みモデルのパス解決は本タスクの変更対象外の既存挙動であり、
+  「モデル読み込みで落ちない」という検証観点は満たしている）
+- **V-3**: 新規WS（`scratchpad/windsurf_ws1`）に動画をコピーし
+  `kite_clipper.py --root <新規WS> --sport windsurf --only-video 20260704_161647` を実行。
+  終了コード0、`logs/result.csv` の `has_kite_candidate` は全行 `False`（器材検出スキップを確認）
+- **V-4（混在ガード）**:
+  - windsurf で実行済みの WS に対し `kite_clipper.py --sport kite` → 終了コード2、
+    `review/frames に 6 件の未処理データが残っています。` を含むメッセージを出力して停止
+  - 同条件で `--allow-profile-switch` を付けて再実行 → 終了コード0で正常完了、
+    `active_profile.json` が `kite` に更新される
+  - 同じ mismatch 状態で `frame_scorer.py predict --sport windsurf --root <WS>` → 終了コード2で同様に停止
+    （kite_clipper.py・frame_scorer.py 両方でガードが機能することを確認）
+  - 新規WS（`scratchpad/fresh_ws1`）で kite 実行後に中間生成物をすべて削除してから `--sport windsurf` に
+    切替 → 終了コード0（誤検知しないことを確認）
+
+### 制約・仕様との整合性メモ
+
+- 制約 C-1〜C-5 はすべて維持（`has_kite_candidate` 列名・`FEATURE_NAMES` の要素数と順序・
+  kite のパス据え置き・`segment_simulator.py` 無変更・`frame_scorer.py`/`record_labels.py` が
+  `kite_clipper.py` を import しない設計）を変更していない
+- 仕様書に明記が無く自分で判断した点:
+  1. 混在ガードを適用する範囲。`kite_clipper.py` の `--cleanup-review` のみ明示的に除外し、
+     `--cut-from-*` 系や `--concat-selected-clips` にもガードを適用した（仕様書はサブコマンド単位の
+     除外を明記していないため、安全側に倒し「起動時」全般に適用しつつ、唯一の救済コマンドだけ除外した）
+  2. `active_profile.json` の書き込みタイミング。メインパイプライン（kite_clipper.py の既定フロー）と
+     frame_scorer.py の predict 成功時のみ書き込み、cleanup系・cut系・train には書き込まないとした
+     （これらは `--sport` を指定しなくても既定値 kite に解決されてしまうため、書き込むと未使用の競技で
+     上書きしてしまうリスクがあると判断した）
+  3. `active_profile.json` が存在しない・壊れている場合はガード判定をスキップする（明示エラーで
+     停止する対象は sport_profile.json 自体の読み込み失敗のみとし、ガード用の状態ファイルの欠落・破損は
+     「初回実行」として扱った）
+- 抵触しかけた点: frame_scorer.py の CLIP モデルパス（`CLIP_MODEL_RELATIVE_PATH`）は `--root`
+  （作業フォルダ）基準のままで、`paths.dataset`/`paths.model` のように app_base_dir 基準にしていない。
+  これは既存の挙動（Phase 2 の変更対象外）であり、本タスクでは触れていない
 
 ## 未確定事項
 

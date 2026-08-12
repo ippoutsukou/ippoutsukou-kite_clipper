@@ -13,13 +13,20 @@ import しない設計方針に合わせています）。
 
 from __future__ import annotations
 
+import csv
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 DEFAULT_SPORT_ID = "kite"
 
 PROFILES_DIRNAME = "profiles"
+
+# 混在ガード（仕様書 2.4）の対象。input/videos・input/photos は元データのため対象外。
+ACTIVE_PROFILE_RELATIVE_PATH = "logs/active_profile.json"
+_GUARD_TARGET_RELATIVE_DIRS = ("review/frames", "selected_frames")
+_GUARD_TARGET_RELATIVE_CSV_FILES = ("logs/ai_scores.csv", "logs/ai_segments.csv")
 
 # プロファイルJSONに必須のトップレベルキー
 _REQUIRED_TOP_KEYS = (
@@ -41,6 +48,14 @@ class ProfileError(Exception):
     """スポーツプロファイルの読み込み・解決に失敗したときの例外。
 
     推測でのフォールバックは行わず、常にこの例外で明示的に停止します。
+    """
+
+
+class ProfileSwitchGuardError(Exception):
+    """プロファイル混在ガード（仕様書 2.4）に引っかかったときの例外。
+
+    作業フォルダ（`--root`）に前回の競技の中間生成物が残ったまま別競技を実行しようとした
+    場合に送出する。呼び出し側は `str(exc)` をそのまま表示し、終了コード2で停止すること。
     """
 
 
@@ -155,3 +170,84 @@ def detect_equipment_candidate(image, profile: SportProfile, kite_detector) -> b
         return False
     # load_profile() 側で検証済みのため通常はここに到達しないが、念のため明示エラーで停止する。
     raise ProfileError(f"未知の equipment_detector です: {detector!r}（プロファイル: {profile.id}）")
+
+
+def _count_files_recursive(directory: Path) -> int:
+    if not directory.is_dir():
+        return 0
+    return sum(1 for path in directory.rglob("*") if path.is_file())
+
+
+def _count_csv_data_rows(csv_path: Path) -> int:
+    """CSVのデータ行数（ヘッダ除く）を返す。読めない・空の場合は0。"""
+    if not csv_path.is_file() or csv_path.stat().st_size == 0:
+        return 0
+    try:
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as file:
+            row_count = sum(1 for _ in csv.reader(file))
+    except OSError:
+        return 0
+    return max(0, row_count - 1)
+
+
+def check_profile_switch(root: Path, sport_id: str, allow_switch: bool) -> None:
+    """作業フォルダ `root` に残る前回競技の中間生成物と `sport_id` の食い違いを検知する。
+
+    詳細仕様: multi_sport/MULTI_SPORT_SPEC.md の 2.4。
+    `root / logs/active_profile.json` に記録された前回の sport_id が今回の sport_id と異なり、
+    かつ review/frames・selected_frames・logs/ai_scores.csv・logs/ai_segments.csv の
+    いずれかに中身が残っている場合、`ProfileSwitchGuardError` を送出する。
+    `allow_switch` が True のときは常に何もしない（`--allow-profile-switch` によるバイパス）。
+    `input/videos` / `input/photos` は元データのためガード対象に含めない。
+    active_profile.json が存在しない、または壊れている場合はガード判定を行わない
+    （初回実行やこの機能導入前のワークフォルダを誤ってブロックしないため）。
+    """
+    if allow_switch:
+        return
+
+    active_path = root / ACTIVE_PROFILE_RELATIVE_PATH
+    if not active_path.is_file():
+        return
+
+    try:
+        raw_text = active_path.read_text(encoding="utf-8")
+        data = json.loads(raw_text)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict):
+        return
+
+    previous_sport_id = data.get("sport_id")
+    if not previous_sport_id or previous_sport_id == sport_id:
+        return
+
+    findings: list[str] = []
+    for relative in _GUARD_TARGET_RELATIVE_DIRS:
+        count = _count_files_recursive(root / relative)
+        if count > 0:
+            findings.append(f"{relative} に {count} 件の未処理データが残っています。")
+    for relative in _GUARD_TARGET_RELATIVE_CSV_FILES:
+        count = _count_csv_data_rows(root / relative)
+        if count > 0:
+            findings.append(f"{relative} に {count} 件の未処理データが残っています。")
+
+    if not findings:
+        return
+
+    message_lines = [
+        f"前回は {previous_sport_id} で実行しましたが、今回は {sport_id} が指定されています。",
+        *findings,
+        "競技を切り替える前に、以下のいずれかを行ってください。",
+        "  - python kite_clipper.py --cleanup-review --confirm-delete で整理する",
+        "  - --allow-profile-switch を付けて、混在を承知のうえで続行する",
+    ]
+    raise ProfileSwitchGuardError("\n".join(message_lines))
+
+
+def write_active_profile(root: Path, sport_id: str) -> None:
+    """実行成功時に `logs/active_profile.json` へ今回の sport_id を書き出す（混在ガード用）。"""
+    logs_dir = root / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"sport_id": sport_id, "updated_at": datetime.now().isoformat()}
+    active_path = logs_dir / "active_profile.json"
+    active_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

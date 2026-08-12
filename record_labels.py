@@ -14,13 +14,17 @@ from typing import Iterable
 import cv2
 import numpy as np
 
+import sport_profile
+
 try:
     cv2.setLogLevel(0)
 except AttributeError:
     pass
 
 # kite_clipper.py のフレーム命名規則と同じもの。record_labels.py は完全に独立した
-# スクリプトにするため、kite_clipper側の定義はimportせずここに複製しています。
+# スクリプトにするため、kite_clipper側の定義はimportせずここに複製しています
+# （sport_profile.py は他プロジェクトモジュールを import しない末端モジュールなので、
+# kite_clipper.py を import しない方針<制約>には抵触せず import してよい）。
 FRAME_NAME_PATTERN = re.compile(r"^(?P<video_stem>.+)__t(?P<time>\d+(?:\.\d+)?)$")
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -86,11 +90,29 @@ class LabelEntry:
     source_path: Path | None
 
 
+def app_base_dir() -> Path:
+    """プロファイル（profiles/<sport>.json）の探索基準。`--root`（作業フォルダ）とは別物。
+
+    kite_clipper.py の app_base_dir() と同じ考え方（PyInstaller配布時は exe と同じ場所）だが、
+    record_labels.py は kite_clipper.py を import しない設計方針のためここに複製する。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="review/frames と selected_frames の選別結果を教師データ(dataset/labels.csv)として記録します。"
     )
     parser.add_argument("--root", type=Path, default=None, help="プロジェクトルート（既定はこのスクリプトのあるフォルダ）")
+    parser.add_argument(
+        "--sport",
+        type=str,
+        default=None,
+        help=f"使用するスポーツプロファイルID（profiles/<id>.json。既定: {sport_profile.DEFAULT_SPORT_ID}）。"
+        "labels.csv の出力先（paths.dataset）を決めます。",
+    )
     parser.add_argument("--dry-run", action="store_true", help="書き込み・コピーを一切せず、記録予定の件数と集計だけ表示します")
     parser.add_argument("--no-images", action="store_true", help="CSVのみ記録し、画像コピーをしません")
     parser.add_argument("--max-side", type=int, default=640, help="コピーする画像の長辺ピクセル（0以下なら縮小せず原寸コピー）")
@@ -303,12 +325,21 @@ def main() -> int:
     args = parse_args()
     root = args.root.resolve() if args.root else Path(__file__).resolve().parent
 
+    sport_id = args.sport if args.sport is not None else sport_profile.DEFAULT_SPORT_ID
+    try:
+        profile = sport_profile.load_profile(app_base_dir(), sport_id)
+    except sport_profile.ProfileError as exc:
+        print(f"スポーツプロファイルの読み込みに失敗しました: {exc}", file=sys.stderr)
+        return 2
+
     review_frames_dir = root / "review" / "frames"
     selected_frames_dir = root / "selected_frames"
     result_csv_path = root / "logs" / "result.csv"
     work_audio_dir = root / "work" / "audio_peaks"
-    dataset_dir = root / "dataset"
-    labels_csv_path = dataset_dir / "labels.csv"
+    # paths.dataset は既に app_base_dir() 基準の絶対パスに解決済み（sport_profile.load_profile 参照）。
+    # kite は従来どおり <app_base_dir>/dataset/labels.csv になる（据え置き）。
+    labels_csv_path = profile.dataset_path
+    dataset_dir = labels_csv_path.parent
     dataset_frames_dir = dataset_dir / "frames"
 
     if not review_frames_dir.exists():
