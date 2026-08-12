@@ -5,9 +5,14 @@ from PyInstaller.utils.hooks import collect_all
 sklearn_datas, sklearn_binaries, sklearn_hiddenimports = collect_all('sklearn')
 onnxruntime_datas, onnxruntime_binaries, onnxruntime_hiddenimports = collect_all('onnxruntime')
 
-# マルチスポーツ対応: profiles/*.json はアプリ本体の設置場所（app_base_dir()）を基準に
-# 探索されるため、凍結ビルドでも exe と同じ場所（配布ルート）に同梱する必要がある
-# （multi_sport/MULTI_SPORT_SPEC.md 2.1 / 3.4）。
+# マルチスポーツ対応: PyInstaller 6.x の onedir ビルドでは datas はここで指定した
+# 'profiles' フォルダとして _internal/profiles/ に展開される（sys._MEIPASS が指す場所）。
+# exe と同じ場所（配布ルート）ではないので注意。sport_profile._resolve_profiles_dir() が
+# 凍結時に _MEIPASS/profiles を優先探索するため、この配置で問題なく読み込める
+# （見つからない場合は sys.executable と同じ場所の profiles/ もフォールバック探索する）。
+# 一方 dataset/model はユーザーが書き込む領域のため、引き続き exe と同じ場所
+# （app_base_dir()）を基準に解決する（sport_profile.load_profile() の root 引数）。
+# 詳細: multi_sport/MULTI_SPORT_SPEC.md 2.1 / 3.4
 profile_datas = [('profiles', 'profiles')]
 
 a = Analysis(

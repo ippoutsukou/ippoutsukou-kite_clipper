@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -71,22 +72,57 @@ class SportProfile:
     model_path: Path  # root からの絶対パスに解決済み
 
 
-def _profiles_dir(root: Path) -> Path:
-    return Path(root) / PROFILES_DIRNAME
+def _profiles_dir_candidates(root: Path) -> list[Path]:
+    """プロファイルJSONの探索候補ディレクトリを、優先順で列挙する。
+
+    プロファイルJSON（読み取り専用の同梱データ）の置き場所と、dataset/model
+    （ユーザーが書き込む配布ルート）の置き場所は、PyInstaller 6.x の onedir 配布では
+    一致しない（前者は `_internal/`、後者は exe と同じ場所）ため、探索ロジックを分離している。
+
+    - 凍結時（`sys.frozen`）: `sys._MEIPASS`（onedir では `_internal/` を指す）配下の
+      `profiles/` を優先し、見つからなければ `exe と同じ場所 / profiles/` も候補にする
+      （手動で exe 横に profiles/ を配置し直した場合の救済）。
+    - 非凍結時: 従来どおり呼び出し元が渡した `root` 配下の `profiles/` のみ。
+    """
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / PROFILES_DIRNAME)
+        candidates.append(Path(sys.executable).resolve().parent / PROFILES_DIRNAME)
+    else:
+        candidates.append(Path(root) / PROFILES_DIRNAME)
+    return candidates
+
+
+def _resolve_profiles_dir(root: Path) -> Path:
+    """`_profiles_dir_candidates()` の候補を順に確認し、最初に存在するディレクトリを返す。
+
+    どれも存在しない場合は、探索した候補パスをすべて列挙した `ProfileError` を送出する
+    （凍結ビルドでどこを探して見つからなかったのか、原因調査できるようにするため）。
+    """
+    candidates = _profiles_dir_candidates(root)
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    candidate_lines = "\n".join(f"  - {candidate}" for candidate in candidates)
+    raise ProfileError(
+        "プロファイルフォルダが見つかりません。以下の場所を探索しましたが、"
+        "いずれも存在しませんでした:\n"
+        f"{candidate_lines}\n"
+        "profiles/ をリポジトリ直下（またはexeと同じ場所）に配置してください。"
+    )
 
 
 def load_profile(root: Path, sport_id: str) -> SportProfile:
     """`<root>/profiles/<sport_id>.json` を読み込んで SportProfile を返す。
 
     `root` はアプリ本体の設置ディレクトリ（PyInstaller配布時は exe と同じ場所）を想定しており、
-    `--root` で指定される作業フォルダとは別物です。dataset/model のパスもこの `root` を基準に解決します。
+    `--root` で指定される作業フォルダとは別物です。dataset/model のパスはこの `root`
+    （= `app_base_dir()`）を基準に解決しますが、プロファイルJSON自体の探索先は
+    `_resolve_profiles_dir()` の候補（凍結時は `_MEIPASS` 優先）に従います。
     """
-    profiles_dir = _profiles_dir(root)
-    if not profiles_dir.is_dir():
-        raise ProfileError(
-            f"プロファイルフォルダが見つかりません: {profiles_dir}\n"
-            "profiles/ をリポジトリ直下（またはexeと同じ場所）に配置してください。"
-        )
+    profiles_dir = _resolve_profiles_dir(root)
 
     profile_path = profiles_dir / f"{sport_id}.json"
     if not profile_path.is_file():
@@ -150,12 +186,7 @@ def list_profiles(root: Path) -> list[SportProfile]:
     1件でも読み込みに失敗すると `ProfileError` を送出して全体を止める。CLI 用の厳格な挙動であり、
     GUI のドロップダウン生成にはこの関数をそのまま使わない（3-0）。GUI 側は `list_profiles_lenient()` を使う。
     """
-    profiles_dir = _profiles_dir(root)
-    if not profiles_dir.is_dir():
-        raise ProfileError(
-            f"プロファイルフォルダが見つかりません: {profiles_dir}\n"
-            "profiles/ をリポジトリ直下（またはexeと同じ場所）に配置してください。"
-        )
+    profiles_dir = _resolve_profiles_dir(root)
     return [load_profile(root, path.stem) for path in sorted(profiles_dir.glob("*.json"))]
 
 
@@ -169,9 +200,10 @@ def list_profiles_lenient(root: Path) -> tuple[list[SportProfile], list[tuple[st
     `profiles/` フォルダ自体が無い場合は、空のプロファイル一覧と
     フォルダ不在を1件のエラーとして返す（例外は送出しない）。
     """
-    profiles_dir = _profiles_dir(root)
-    if not profiles_dir.is_dir():
-        return [], [(PROFILES_DIRNAME, f"プロファイルフォルダが見つかりません: {profiles_dir}")]
+    try:
+        profiles_dir = _resolve_profiles_dir(root)
+    except ProfileError as exc:
+        return [], [(PROFILES_DIRNAME, str(exc))]
 
     profiles: list[SportProfile] = []
     errors: list[tuple[str, str]] = []

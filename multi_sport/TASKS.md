@@ -160,6 +160,7 @@ Phase 1 は既存挙動を1ミリも変えないのが目的。1-0 のベース�
 | 2026-08-12 | 作業フォルダは共有し、`active_profile.json` で混在ガード | 競技別ワークスペース分離は全パス定数に手が入り、regression リスクが目的（無事故の移行）と衝突する |
 | 2026-08-12 | GUIの混在ガード事前チェックは `sport_profile.check_profile_switch()` をそのまま呼ぶ | GUI独自の判定ロジックを別途書くと、CLIとGUIで「いつ止まるか」の基準がずれる恐れがある。同一関数を in-process で呼ぶことで判定基準を一本化した |
 | 2026-08-12 | `frame_scorer.py:720` のCLIPモデルパス基準の不整合は Phase 3 でも見送り | `--root` 基準のままで、`app_base_dir()` 基準の `paths.model` と不整合。通常運用では両者が同じフォルダのため顕在化しない。挙動変更を伴い単独の回帰確認が必要なため対象外とした |
+| 2026-08-12 | プロファイルJSONの探索先と `paths.dataset`/`paths.model` の解決基準を分離した（`sport_profile._resolve_profiles_dir()` を新設） | PyInstaller 6.x onedir 配布では `datas` が `_internal/`（`_MEIPASS`）に入るが、exe は配布ルート直下にある。両者を同じ `root`（`app_base_dir()`）で扱っていたため凍結ビルドが `profiles/` を見つけられず起動不能になっていた。dataset/model は書き込み領域のため `_MEIPASS` 基準にはできず、探索ロジックのみ分離した |
 
 ---
 
@@ -442,6 +443,70 @@ active_profile.json が wing」の状態のものをそのまま利用）で検�
    設計されており、3択ダイアログのロジックを丸ごと複製するのは差分過大と判断した）。
    実用上、通常のワークフローでは工程2（フレーム生成）の時点で `run_cli` 側のガードが
    既に働くため、ビューアを開いた時点で競技の食い違いが残っているケースは稀である。
+
+## Phase 3 追補: PyInstaller onedir 配布での `profiles/` 不在バグ修正（2026-08-12）
+
+### バグの内容
+
+- `app_base_dir()`（`kite_clipper.py` / `kite_clipper_gui.py` / `frame_scorer.py` /
+  `record_labels.py` に同一実装が複製されている）は凍結時に
+  `Path(sys.executable).resolve().parent` を返す。onedir 配布ではこれは
+  `dist/kite_clipper_gui/`（exe が置かれる場所）になる。
+- 一方 PyInstaller 6.x の onedir ビルドは `datas` を **`_internal/` サブフォルダ**に配置する。
+  `kite_clipper_gui.spec` の `profile_datas = [('profiles', 'profiles')]` は
+  `dist/kite_clipper_gui/_internal/profiles/` に展開されるが、`sport_profile.load_profile()` は
+  （`root` = `app_base_dir()` を渡していたため）`dist/kite_clipper_gui/profiles/` を探しに行き、
+  `ProfileError` で起動不能になっていた。
+- Phase 3 実装ログの V-6（PyInstallerビルド後のexeでの確認、未実施）で見落とされていた不具合。
+
+### 修正内容
+
+`sport_profile.py` に「プロファイルJSONの探索先」を、「`paths.dataset` / `paths.model` の解決基準
+（`root` = `app_base_dir()`、従来どおり）」から分離した。
+
+- `_profiles_dir_candidates(root)`: 凍結時は `sys._MEIPASS`（onedir では `_internal/` を指す）配下の
+  `profiles/` を最優先候補にし、次点で `sys.executable` と同じ場所の `profiles/`
+  （手動で exe 横に配置し直した場合の救済）を候補にする。非凍結時は従来どおり `root/profiles/` のみ。
+- `_resolve_profiles_dir(root)`: 候補を順に確認し、最初に存在するディレクトリを返す。
+  すべて存在しない場合は、探索した候補パスを**すべて列挙**した `ProfileError` を送出する
+  （原因調査しやすくするため）。
+- `load_profile()` / `list_profiles()` / `list_profiles_lenient()` はいずれもこの解決ロジックを通す。
+  `load_profile(root, sport_id)` の**シグネチャは変更していない**。`paths.dataset` /
+  `paths.model` の解決（`Path(root) / paths["dataset"]` 等）は一切変更していない
+  （`_MEIPASS` は読み取り専用の展開先であり、モデル保存先として不正なため）。
+- `kite_clipper_gui.spec` のコメントを「exe と同じ場所に同梱される」という誤った説明から、
+  実際の展開先（`_internal/profiles/`、すなわち `_MEIPASS` 基準）に合わせて修正した。
+  `datas` の指定自体（`profile_datas = [('profiles', 'profiles')]`）は変更していない。
+
+### 検証結果
+
+- **V-1（baseline回帰）**: `scratchpad/baseline_ws` の中間生成物（`final/` `logs/` `review/`
+  `selected_clips/` `selected_frames/` `work/`、`input/` は保持）を `shutil.rmtree` で削除後、
+  `.venv/Scripts/python.exe kite_clipper.py --root <baseline_ws>` を実行。生成された
+  `logs/result.csv` の SHA256 は `278b985ae7547fcf22d6ee89ca2b83ac91d8c18af086a4a45bd0c048eea0d254` で、
+  期待値と完全一致（差分ゼロ）。
+- **V-2（凍結時探索ロジックの単体検証）**: `sys.frozen` / `sys._MEIPASS` / `sys.executable` を
+  モンキーパッチし、スクラッチパッドに擬似配布レイアウトを作成して3ケースを確認した。
+  1. `_MEIPASS/profiles/kite.json` がある場合、そちらを最優先で読み込み、かつ
+     `paths.model` / `paths.dataset` は `root`（exe の場所）基準で解決され、`_MEIPASS` 配下には
+     ならないこと（dataset/model の解決基準を変えていないことの直接確認）。
+  2. `_MEIPASS/profiles/` が無く、exe と同じ場所の `profiles/` にはある場合、フォールバックで
+     読み込めること。
+  3. どちらにも無い場合、`ProfileError` のメッセージに両方の候補パスが列挙されること。
+  3ケースとも期待どおりの結果。
+- **V-3（非凍結時の回帰）**: 非凍結の通常実行で `list_profiles_lenient()` が
+  `kite` / `windsurf` / `wing` の3件をエラーなしで返し、`load_profile(root, "kite")` の
+  `dataset_path` / `model_path` が従来どおりリポジトリ直下の `dataset/labels.csv` /
+  `models/frame_scorer.pkl` に解決されることを確認。
+
+### 実際の PyInstaller ビルドによる確認（未実施・要ユーザー確認）
+
+- 指示によりビルド自体は実施していない。ユーザーが手元で `pyinstaller kite_clipper_gui.spec` を
+  実行し、`dist/kite_clipper_gui/kite_clipper_gui.exe` の起動でプロファイル一覧
+  （kite / windsurf / wing）が表示されることを確認する必要がある。
+- あわせて、`dist/kite_clipper_gui/_internal/profiles/` に3つの JSON が実際に展開されているか
+  （PyInstaller のバージョンによって `_internal` の有無や名称が変わる可能性があるため）も
+  合わせて目視確認することを推奨する。
 
 ## 未確定事項
 
