@@ -13,8 +13,8 @@
     "frame_interval": 1.0
   },
   "segment": {
-    "enter": 0.5,
-    "exit": 0.4,
+    "enter": 0.55,
+    "exit": 0.5,
     "smooth_window": 3,
     "split_gap": 2.0,
     "pre_roll": 1.0,
