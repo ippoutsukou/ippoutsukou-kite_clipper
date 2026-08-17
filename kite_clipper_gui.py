@@ -49,6 +49,9 @@ THUMBNAIL_MAX_HEIGHT = 240
 AI_SEGMENTS_CSV = ROOT / "logs" / "ai_segments.csv"
 OMAKASE_PROCESSED_FILE = ROOT / "logs" / "omakase_processed.json"
 OMAKASE_POLL_INTERVAL_MS = 3000
+# おまかせモードで同じ動画を再処理する上限回数。これを超えたら処理済みとして記録し、
+# 恒久的なエラー（対応外の解像度など）で無限に再試行するのを防ぎます。
+OMAKASE_MAX_ATTEMPTS = 3
 
 # GUIで選択中の競技（スポーツプロファイル）の永続化先。
 GUI_SETTINGS_FILE = ROOT / "logs" / "gui_settings.json"
@@ -275,6 +278,9 @@ class KiteClipperGui(tk.Tk):
         # ファイル名 -> (直近ポーリングでのサイズ, そのサイズが何回連続で観測されたか)
         self.omakase_pending_sizes: dict[str, tuple[int, int]] = {}
         self.omakase_processed: dict[str, dict[str, float]] = self._load_omakase_processed()
+        # ファイル名 -> 連続失敗回数。恒久的なエラーで同じ動画を延々と再処理しないための上限管理。
+        # 起動しなおせばリセットされる（原因を直してから再試行できるように、あえて保存しない）。
+        self.omakase_failures: dict[str, int] = {}
 
         # ---- 競技（スポーツプロファイル）選択の状態（マルチスポーツ対応 Phase 3）
         # 起動不能を避けるため list_profiles_lenient() を使い、読めなかったものは
@@ -1738,6 +1744,9 @@ class KiteClipperGui(tk.Tk):
         for name in list(self.omakase_pending_sizes.keys()):
             if name not in current:
                 del self.omakase_pending_sizes[name]
+        for name in list(self.omakase_failures.keys()):
+            if name not in current:
+                del self.omakase_failures[name]
 
         target_name: str | None = None
         for name, (size, _mtime) in current.items():
@@ -1823,8 +1832,21 @@ class KiteClipperGui(tk.Tk):
         self._omakase_finish(video_path)
 
     def _omakase_abort(self, video_path: Path, reason: str) -> None:
-        # 処理済みとしては記録せず、次のポーリングで再試行できるようにします。
-        self.append_log(f"おまかせ: {reason}（{video_path.name}）。この動画の自動処理を中断しました。")
+        # 一時的な失敗（他コマンドとの競合など）は再試行したいので、既定では処理済みに
+        # 記録せず次のポーリングに任せます。ただし同じ動画が続けて失敗する場合は恒久的な
+        # エラーとみなし、上限回数で打ち切ります。
+        attempts = self.omakase_failures.get(video_path.name, 0) + 1
+        self.omakase_failures[video_path.name] = attempts
+        self.append_log(
+            f"おまかせ: {reason}（{video_path.name}）。"
+            f"この動画の自動処理を中断しました。[{attempts}/{OMAKASE_MAX_ATTEMPTS}回目]"
+        )
+        if attempts >= OMAKASE_MAX_ATTEMPTS:
+            self._record_omakase_processed(video_path)
+            self.append_log(
+                f"おまかせ: {video_path.name} は{OMAKASE_MAX_ATTEMPTS}回失敗したため自動処理の対象から外しました。"
+                "原因を解消してからGUIを再起動すると、もう一度処理されます。"
+            )
         self.omakase_running = False
         self.set_busy(False)
         self.status_var.set(f"おまかせ: エラー（{video_path.name}）")
@@ -1832,6 +1854,7 @@ class KiteClipperGui(tk.Tk):
         self.refresh_all()
 
     def _omakase_finish(self, video_path: Path) -> None:
+        self.omakase_failures.pop(video_path.name, None)
         self._record_omakase_processed(video_path)
         self.omakase_running = False
         self.set_busy(False)
