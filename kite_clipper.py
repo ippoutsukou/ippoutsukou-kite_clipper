@@ -1058,7 +1058,8 @@ def cut_from_selected_frames(
     print(f"エラー: {error_count} 件")
     print(f"CSV: {logs / 'clip_cuts.csv'}")
     print(f"出力先: {selected_clips}")
-    return 0
+    # 1件でも失敗したら異常終了にします（GUIは終了コードで成否を判定するため）。
+    return 1 if error_count else 0
 
 
 def read_ai_segments_csv(
@@ -1188,7 +1189,8 @@ def cut_from_ai_segments(
     print(f"エラー: {error_count} 件")
     print(f"CSV: {auto_clip_cuts_csv}")
     print(f"出力先: {selected_clips}")
-    return 0
+    # 1件でも失敗したら異常終了にします（GUIは終了コードで成否を判定するため）。
+    return 1 if error_count else 0
 
 
 def iter_files_recursive(directory: Path, extensions: set[str]) -> Iterable[Path]:
