@@ -1315,6 +1315,18 @@ def bitrate_for_resolution(width: int, height: int) -> str:
     return "8M"
 
 
+# H.264 の上限。一辺は実装側（QSV等）が 4096px で頭打ちになり、総画素は Level 6.2 の
+# MaxFS 139264 マクロブロック（約35.6メガピクセル）が上限です。GoPro の 8:7 フルセンサー
+# 素材（5312x4648）は横幅が 4096px を超えるため再エンコードできません。
+H264_MAX_SIDE = 4096
+H264_MAX_PIXELS = 139264 * 16 * 16
+
+
+def exceeds_h264_limit(width: int, height: int) -> bool:
+    # 規格上の制約なので、エンコーダを qsv から libopenh264 に替えても解決しません。
+    return max(width, height) > H264_MAX_SIDE or width * height > H264_MAX_PIXELS
+
+
 def cut_video_clip(
     video_path: Path,
     output_path: Path,
@@ -1337,10 +1349,11 @@ def cut_video_clip(
         "-t",
         format_seconds(duration),
     ]
-    if fast_copy:
+    width, height = get_video_resolution(video_path)
+    # H.264 に収まらない解像度は再エンコードできないため、ストリームコピーへ切り替えます。
+    if fast_copy or exceeds_h264_limit(width, height):
         command.extend(["-c", "copy"])
     else:
-        width, height = get_video_resolution(video_path)
         command.extend([
             "-c:v",
             detect_video_encoder(),
@@ -1454,6 +1467,10 @@ def concat_selected_clips(
         # ビットレートを決めることで、正規化の有無にかかわらず一律に扱えます。
         concat_width, concat_height = get_video_resolution(concat_inputs[0])
         concat_bitrate = bitrate_for_resolution(concat_width, concat_height)
+        # normalize=original のまま 8:7 素材（5312x4648）を結合すると H.264 に収まらないため、
+        # 切り出しと同じくストリームコピーへ切り替えます。
+        if exceeds_h264_limit(concat_width, concat_height):
+            fast_copy = True
         concat_video_clips(concat_list, output, fast_copy, concat_bitrate)
         for index, clip in enumerate(clips, start=1):
             rows.append(concat_row(index, clip, get_video_duration(clip), output, "ok", f"{normalize}/{fit}"))
