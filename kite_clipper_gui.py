@@ -2067,7 +2067,9 @@ def main() -> int:
     if argv:
         print(f"不明な引数です: {argv}", file=sys.stderr)
         return 2
-    app = KiteClipperGui()
+    from video_ui import VideoOnlyApp
+    app = VideoOnlyApp(ROOT, ROOT / "out")
+    app.protocol("WM_DELETE_WINDOW", app._on_close)
     app.mainloop()
     return 0
 

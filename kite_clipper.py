@@ -1878,40 +1878,14 @@ def main() -> int:
             args.fit,
         )
 
-    input_photos = root / "input" / "photos"
     input_videos = root / "input" / "videos"
-    review_photos = root / "review" / "photos"
     review_frames = root / "review" / "frames"
     logs = root / "logs"
 
     setup_logging(logs)
     rows: list[dict[str, object]] = []
-    photos: list[PhotoAnalysis] = []
-
-    for photo_path in iter_files(input_photos, PHOTO_EXTENSIONS):
-        try:
-            photos.append(
-                analyze_photo(
-                    photo_path,
-                    args.blur_threshold,
-                    args.dark_threshold,
-                    args.min_width,
-                    args.min_height,
-                )
-            )
-        except Exception as exc:
-            logging.exception("写真処理エラー: %s", photo_path)
-            rows.append(error_row("photo", photo_path, str(exc)))
-
-    if photos:
-        group_photos(photos, args.similarity_threshold)
-        selected = select_best_photos(photos)
-        try:
-            copy_selected_photos(selected, review_photos)
-        except Exception as exc:
-            logging.exception("写真コピーエラー")
-            rows.append(error_row("photo_copy", review_photos, str(exc)))
-        rows.extend(photo_row(photo) for photo in photos)
+    # 通常処理は動画専用。PhotoAnalysis/PHOTO_EXTENSIONSは
+    # フレーム画像解析・学習互換性のため残し、input/photosは読み込まない。
 
     target_videos = filter_videos_by_only(iter_files(input_videos, VIDEO_EXTENSIONS), args.only_video)
     if args.only_video and not target_videos:
