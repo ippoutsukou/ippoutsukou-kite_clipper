@@ -9,6 +9,9 @@ import 'package:media_kit_video/media_kit_video.dart';
 
 import 'export_service.dart';
 import 'editor_viewport.dart';
+import 'editor_controls.dart';
+import 'timeline_frames.dart';
+import 'preview_readiness.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -26,6 +29,13 @@ class KiteApp extends StatelessWidget {
           colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xff1266ed)),
           scaffoldBackgroundColor: const Color(0xfff5f7fa),
           fontFamily: 'Yu Gothic UI',
+          sliderTheme: const SliderThemeData(
+            activeTrackColor: Color(0xff1266ed),
+            inactiveTrackColor: Color(0xffdce5f1),
+            thumbColor: Color(0xff1266ed),
+            rangeThumbShape: RoundRangeSliderThumbShape(enabledThumbRadius: 8),
+            trackHeight: 3,
+          ),
           outlinedButtonTheme: OutlinedButtonThemeData(
             style: OutlinedButton.styleFrom(
               backgroundColor: Colors.white,
@@ -55,7 +65,7 @@ class Workspace extends StatefulWidget {
 
 class _WorkspaceState extends State<Workspace> {
   final player = Player();
-  late final controller = VideoController(player);
+  late final VideoController controller;
   final subscriptions = <StreamSubscription<dynamic>>[];
   String? source;
   String? output;
@@ -67,6 +77,43 @@ class _WorkspaceState extends State<Workspace> {
   bool loading = false;
   int? pendingSeek;
   Future<void>? seekTask;
+  bool muted = false;
+  final timelineLoader = TimelineLoader(extractTimelineFrame);
+  List<Uint8List?> timelineFrames = List.filled(8, null);
+  String? timelineSource;
+
+  void loadTimeline() {
+    final path = source;
+    if (path == null || durationMs <= 0 || timelineSource == path) return;
+    timelineSource = path;
+    unawaited(timelineLoader.load(path, durationMs, (index, bytes) {
+      if (!mounted) return;
+      setState(() {
+        timelineFrames[index] = bytes;
+        thumbnail ??= bytes;
+      });
+    }));
+  }
+
+  Future<void> togglePlayback() async {
+    try {
+      await seekTask;
+      if (!mounted || busy || loading) return;
+      await player.playOrPause();
+    } catch (_) {
+      if (mounted) setState(() => error = '再生操作を完了できませんでした。');
+    }
+  }
+
+  Future<void> toggleMute() async {
+    try {
+      final next = !muted;
+      await player.setVolume(next ? 0 : 100);
+      if (mounted) setState(() => muted = next);
+    } catch (_) {
+      if (mounted) setState(() => error = '音声を切り替えられませんでした。');
+    }
+  }
 
   void previewAt(int milliseconds) {
     pendingSeek = milliseconds;
@@ -91,6 +138,8 @@ class _WorkspaceState extends State<Workspace> {
   @override
   void initState() {
     super.initState();
+    // 初回のVideoウィジェット構築まで遅延させず、起動時に出力を接続する。
+    controller = VideoController(player);
     subscriptions.add(
       player.stream.duration.listen((value) {
         if (!mounted || value.inMilliseconds <= 0) return;
@@ -99,6 +148,7 @@ class _WorkspaceState extends State<Workspace> {
             range = RangeValues(0, value.inMilliseconds.toDouble());
           durationMs = value.inMilliseconds;
         });
+        loadTimeline();
       }),
     );
     subscriptions.add(
@@ -110,6 +160,7 @@ class _WorkspaceState extends State<Workspace> {
 
   @override
   void dispose() {
+    timelineLoader.cancel();
     pendingSeek = null;
     for (final sub in subscriptions) {
       sub.cancel();
@@ -136,6 +187,7 @@ class _WorkspaceState extends State<Workspace> {
       );
       if (file == null || !mounted) return;
       pendingSeek = null;
+      timelineLoader.cancel();
       await seekTask;
       await player.stop();
       setState(() {
@@ -143,8 +195,18 @@ class _WorkspaceState extends State<Workspace> {
         output = null;
         thumbnail = null;
         durationMs = 0;
+        timelineSource = null;
+        timelineFrames = List.filled(8, null);
       });
-      await player.open(Media(file.path), play: false);
+      await openPreparedPreview(
+        ready: () async {
+          await controller.platform.future;
+          await WidgetsBinding.instance.endOfFrame;
+        }(),
+        isActive: () => mounted,
+        open: () => player.open(Media(file.path), play: false),
+      );
+      if (!mounted) return;
       // 動画が読み込まれた後に取得。失敗しても再生機能は維持する。
       try {
         final frame = await player.screenshot();
@@ -266,7 +328,7 @@ class _WorkspaceState extends State<Workspace> {
               const Padding(
                 padding: EdgeInsets.only(top: 20),
                 child: Text(
-                  '最小実証：動画1本を範囲指定して保存',
+                  '開始と終了を調整して、残したい区間を保存',
                   style: TextStyle(color: Colors.blueGrey, fontSize: 12),
                 ),
               ),
@@ -277,9 +339,31 @@ class _WorkspaceState extends State<Workspace> {
   Widget editor() => EditorViewport(
         preview: ClipRRect(
           borderRadius: BorderRadius.circular(5),
-          child: Video(controller: controller, fit: BoxFit.contain),
+          child: Video(
+              controller: controller,
+              fit: BoxFit.contain,
+              controls: NoVideoControls),
         ),
         controls: [
+          StreamBuilder<Duration>(
+            stream: player.stream.position,
+            initialData: player.state.position,
+            builder: (context, position) => StreamBuilder<bool>(
+              stream: player.stream.playing,
+              initialData: player.state.playing,
+              builder: (context, playing) => PlaybackBar(
+                positionMs: position.data?.inMilliseconds ?? 0,
+                durationMs: durationMs,
+                playing: playing.data ?? false,
+                muted: muted,
+                enabled: !busy && !loading && durationMs > 0,
+                onToggle: togglePlayback,
+                onMute: toggleMute,
+                onSeek: (value) => previewAt(
+                    value.clamp(0, durationMs > 0 ? durationMs - 1 : 0)),
+              ),
+            ),
+          ),
           const SizedBox(height: 8),
           Row(
             children: [
@@ -296,30 +380,35 @@ class _WorkspaceState extends State<Workspace> {
           Container(
             height: 48,
             decoration: BoxDecoration(
-              color: const Color(0xffd9e5ef),
+              color: const Color(0xffedf3fc),
               borderRadius: BorderRadius.circular(4),
             ),
-            child: RangeSlider(
-              min: 0,
-              max: durationMs > 0 ? durationMs.toDouble() : 1,
-              values: RangeValues(
-                range.start
-                    .clamp(0, durationMs > 0 ? durationMs.toDouble() : 1),
-                range.end.clamp(0, durationMs > 0 ? durationMs.toDouble() : 1),
+            child: Stack(fit: StackFit.expand, children: [
+              TimelineFrames(frames: timelineFrames),
+              RangeSlider(
+                min: 0,
+                max: durationMs > 0 ? durationMs.toDouble() : 1,
+                values: RangeValues(
+                  range.start
+                      .clamp(0, durationMs > 0 ? durationMs.toDouble() : 1),
+                  range.end
+                      .clamp(0, durationMs > 0 ? durationMs.toDouble() : 1),
+                ),
+                labels: RangeLabels(time(range.start), time(range.end)),
+                onChanged: busy || loading || durationMs == 0
+                    ? null
+                    : (v) {
+                        if (v.end - v.start < 100) return;
+                        final target =
+                            rangePreviewPosition(range, v, durationMs);
+                        setState(() {
+                          range = v;
+                          output = null;
+                        });
+                        previewAt(target);
+                      },
               ),
-              labels: RangeLabels(time(range.start), time(range.end)),
-              onChanged: busy || loading || durationMs == 0
-                  ? null
-                  : (v) {
-                      if (v.end - v.start < 100) return;
-                      final target = rangePreviewPosition(range, v, durationMs);
-                      setState(() {
-                        range = v;
-                        output = null;
-                      });
-                      previewAt(target);
-                    },
-            ),
+            ]),
           ),
           const SizedBox(height: 6),
           Wrap(
@@ -375,19 +464,16 @@ class _WorkspaceState extends State<Workspace> {
           children: [
             if (busy || loading) const LinearProgressIndicator(),
             if (error != null)
-              Container(
-                width: double.infinity,
-                color: const Color(0xffffeded),
-                padding: const EdgeInsets.all(12),
-                child: Text(error!),
+              EditorNotice(
+                failed: true,
+                details: error!,
+                onDismiss: () => setState(() => error = null),
               ),
-            if (output != null)
-              Container(
-                width: double.infinity,
-                color: const Color(0xffe9f7ef),
-                padding: const EdgeInsets.all(12),
-                child:
-                    SelectableText('1本の動画を保存しました。再生して範囲と音声を確認してください。\n$output'),
+            if (output != null && error == null)
+              EditorNotice(
+                failed: false,
+                details: '1本の動画を保存しました。再生して範囲と音声を確認してください。\n$output',
+                onDismiss: () => setState(() => output = null),
               ),
             Expanded(
               child: source == null

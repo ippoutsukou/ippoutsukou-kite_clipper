@@ -18,10 +18,53 @@ class MainActivity : FlutterActivity() {
     private var pending: MethodChannel.Result? = null
     private var arguments: Map<*, *>? = null
     private val worker = Executors.newSingleThreadExecutor()
+    private val thumbnailWorker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
 
     override fun configureFlutterEngine(engine: FlutterEngine) {
         super.configureFlutterEngine(engine)
+        MethodChannel(engine.dartExecutor.binaryMessenger, "kite_clipper/thumbnails")
+            .setMethodCallHandler { call, result ->
+                if (call.method != "frame") { result.notImplemented(); return@setMethodCallHandler }
+                val source = call.argument<String>("source")
+                val position = call.argument<Number>("positionMs")?.toLong()
+                if (source == null || position == null || position < 0) {
+                    result.error("arguments", "画像取得の指定が不正です", null)
+                    return@setMethodCallHandler
+                }
+                thumbnailWorker.execute {
+                    val retriever = android.media.MediaMetadataRetriever()
+                    var frame: android.graphics.Bitmap? = null
+                    var scaled: android.graphics.Bitmap? = null
+                    try {
+                        retriever.setDataSource(source)
+                        frame = if (android.os.Build.VERSION.SDK_INT >= 27) {
+                            retriever.getScaledFrameAtTime(position * 1000,
+                                android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC, 160, 90)
+                        } else {
+                            retriever.getFrameAtTime(position * 1000,
+                                android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                        }
+                        val bitmap = frame
+                        val bytes = if (bitmap == null) null else {
+                            val ratio = minOf(160.0 / bitmap.width, 90.0 / bitmap.height, 1.0)
+                            scaled = android.graphics.Bitmap.createScaledBitmap(bitmap,
+                                maxOf(1, (bitmap.width * ratio).toInt()),
+                                maxOf(1, (bitmap.height * ratio).toInt()), true)
+                            val stream = java.io.ByteArrayOutputStream()
+                            scaled!!.compress(android.graphics.Bitmap.CompressFormat.JPEG, 75, stream)
+                            stream.toByteArray()
+                        }
+                        main.post { result.success(bytes) }
+                    } catch (_: Exception) {
+                        main.post { result.success(null) }
+                    } finally {
+                        if (scaled !== frame) scaled?.recycle()
+                        frame?.recycle()
+                        runCatching { retriever.release() }
+                    }
+                }
+            }
         MethodChannel(engine.dartExecutor.binaryMessenger, "kite_clipper/export")
             .setMethodCallHandler { call, result ->
                 if (call.method != "export") { result.notImplemented(); return@setMethodCallHandler }
