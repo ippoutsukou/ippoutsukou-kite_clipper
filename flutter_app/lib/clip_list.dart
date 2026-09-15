@@ -94,9 +94,9 @@ class ClipList extends StatelessWidget {
                           subtitle: Text(
                               item.error != null
                                   ? '読み込み・処理エラー（選択して確認）'
-                                  : item.endMs == null
+                                  : item.segments.isEmpty
                                       ? '長さ未確認'
-                                      : '${((item.endMs! - item.startMs!) / 1000).toStringAsFixed(1)} 秒',
+                                      : '区間${item.segments.length} ・ 合計${(item.segments.fold<int>(0, (sum, s) => sum + s.endMs - s.startMs) / 1000).toStringAsFixed(1)}秒',
                               maxLines: 2),
                         ),
                       ));

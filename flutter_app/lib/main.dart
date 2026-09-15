@@ -16,6 +16,7 @@ import 'range_timeline.dart';
 import 'time_entry.dart';
 import 'clip_session.dart';
 import 'clip_list.dart';
+import 'segment_chips.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -481,6 +482,13 @@ class _WorkspaceState extends State<Workspace> {
             frames: timelineFrames,
             values: range,
             durationMs: durationMs,
+            others: [
+              if (editing != null)
+                for (var i = 0; i < editing!.segments.length; i++)
+                  if (i != editing!.activeSegment)
+                    RangeValues(editing!.segments[i].startMs.toDouble(),
+                        editing!.segments[i].endMs.toDouble()),
+            ],
             compact: MediaQuery.sizeOf(context).height < 700,
             onChanged: busy || loading || durationMs == 0
                 ? null
@@ -495,6 +503,17 @@ class _WorkspaceState extends State<Workspace> {
                     previewAt(target);
                   },
           ),
+          if (editing != null) ...[
+            const SizedBox(height: 6),
+            SegmentChips(
+              segments: editing!.segments,
+              selected: editing!.activeSegment,
+              enabled: segmentsEnabled,
+              onSelect: selectSegment,
+              onAdd: addSegment,
+              onRemove: (index) => unawaited(removeSegment(index)),
+            ),
+          ],
           const SizedBox(height: 6),
           Wrap(
             spacing: 16,
@@ -532,6 +551,82 @@ class _WorkspaceState extends State<Workspace> {
       rememberActive();
     });
     previewAt(value.clamp(0, durationMs - 1));
+  }
+
+  /// 編集中の動画。長さ確定前・読み込み失敗時は区間操作を受け付けない。
+  ClipItem? get editing {
+    final item = session.active;
+    return item != null &&
+            item.path == source &&
+            durationMs > 0 &&
+            item.segments.isNotEmpty
+        ? item
+        : null;
+  }
+
+  bool get segmentsEnabled => !busy && !loading && editing != null;
+
+  /// 区間の切替は動画を開き直さず、範囲の差し替えとシークだけ行う。
+  void showSegment(ClipItem item) {
+    setState(() {
+      range = RangeValues(item.startMs!.toDouble(), item.endMs!.toDouble());
+      output = item.output;
+    });
+    previewAt(item.startMs!.clamp(0, durationMs - 1));
+  }
+
+  void selectSegment(int index) {
+    final item = editing;
+    if (!segmentsEnabled || item == null || index == item.activeSegment) return;
+    rememberActive();
+    item.selectSegment(index);
+    showSegment(item);
+  }
+
+  void addSegment() {
+    final item = editing;
+    if (!segmentsEnabled || item == null) return;
+    rememberActive();
+    try {
+      item.addSegment(player.state.position.inMilliseconds);
+    } on StateError catch (e) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(e.message)));
+      return;
+    }
+    showSegment(item);
+  }
+
+  Future<void> removeSegment(int index) async {
+    final item = editing;
+    if (!segmentsEnabled || item == null || item.segments.length <= 1) return;
+    rememberActive();
+    final target = item.segments[index];
+    final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+              title: Text('区間${index + 1}を削除しますか？'),
+              content: const SingleChildScrollView(
+                  child: Text('この区間の範囲は失われます。元動画と保存済みファイルは削除しません。')),
+              actions: [
+                TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('キャンセル')),
+                FilledButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child: const Text('この区間を削除')),
+              ],
+            ));
+    // 確認中に動画切替・保存・他の削除が起きていたら何もしない。
+    final now = item.segments.indexOf(target);
+    if (!mounted ||
+        confirmed != true ||
+        !segmentsEnabled ||
+        !identical(editing, item) ||
+        now < 0 ||
+        item.segments.length <= 1) return;
+    item.removeSegment(now);
+    showSegment(item);
   }
 
   Widget _timeBox(String label, String value) => Row(
@@ -591,7 +686,8 @@ class _WorkspaceState extends State<Workspace> {
             if (output != null && error == null)
               EditorNotice(
                 failed: false,
-                details: '1本の動画を保存しました。再生して範囲と音声を確認してください。\n$output',
+                details:
+                    '区間${(editing?.activeSegment ?? 0) + 1}を保存しました。再生して範囲と音声を確認してください。\n$output',
                 onDismiss: () => setState(() => output = null),
               ),
             Expanded(
@@ -659,7 +755,7 @@ class _WorkspaceState extends State<Workspace> {
                       child: Text(
                         busy
                             ? '保存中…'
-                            : '${session.active?.name ?? "選択中の動画"} の1区間',
+                            : '${session.active?.name ?? "選択中の動画"} ・ 区間${(editing?.activeSegment ?? 0) + 1}',
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(fontWeight: FontWeight.w600),
@@ -671,7 +767,7 @@ class _WorkspaceState extends State<Workspace> {
                               ? null
                               : save,
                       icon: const Icon(Icons.save_alt, size: 18),
-                      label: const Text('このクリップを保存'),
+                      label: const Text('この区間を保存'),
                     ),
                   ],
                 ),
