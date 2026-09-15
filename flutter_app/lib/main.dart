@@ -17,6 +17,9 @@ import 'time_entry.dart';
 import 'clip_session.dart';
 import 'clip_list.dart';
 import 'segment_chips.dart';
+import 'batch_plan.dart';
+import 'batch_runner.dart';
+import 'batch_dialogs.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -88,6 +91,10 @@ class _WorkspaceState extends State<Workspace> {
   String? timelineSource;
   final session = ClipSession(caseInsensitivePaths: Platform.isWindows);
   StreamSubscription<String>? mediaError;
+  // 一括保存中だけ値を持つ。batchProgress が null でなければ進捗欄を表示する。
+  BatchRunner? batchRunner;
+  String? batchProgress;
+  double? batchFraction;
 
   void rememberActive() {
     final item = session.active;
@@ -415,6 +422,118 @@ class _WorkspaceState extends State<Workspace> {
     }
   }
 
+  bool get hasBatchTargets =>
+      session.items.any((item) => item.segments.isNotEmpty);
+
+  /// 全動画の全区間を、選んだフォルダへ1件ずつ保存する。
+  Future<void> saveAll() async {
+    if (busy || loading) return;
+    rememberActive();
+    final plan = await showDialog<BatchPlan>(
+        context: context,
+        builder: (_) => BatchConfirmDialog(
+            items: session.items, android: Platform.isAndroid));
+    if (!mounted || plan == null || busy || loading) return;
+    final service = ExportService();
+    setState(() {
+      busy = true;
+      error = null;
+      batchProgress = '保存先を選んでいます…';
+      batchFraction = null;
+    });
+    BatchFolder? folder;
+    try {
+      await player.pause();
+      final now = DateTime.now();
+      if (Platform.isAndroid) {
+        folder = await service.pickAndroidBatchFolder(now);
+      } else {
+        final parent = await getDirectoryPath(confirmButtonText: 'ここに保存');
+        if (parent != null) {
+          folder = await service.createBatchFolder(parent, now);
+        }
+      }
+    } catch (e) {
+      error = '保存先フォルダを用意できませんでした：${describeBatchError(e)}';
+    }
+    if (!mounted) return;
+    if (folder == null) {
+      setState(() {
+        busy = false;
+        batchProgress = null;
+      });
+      return;
+    }
+    final target = folder;
+    final total = plan.entries.length;
+    var done = 0;
+    final runner = BatchRunner((entry) => service.exportInto(
+        target,
+        entry.fileName,
+        entry.item.path,
+        ClipRange(entry.segment.startMs, entry.segment.endMs),
+        entry.item.durationMs!));
+    setState(() {
+      batchRunner = runner;
+      batchProgress = '保存を始めています…';
+      batchFraction = 0;
+    });
+    try {
+      await service.keepScreenOn(true);
+    } catch (_) {
+      // 消灯防止に失敗しても保存自体は続ける。
+    }
+    BatchSummary? summary;
+    try {
+      summary = await runner.run(plan, onStart: (index, entry) {
+        if (!mounted || runner.cancelRequested) return;
+        setState(() {
+          batchProgress =
+              '${index + 1} / $total 件目を保存中：${entry.item.name} 区間${entry.segmentNumber}';
+          batchFraction = index / total;
+        });
+      }, onResult: (result) {
+        if (!mounted) return;
+        setState(() {
+          batchFraction = ++done / total;
+          // 画面側の output は rememberActive で選択中区間へ書き戻されるため、ここで揃える。
+          if (result.status == BatchStatus.saved &&
+              identical(result.entry.segment, editing?.current)) {
+            output = result.output;
+          }
+        });
+      });
+    } catch (e) {
+      error = '一括保存を完了できませんでした：${describeBatchError(e)}';
+    } finally {
+      unawaited(service.keepScreenOn(false).catchError((_) {}));
+      if (mounted) {
+        setState(() {
+          busy = false;
+          batchRunner = null;
+          batchProgress = null;
+          batchFraction = null;
+          if (editing != null) output = editing!.output;
+        });
+      }
+    }
+    final result = summary;
+    if (mounted && result != null) {
+      await showDialog<void>(
+          context: context,
+          builder: (_) =>
+              BatchResultDialog(summary: result, folderLabel: target.label));
+    }
+  }
+
+  /// 保存中の1件は止めず、終わった時点で残りを取りやめる。
+  void cancelBatch() {
+    final runner = batchRunner;
+    if (runner == null || !runner.running) return;
+    runner.cancel();
+    setState(() => batchProgress = '中止しています…（保存中の1件が終わるまで待っています）');
+  }
+
   String time(double ms) {
     final n = ms.round();
     return '${(n ~/ 60000).toString().padLeft(2, '0')}:${((n ~/ 1000) % 60).toString().padLeft(2, '0')}.${(n % 1000).toString().padLeft(3, '0')}';
@@ -650,7 +769,10 @@ class _WorkspaceState extends State<Workspace> {
       );
 
   @override
-  Widget build(BuildContext context) => Scaffold(
+  Widget build(BuildContext context) => PopScope(
+      // 一括保存中に戻る操作で画面を閉じると保存が中断されるため止める。
+      canPop: batchRunner == null,
+      child: Scaffold(
         appBar: AppBar(
           backgroundColor: Colors.white,
           surfaceTintColor: Colors.white,
@@ -676,7 +798,31 @@ class _WorkspaceState extends State<Workspace> {
         ),
         body: Column(
           children: [
-            if (busy || loading) const LinearProgressIndicator(),
+            if (batchProgress != null)
+              Container(
+                color: const Color(0xffedf5ff),
+                padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(children: [
+                      Expanded(
+                          child: Text(batchProgress!,
+                              maxLines: 2, overflow: TextOverflow.ellipsis)),
+                      if (batchRunner != null)
+                        TextButton(
+                            onPressed: batchRunner!.cancelRequested
+                                ? null
+                                : cancelBatch,
+                            child: const Text('中止')),
+                    ]),
+                    const SizedBox(height: 4),
+                    LinearProgressIndicator(value: batchFraction),
+                  ],
+                ),
+              )
+            else if (busy || loading)
+              const LinearProgressIndicator(),
             if (error != null)
               EditorNotice(
                 failed: true,
@@ -749,31 +895,56 @@ class _WorkspaceState extends State<Workspace> {
               padding: const EdgeInsets.all(16),
               child: SafeArea(
                 top: false,
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        busy
-                            ? '保存中…'
-                            : '${session.active?.name ?? "選択中の動画"} ・ 区間${(editing?.activeSegment ?? 0) + 1}',
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontWeight: FontWeight.w600),
-                      ),
-                    ),
-                    FilledButton.icon(
-                      onPressed:
-                          source == null || busy || loading || durationMs <= 0
-                              ? null
-                              : save,
-                      icon: const Icon(Icons.save_alt, size: 18),
-                      label: const Text('この区間を保存'),
-                    ),
-                  ],
-                ),
+                child: LayoutBuilder(builder: (context, box) {
+                  final label = Text(
+                    busy
+                        ? '保存中…'
+                        : '${session.active?.name ?? "選択中の動画"} ・ 区間${(editing?.activeSegment ?? 0) + 1}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  );
+                  final saveAllButton = OutlinedButton.icon(
+                    onPressed:
+                        busy || loading || !hasBatchTargets ? null : saveAll,
+                    icon: const Icon(Icons.library_add_check_outlined,
+                        size: 18),
+                    label: const Text('すべて保存…'),
+                  );
+                  final saveButton = FilledButton.icon(
+                    onPressed:
+                        source == null || busy || loading || durationMs <= 0
+                            ? null
+                            : save,
+                    icon: const Icon(Icons.save_alt, size: 18),
+                    label: const Text('この区間を保存'),
+                  );
+                  // 狭い画面では名前とボタンを2段にして、ボタン文字の見切れを防ぐ。
+                  if (box.maxWidth < 560) {
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        label,
+                        const SizedBox(height: 8),
+                        Row(children: [
+                          Expanded(child: saveAllButton),
+                          const SizedBox(width: 8),
+                          Expanded(child: saveButton),
+                        ]),
+                      ],
+                    );
+                  }
+                  return Row(children: [
+                    Expanded(child: label),
+                    saveAllButton,
+                    const SizedBox(width: 8),
+                    saveButton,
+                  ]);
+                }),
               ),
             ),
           ],
         ),
-      );
+      ));
 }
