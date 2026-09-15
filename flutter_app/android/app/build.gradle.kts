@@ -39,6 +39,11 @@ android {
     }
 }
 
+dependencies {
+    // AI候補の測定用。CLIP画像エンコーダー(ONNX)をアプリ内で実行する。
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
+}
+
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17

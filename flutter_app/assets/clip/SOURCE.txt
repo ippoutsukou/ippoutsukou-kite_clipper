@@ -1,0 +1,14 @@
+CLIP ViT-B/32 画像エンコーダー (ONNX量子化版)
+
+ファイル: vision_model_quantized.onnx (約89MB)
+取得元: https://huggingface.co/Xenova/clip-vit-base-patch32
+        (onnx/vision_model_quantized.onnx)
+取得日: 2026-07-10
+元モデル: OpenAI CLIP ViT-B/32 (https://github.com/openai/CLIP, MITライセンス)
+用途: frame_scorer.py の画像埋め込み特徴量(方式B)
+
+入力: pixel_values (batch, 3, 224, 224) float32
+      前処理: RGB、短辺224リサイズ→中央224x224クロップ、
+      mean=(0.48145466, 0.4578275, 0.40821073)
+      std =(0.26862954, 0.26130258, 0.27577711)
+出力: image_embeds (batch, 512) ※利用時にL2正規化する

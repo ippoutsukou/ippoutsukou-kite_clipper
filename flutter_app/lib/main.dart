@@ -21,6 +21,9 @@ import 'batch_plan.dart';
 import 'batch_runner.dart';
 import 'batch_dialogs.dart';
 import 'session_store.dart';
+import 'ai_segments.dart';
+import 'analysis_service.dart';
+import 'analysis_dialogs.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -97,6 +100,8 @@ class _WorkspaceState extends State<Workspace> {
   Timer? saveTimer;
   Future<void>? saving;
   bool saveFailureShown = false;
+  // AI解析の測定用。最後に選んだ競技を覚えておく。
+  String sportId = sportModelIds.first;
   late final AppLifecycleListener lifecycle;
   StreamSubscription<String>? mediaError;
   // 一括保存中だけ値を持つ。batchProgress が null でなければ進捗欄を表示する。
@@ -527,6 +532,71 @@ class _WorkspaceState extends State<Workspace> {
     }
   }
 
+  /// AI候補の速度測定。競技を選び、端末内で解析して所要時間と提案区間を表示する。
+  /// この段階では区間の自動追加・保存は行わない。
+  Future<void> runAnalysis() async {
+    final item = editing;
+    if (busy || loading || item == null) return;
+    if (!AnalysisService.supported) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('この測定用ビルドでは Android のみ解析できます。')));
+      return;
+    }
+    final chosen = await showDialog<String>(
+        context: context,
+        builder: (context) => SimpleDialog(
+              title: const Text('AI解析（測定）'),
+              children: [
+                for (final id in sportModelIds)
+                  SimpleDialogOption(
+                      onPressed: () => Navigator.pop(context, id),
+                      child: Text(id == sportId ? '$id（前回）' : id)),
+                const Padding(
+                    padding: EdgeInsets.fromLTRB(24, 8, 24, 0),
+                    child: Text('1秒ごとにフレームを取り出して採点します。最大300フレーム（5分）まで測定します。',
+                        style: TextStyle(fontSize: 12, color: Colors.blueGrey))),
+              ],
+            ));
+    if (!mounted || chosen == null || busy || loading || editing != item) return;
+    setState(() {
+      sportId = chosen;
+      busy = true;
+      error = null;
+    });
+    unawaited(showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => const AlertDialog(
+            content: Row(children: [
+              CircularProgressIndicator(),
+              SizedBox(width: 16),
+              Expanded(child: Text('AI解析中です。しばらくお待ちください。')),
+            ]))));
+    SportModel? model;
+    AnalysisResult? result;
+    try {
+      model = await loadSportModel(chosen);
+      result = await AnalysisService().analyze(source: item.path, model: model);
+    } catch (e) {
+      error = 'AI解析に失敗しました：${describeBatchError(e)}';
+    } finally {
+      if (mounted) {
+        Navigator.of(context, rootNavigator: true).pop();
+        setState(() => busy = false);
+      }
+    }
+    if (!mounted || result == null || model == null) return;
+    final segments = buildProposedSegments(
+        timesMs: result.timesMs,
+        scores: result.scores,
+        model: model,
+        durationMs: result.durationMs);
+    await showDialog<void>(
+        context: context,
+        builder: (context) =>
+            AnalysisResultDialog(result: result!, segments: segments, sportId: chosen));
+  }
+
   bool get hasBatchTargets =>
       session.items.any((item) => item.segments.isNotEmpty);
 
@@ -697,6 +767,15 @@ class _WorkspaceState extends State<Workspace> {
               const Text('保存する範囲',
                   style: TextStyle(fontWeight: FontWeight.w600)),
               const Spacer(),
+              OutlinedButton.icon(
+                onPressed: busy || loading || editing == null ? null : runAnalysis,
+                icon: const Icon(Icons.auto_awesome, size: 16),
+                label: const Text('AI解析（測定）'),
+                style: OutlinedButton.styleFrom(
+                    minimumSize: const Size(0, 36),
+                    padding: const EdgeInsets.symmetric(horizontal: 10)),
+              ),
+              const SizedBox(width: 12),
               Text(
                   '${((range.end - range.start) / 1000).toStringAsFixed(1)} 秒'),
             ],

@@ -11,6 +11,11 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.DocumentsContract
 import android.view.WindowManager
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
+import java.io.File
+import java.nio.FloatBuffer
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -32,6 +37,10 @@ class MainActivity : FlutterActivity() {
     private var batchBusy = false
     private val worker = Executors.newSingleThreadExecutor()
     private val thumbnailWorker = Executors.newSingleThreadExecutor()
+    // AI候補の測定用。解析は1件ずつ、CLIPのセッションは使い回す。
+    private val analyzeWorker = Executors.newSingleThreadExecutor()
+    private var analyzing = false
+    private var clipSession: OrtSession? = null
     private val main = Handler(Looper.getMainLooper())
 
     private fun isBusy() = pending != null || pendingFolder != null || batchBusy
@@ -77,6 +86,31 @@ class MainActivity : FlutterActivity() {
                         if (scaled !== frame) scaled?.recycle()
                         frame?.recycle()
                         runCatching { retriever.release() }
+                    }
+                }
+            }
+        MethodChannel(engine.dartExecutor.binaryMessenger, "kite_clipper/analyze")
+            .setMethodCallHandler { call, result ->
+                if (call.method != "analyze") { result.notImplemented(); return@setMethodCallHandler }
+                if (analyzing) { result.error("busy", "解析中です", null); return@setMethodCallHandler }
+                val source = call.argument<String>("source")
+                val intervalMs = call.argument<Number>("intervalMs")?.toLong() ?: 1000L
+                val maxFrames = call.argument<Number>("maxFrames")?.toInt() ?: 300
+                val coefficients = call.argument<List<Double>>("coef")
+                val intercept = call.argument<Number>("intercept")?.toDouble() ?: 0.0
+                if (source == null || coefficients == null || coefficients.size != CLIP_EMBED_DIM ||
+                    intervalMs < 100 || maxFrames < 1) {
+                    result.error("arguments", "解析の指定が不正です", null)
+                    return@setMethodCallHandler
+                }
+                analyzing = true
+                analyzeWorker.execute {
+                    try {
+                        val measured = analyze(source, intervalMs, maxFrames, coefficients, intercept)
+                        main.post { analyzing = false; result.success(measured) }
+                    } catch (e: Exception) {
+                        val message = "AI解析に失敗しました：${e.javaClass.simpleName} ${e.message ?: ""}"
+                        main.post { analyzing = false; result.error("analyze", message, null) }
                     }
                 }
             }
@@ -226,6 +260,149 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    /** 同梱のCLIPモデルをアプリ専用領域へ取り出す（毎回コピーしない）。 */
+    private fun clipModelFile(): File {
+        val target = File(filesDir, "vision_model_quantized.onnx")
+        val key = io.flutter.FlutterInjector.instance().flutterLoader()
+            .getLookupKeyForAsset("assets/clip/vision_model_quantized.onnx")
+        val expected = assets.openFd(key).use { it.length }
+        if (target.exists() && target.length() == expected) return target
+        val temp = File(filesDir, "vision_model_quantized.onnx.tmp")
+        assets.open(key).use { input -> temp.outputStream().use { input.copyTo(it) } }
+        if (!temp.renameTo(target)) throw java.io.IOException("モデルを取り出せません")
+        return target
+    }
+
+    private fun clipSession(): OrtSession {
+        clipSession?.let { return it }
+        val environment = OrtEnvironment.getEnvironment()
+        val created = environment.createSession(clipModelFile().absolutePath, OrtSession.SessionOptions())
+        clipSession = created
+        return created
+    }
+
+    /**
+     * 動画から intervalMs ごとにフレームを取り出し、CLIP埋め込み→採用確率を計算する。
+     * 速度測定が目的のため、段階ごとの所要時間も返す。保存処理には触れない。
+     */
+    private fun analyze(
+        source: String, intervalMs: Long, maxFrames: Int,
+        coefficients: List<Double>, intercept: Double,
+    ): Map<String, Any> {
+        val started = System.currentTimeMillis()
+        val modelStart = System.currentTimeMillis()
+        val session = clipSession()
+        val environment = OrtEnvironment.getEnvironment()
+        val inputName = session.inputNames.first()
+        val modelMs = System.currentTimeMillis() - modelStart
+
+        val retriever = android.media.MediaMetadataRetriever()
+        val timesMs = mutableListOf<Long>()
+        val scores = mutableListOf<Double>()
+        var extractMs = 0L
+        var inferMs = 0L
+        var durationMs = 0L
+        var truncated = false
+        try {
+            retriever.setDataSource(source)
+            durationMs = retriever.extractMetadata(
+                android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            require(durationMs > 0) { "動画の長さを取得できません" }
+            val width = retriever.extractMetadata(
+                android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: CLIP_IMAGE_SIZE
+            val height = retriever.extractMetadata(
+                android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: CLIP_IMAGE_SIZE
+            // Python版と同じ前処理：短辺224へ縮小してから中央224x224を切り出す。
+            val scale = CLIP_IMAGE_SIZE.toDouble() / minOf(width, height).coerceAtLeast(1)
+            val scaledWidth = maxOf(CLIP_IMAGE_SIZE, Math.round(width * scale).toInt())
+            val scaledHeight = maxOf(CLIP_IMAGE_SIZE, Math.round(height * scale).toInt())
+
+            val batch = ArrayList<FloatArray>(BATCH_SIZE)
+            val batchTimes = ArrayList<Long>(BATCH_SIZE)
+
+            fun runBatch() {
+                if (batch.isEmpty()) return
+                val inferStart = System.currentTimeMillis()
+                val buffer = FloatBuffer.allocate(batch.size * 3 * CLIP_IMAGE_SIZE * CLIP_IMAGE_SIZE)
+                batch.forEach { buffer.put(it) }
+                buffer.rewind()
+                OnnxTensor.createTensor(environment, buffer,
+                    longArrayOf(batch.size.toLong(), 3, CLIP_IMAGE_SIZE.toLong(), CLIP_IMAGE_SIZE.toLong())
+                ).use { tensor ->
+                    session.run(mapOf(inputName to tensor)).use { output ->
+                        @Suppress("UNCHECKED_CAST")
+                        val embeddings = output[0].value as Array<FloatArray>
+                        for ((index, raw) in embeddings.withIndex()) {
+                            var norm = 0.0
+                            for (value in raw) norm += value.toDouble() * value
+                            norm = Math.sqrt(norm)
+                            var sum = intercept
+                            if (norm > 1e-12) {
+                                for (i in raw.indices) sum += coefficients[i] * (raw[i] / norm)
+                            }
+                            timesMs.add(batchTimes[index])
+                            scores.add(1.0 / (1.0 + Math.exp(-sum)))
+                        }
+                    }
+                }
+                inferMs += System.currentTimeMillis() - inferStart
+                batch.clear()
+                batchTimes.clear()
+            }
+
+            var positionMs = 0L
+            while (positionMs < durationMs) {
+                if (timesMs.size + batch.size >= maxFrames) { truncated = true; break }
+                val extractStart = System.currentTimeMillis()
+                val frame = retriever.getScaledFrameAtTime(
+                    positionMs * 1000,
+                    android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                    scaledWidth, scaledHeight)
+                extractMs += System.currentTimeMillis() - extractStart
+                if (frame != null) {
+                    batch.add(preprocess(frame))
+                    batchTimes.add(positionMs)
+                    frame.recycle()
+                    if (batch.size >= BATCH_SIZE) runBatch()
+                }
+                positionMs += intervalMs
+            }
+            runBatch()
+        } finally {
+            runCatching { retriever.release() }
+        }
+        return mapOf(
+            "durationMs" to durationMs,
+            "timesMs" to timesMs,
+            "scores" to scores,
+            "modelMs" to modelMs,
+            "extractMs" to extractMs,
+            "inferMs" to inferMs,
+            "totalMs" to (System.currentTimeMillis() - started),
+            "truncated" to truncated,
+        )
+    }
+
+    /** Bitmap の中央224x224を CHW float32 に正規化する（CLIPのmean/std）。 */
+    private fun preprocess(frame: android.graphics.Bitmap): FloatArray {
+        val left = maxOf(0, (frame.width - CLIP_IMAGE_SIZE) / 2)
+        val top = maxOf(0, (frame.height - CLIP_IMAGE_SIZE) / 2)
+        val pixels = IntArray(CLIP_IMAGE_SIZE * CLIP_IMAGE_SIZE)
+        frame.getPixels(pixels, 0, CLIP_IMAGE_SIZE, left, top, CLIP_IMAGE_SIZE, CLIP_IMAGE_SIZE)
+        val plane = CLIP_IMAGE_SIZE * CLIP_IMAGE_SIZE
+        val output = FloatArray(3 * plane)
+        for (i in pixels.indices) {
+            val pixel = pixels[i]
+            val r = ((pixel shr 16) and 0xff) / 255f
+            val g = ((pixel shr 8) and 0xff) / 255f
+            val b = (pixel and 0xff) / 255f
+            output[i] = (r - CLIP_MEAN[0]) / CLIP_STD[0]
+            output[plane + i] = (g - CLIP_MEAN[1]) / CLIP_STD[1]
+            output[2 * plane + i] = (b - CLIP_MEAN[2]) / CLIP_STD[2]
+        }
+        return output
+    }
+
     private fun displayName(uri: Uri): String? = runCatching {
         contentResolver.query(uri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { cursor ->
             if (cursor.moveToFirst()) cursor.getString(0) else null
@@ -345,5 +522,11 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val EXPORT_REQUEST = 8102
         private const val FOLDER_REQUEST = 8103
+        // vendor/clip/SOURCE.txt と clip_embedder.py に合わせた前処理仕様。
+        private const val CLIP_EMBED_DIM = 512
+        private const val CLIP_IMAGE_SIZE = 224
+        private const val BATCH_SIZE = 8
+        private val CLIP_MEAN = floatArrayOf(0.48145466f, 0.4578275f, 0.40821073f)
+        private val CLIP_STD = floatArrayOf(0.26862954f, 0.26130258f, 0.27577711f)
     }
 }

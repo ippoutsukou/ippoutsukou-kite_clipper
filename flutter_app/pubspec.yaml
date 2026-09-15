@@ -16,3 +16,7 @@ dev_dependencies:
     sdk: flutter
 flutter:
   uses-material-design: true
+  assets:
+    # 競技ごとの判定モデル（係数のみ・各約5KB）とCLIP画像エンコーダー（約85MB）
+    - assets/models/
+    - assets/clip/vision_model_quantized.onnx
