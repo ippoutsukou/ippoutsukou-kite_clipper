@@ -109,7 +109,7 @@ class MainActivity : FlutterActivity() {
                         val measured = analyze(source, intervalMs, maxFrames, coefficients, intercept)
                         main.post { analyzing = false; result.success(measured) }
                     } catch (e: Exception) {
-                        val message = "AI解析に失敗しました：${e.javaClass.simpleName} ${e.message ?: ""}"
+                        val message = "${e.javaClass.simpleName} ${e.message ?: ""}".trim()
                         main.post { analyzing = false; result.error("analyze", message, null) }
                     }
                 }
@@ -260,15 +260,24 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /** 同梱のCLIPモデルをアプリ専用領域へ取り出す（毎回コピーしない）。 */
+    /**
+     * 同梱のCLIPモデルをアプリ専用領域へ取り出す（毎回コピーしない）。
+     * 同梱ファイルはAPK内で圧縮されているため、assets.openFd でサイズを問い合わせることはできない。
+     * 取り出し済みファイルの大きさを既知の値（CLIP_MODEL_BYTES）と比べて判定する。
+     */
     private fun clipModelFile(): File {
         val target = File(filesDir, "vision_model_quantized.onnx")
+        if (target.exists() && target.length() == CLIP_MODEL_BYTES) return target
         val key = io.flutter.FlutterInjector.instance().flutterLoader()
             .getLookupKeyForAsset("assets/clip/vision_model_quantized.onnx")
-        val expected = assets.openFd(key).use { it.length }
-        if (target.exists() && target.length() == expected) return target
         val temp = File(filesDir, "vision_model_quantized.onnx.tmp")
         assets.open(key).use { input -> temp.outputStream().use { input.copyTo(it) } }
+        if (temp.length() != CLIP_MODEL_BYTES) {
+            temp.delete()
+            throw java.io.IOException("モデルの取り出し結果が想定と違います")
+        }
+        // 取り出し途中で終了した古いコピーだけを置き換える（利用者のファイルには触れない）。
+        if (target.exists()) target.delete()
         if (!temp.renameTo(target)) throw java.io.IOException("モデルを取り出せません")
         return target
     }
@@ -524,6 +533,8 @@ class MainActivity : FlutterActivity() {
         private const val FOLDER_REQUEST = 8103
         // vendor/clip/SOURCE.txt と clip_embedder.py に合わせた前処理仕様。
         private const val CLIP_EMBED_DIM = 512
+        // assets/clip/vision_model_quantized.onnx のバイト数。モデルを差し替えたら更新すること。
+        private const val CLIP_MODEL_BYTES = 89117001L
         private const val CLIP_IMAGE_SIZE = 224
         private const val BATCH_SIZE = 8
         private val CLIP_MEAN = floatArrayOf(0.48145466f, 0.4578275f, 0.40821073f)
