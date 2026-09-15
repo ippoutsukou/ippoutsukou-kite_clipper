@@ -12,6 +12,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
+import sport_profile
+
 from video_session import (
     Candidate, Material, Session, SessionError, SessionStore, compatible_for_concat,
     copy_file_exclusive, probe, safe_name, snap_range, stream_copy_clip, unique_output,
@@ -47,6 +49,9 @@ class VideoOnlyApp(tk.Tk):
         self.cards: dict[str, tk.Widget] = {}
         self.check_vars: dict[str, tk.BooleanVar] = {}
         self.status_var = tk.StringVar(value="動画を選択してください")
+        self.profile_var = tk.StringVar(value="")
+        self._profiles = []
+        self._profile_errors = []
         self.view_var = tk.StringVar(value="start")
         self._busy = False
         self._closed = False
@@ -66,11 +71,23 @@ class VideoOnlyApp(tk.Tk):
         self._drain_job = self.after(80, self._drain_events)
 
     def _build(self) -> None:
-        header = ttk.Frame(self, padding=12)
-        header.pack(fill=tk.X)
-        ttk.Label(header, text="Kite Clipper", font=("Meiryo UI", 16, "bold")).pack(side=tk.LEFT)
-        ttk.Label(header, textvariable=self.status_var).pack(side=tk.RIGHT)
-        self.body = ttk.Frame(self, padding=(12, 0, 12, 12))
+        self.configure(background="#eef2f5")
+        style = ttk.Style(self)
+        try: style.theme_use("clam")
+        except tk.TclError: pass
+        style.configure("Header.TFrame", background="#ffffff")
+        style.configure("Header.TLabel", background="#ffffff", foreground="#172b3a")
+        style.configure("Background.TFrame", background="#eef2f5")
+        style.configure("Card.TFrame", background="white", relief="groove")
+        style.configure("Primary.TButton", background="#1677ee", foreground="white")
+        style.map("Primary.TButton", background=[("disabled", "#b9c7d8"), ("active", "#0f62c9")], foreground=[("disabled", "#eef3f8"), ("!disabled", "white")])
+        style.configure("Success.TButton", foreground="#147d55")
+        header = ttk.Frame(self, padding=(18, 10), style="Header.TFrame")
+        header.pack(fill=tk.X, side=tk.TOP)
+        ttk.Label(header, text="Kite Clipper", font=("Meiryo UI", 16, "bold"), style="Header.TLabel").pack(side=tk.LEFT)
+        ttk.Label(header, textvariable=self.profile_var, style="Header.TLabel").pack(side=tk.LEFT, padx=18)
+        ttk.Label(header, textvariable=self.status_var, style="Header.TLabel").pack(side=tk.RIGHT)
+        self.body = ttk.Frame(self, padding=(18, 14, 18, 14), style="Background.TFrame")
         self.body.pack(fill=tk.BOTH, expand=True)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._show_start()
@@ -111,13 +128,29 @@ class VideoOnlyApp(tk.Tk):
         self.view_var.set("start")
         panel = ttk.LabelFrame(self.body, text="動画を選ぶ", padding=24)
         panel.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(panel, text="動画を選ぶとサムネイル生成とAI候補解析を自動で開始します。",
-                  font=("Meiryo UI", 12)).pack(pady=(100, 18))
-        ttk.Button(panel, text="動画を選択…", command=self.select_videos).pack()
+        self._profiles, self._profile_errors = sport_profile.list_profiles_lenient(self.app_root)
+        if self._profiles:
+            self.profile_var.set("競技: " + self._profiles[0].display_name)
+            self.profile_combo = ttk.Combobox(panel, values=[p.display_name + " (" + p.id + ")" for p in self._profiles], state="readonly", width=34)
+            self.profile_combo.current(0)
+            self.profile_combo.pack(pady=(15, 10))
+            self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_selected)
+        else:
+            detail = self._profile_errors[0][1] if self._profile_errors else "profiles/*.json がありません"
+            ttk.Label(panel, text="競技プロファイルを読み込めません: " + detail[:120], foreground="#a33", wraplength=620).pack(pady=(20, 12))
+            self.profile_var.set("競技プロファイルなし")
+        ttk.Label(panel, text="動画を選ぶとサムネイル生成とAI候補解析を自動で開始します。", font=("Meiryo UI", 12)).pack(pady=(100, 18))
+        select_button = ttk.Button(panel, text="動画を選択…", command=self.select_videos, style="Primary.TButton", state=(tk.NORMAL if self._profiles else tk.DISABLED))
+        select_button.pack()
         latest = self._latest_store()
         if latest:
             ttk.Button(panel, text="前回の作業を再開",
                        command=lambda item=latest: self._resume(item)).pack(pady=12)
+
+    def _on_profile_selected(self, _event=None) -> None:
+        if not self._profiles or not hasattr(self, "profile_combo"): return
+        index = self.profile_combo.current()
+        if 0 <= index < len(self._profiles): self.profile_var.set("競技: " + self._profiles[index].display_name)
 
     def _latest_store(self) -> SessionStore | None:
         root = self.output_root / "sessions"
@@ -132,6 +165,8 @@ class VideoOnlyApp(tk.Tk):
         try:
             session = store.load()
             self.store, self.session = store, session
+            profile = next((p for p in self._profiles if p.id == session.sport_id), None)
+            self.profile_var.set("競技: " + (profile.display_name if profile else session.sport_id))
             for material in session.materials:
                 if material.changed():
                     material.status = "changed"
@@ -154,7 +189,10 @@ class VideoOnlyApp(tk.Tk):
         if not paths:
             return
         self.store = SessionStore(self.output_root)
-        self.session = Session(self.store.root.name, sport_id="kite", current_view="analyzing")
+        if not getattr(self, "_profiles", None) or not hasattr(self, "profile_combo"):
+            self.status_var.set("競技プロファイルがないため開始できません")
+            return
+        self.session = Session(self.store.root.name, sport_id=self._profiles[max(0, self.profile_combo.current())].id, current_view="analyzing")
         self.store.save(self.session)
         self._busy = True
         self._cancel.clear()
@@ -332,7 +370,7 @@ class VideoOnlyApp(tk.Tk):
         holder = ttk.Frame(canvas); self.candidate_holder = holder
         window = canvas.create_window((0, 0), window=holder, anchor="nw")
         holder.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+        canvas.bind("<Configure>", lambda e: (canvas.itemconfigure(window, width=e.width), self._reflow_cards(e.width)))
         canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-int(e.delta / 120), "units"))
         holder.columnconfigure(0, weight=1); holder.columnconfigure(1, weight=1)
         self.cards.clear(); self.check_vars.clear()
@@ -344,14 +382,22 @@ class VideoOnlyApp(tk.Tk):
         count = len(self.session.accepted_candidates()) if self.session else 0
         ttk.Label(footer, text=f"採用中の{count}候補を保存").pack(side=tk.LEFT)
         ttk.Button(footer, text=f"採用中の{count}候補を切り出し実行",
-                   command=self.cut_all).pack(side=tk.RIGHT)
+                   command=self.cut_all, style="Primary.TButton").pack(side=tk.RIGHT)
+
+    def _reflow_cards(self, width: int) -> None:
+        holder = getattr(self, "candidate_holder", None)
+        if holder is None: return
+        columns = 2 if width < 1050 else (3 if width < 1350 else 4)
+        for index, candidate in enumerate(sorted((self.session.candidates if self.session else []), key=lambda c: c.order)):
+            card = self.cards.get(candidate.candidate_id)
+            if card is not None: card.grid_configure(row=index // columns, column=index % columns)
 
     def _add_card(self, candidate: Candidate, row: int = 0, column: int = 0) -> None:
         holder = getattr(self, "candidate_holder", None)
         if holder is None or not self.session or candidate.candidate_id in self.cards:
             return
         material = self.session.material(candidate.material_id)
-        card = ttk.Frame(holder, padding=8, relief=tk.GROOVE, borderwidth=1)
+        card = ttk.Frame(holder, padding=8, style="Card.TFrame", relief=tk.GROOVE, borderwidth=1)
         card.grid(row=row, column=column, sticky="nsew", padx=5, pady=5)
         var = tk.BooleanVar(value=candidate.accepted)
         self.check_vars[candidate.candidate_id] = var
@@ -533,8 +579,8 @@ class VideoOnlyApp(tk.Tk):
         self.session.current_view = "preview"
         self.session.current_candidate_id = self.current.candidate_id
         if self.store: self.store.save(self.session)
-        outer = ttk.Frame(self.body); outer.pack(fill=tk.BOTH, expand=True)
-        left = ttk.Frame(outer, width=230); left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        outer = ttk.Frame(self.body); outer.pack(fill=tk.BOTH, expand=True); outer.columnconfigure(1, weight=1); outer.rowconfigure(0, weight=1)
+        left = ttk.Frame(outer, width=230); left.grid(row=0, column=0, sticky="ns", padx=(0, 10))
         ttk.Label(left, text="候補（採用順）").pack(anchor=tk.W)
         list_area = ttk.Frame(left); list_area.pack(fill=tk.BOTH, expand=True)
         list_canvas = tk.Canvas(list_area, width=230, highlightthickness=0)
@@ -551,44 +597,44 @@ class VideoOnlyApp(tk.Tk):
             return (f"{material.display_name}  "
                     f"{_format_sec(candidate.requested_start_sec)}-{_format_sec(candidate.requested_end_sec)}")
         for candidate in self.session.accepted_candidates():
-            row = ttk.Frame(list_holder); row.pack(fill=tk.X, pady=2)
+            row = ttk.Frame(list_holder); row.pack(fill=tk.X, pady=2); row.columnconfigure(0, weight=1)
             ttk.Button(row, text=label_for(candidate),
-                       command=lambda c=candidate: self._select_preview(c)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+                       command=lambda c=candidate: self._select_preview(c)).grid(row=0, column=0, sticky="ew")
             ttk.Button(row, text="除外", width=4,
-                       command=lambda c=candidate: self._exclude_candidate(c)).pack(side=tk.RIGHT)
+                       command=lambda c=candidate: self._exclude_candidate(c)).grid(row=0, column=1, sticky="e")
             ttk.Button(row, text="↑", width=3,
-                       command=lambda c=candidate: self._move_candidate_preview(c, -1)).pack(side=tk.RIGHT)
+                       command=lambda c=candidate: self._move_candidate_preview(c, -1)).grid(row=0, column=2, sticky="e")
             ttk.Button(row, text="↓", width=3,
-                       command=lambda c=candidate: self._move_candidate_preview(c, 1)).pack(side=tk.RIGHT)
+                       command=lambda c=candidate: self._move_candidate_preview(c, 1)).grid(row=0, column=3, sticky="e")
         excluded = [c for c in self.session.candidates if not c.accepted]
         if excluded:
             ttk.Label(list_holder, text="除外した候補").pack(anchor=tk.W, pady=(14, 3))
             for candidate in excluded:
                 ttk.Button(list_holder, text=f"復帰 {label_for(candidate)}",
                            command=lambda c=candidate: self._restore_candidate(c)).pack(fill=tk.X, pady=2)
-        right = ttk.Frame(outer); right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.video_host = tk.Frame(right, background="black", height=400)
-        self.video_host.pack(fill=tk.BOTH, expand=True)
+        right = ttk.Frame(outer); right.grid(row=0, column=1, sticky="nsew"); right.rowconfigure(0, weight=1); right.columnconfigure(0, weight=1)
+        self.video_host = tk.Frame(right, background="black", height=240)
+        self.video_host.grid(row=0, column=0, sticky="nsew")
         self.video_host.bind("<Configure>", self._on_video_resize)
-        info = ttk.Frame(right); info.pack(fill=tk.X, pady=(6, 2))
+        info = ttk.Frame(right); info.grid(row=1, column=0, sticky="ew", pady=(6, 2))
         self.range_info_var = tk.StringVar()
         ttk.Label(info, textvariable=self.range_info_var).pack(side=tk.LEFT)
         ttk.Button(info, text="タグ…", command=self._tags).pack(side=tk.RIGHT)
         self.timeline = tk.Canvas(right, height=62, background="#20242a", highlightthickness=0)
-        self.timeline.pack(fill=tk.X, pady=5)
+        self.timeline.grid(row=2, column=0, sticky="ew", pady=5)
         self.timeline.bind("<Configure>", lambda _e: self._draw_handles())
         self.timeline.bind("<Button-1>", self._timeline_press)
         self.timeline.bind("<B1-Motion>", self._timeline_drag)
         self.timeline.bind("<ButtonRelease-1>", self._timeline_release)
-        controls = ttk.Frame(right); controls.pack(fill=tk.X)
+        controls = ttk.Frame(right); controls.grid(row=3, column=0, sticky="ew")
         ttk.Button(controls, text="再生", command=self._play).pack(side=tk.LEFT)
         ttk.Button(controls, text="一時停止", command=self._pause).pack(side=tk.LEFT, padx=4)
         ttk.Button(controls, text="候補一覧へ戻る", command=self._show_candidates).pack(side=tk.LEFT, padx=10)
         self.merge_reason_var = tk.StringVar()
-        ttk.Label(right, textvariable=self.merge_reason_var, foreground="#a33").pack(fill=tk.X)
-        footer = ttk.Frame(right); footer.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(footer, text="個別ファイルで保存", command=self.save_individual).pack(side=tk.RIGHT, padx=4)
-        self.merge_button = ttk.Button(footer, text="1本にまとめて保存", command=self.save_concat)
+        ttk.Label(right, textvariable=self.merge_reason_var, foreground="#a33").grid(row=4, column=0, sticky="ew")
+        footer = ttk.Frame(right); footer.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(footer, text="個別ファイルで保存", command=self.save_individual, style="Primary.TButton").pack(side=tk.RIGHT, padx=4)
+        self.merge_button = ttk.Button(footer, text="1本にまとめて保存", command=self.save_concat, style="Primary.TButton")
         self.merge_button.pack(side=tk.RIGHT)
         if self._busy:
             for child in controls.winfo_children(): child.configure(state=tk.DISABLED)
@@ -628,8 +674,8 @@ class VideoOnlyApp(tk.Tk):
 
     def _resize_player(self) -> None:
         if not getattr(self, "player", None): return
-        width = max(640, self.video_host.winfo_width())
-        height = max(360, self.video_host.winfo_height())
+        width = max(1, self.video_host.winfo_width())
+        height = max(1, self.video_host.winfo_height())
         if hasattr(self.player, "resize"):
             try: self.player.resize(width, height)
             except Exception: pass

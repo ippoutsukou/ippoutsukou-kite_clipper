@@ -231,7 +231,7 @@ class MciVideoPreview:
         self._display_size = int(width), int(height)
         if self._label is not None:
             try:
-                w, h = self._fit_size(); self._label.configure(width=w, height=h)
+                self._label.place(relx=0.5, rely=0.5, anchor="center")
             except Exception as exc: self._emit_error(f"映像領域の変更に失敗しました: {exc}")
 
     def _clear_frames(self):

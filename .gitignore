@@ -26,6 +26,11 @@ selected_clips/*
 final/*
 work/*
 logs/*
+# 実行結果・検証用の出力（APKは1本約200MBでGitHubの上限を超える）
+out/
+output/
+*.apk
+flutter_app/*.log
 
 # 空フォルダだけは保持する
 !input/photos/.gitkeep

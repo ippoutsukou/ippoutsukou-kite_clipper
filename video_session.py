@@ -103,7 +103,7 @@ class Candidate:
 @dataclass
 class Session:
     session_id: str
-    sport_id: str = "kiteboarding"
+    sport_id: str = "kite"
     schema_version: int = SCHEMA_VERSION
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)

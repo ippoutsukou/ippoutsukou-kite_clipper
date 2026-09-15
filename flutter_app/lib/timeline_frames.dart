@@ -122,7 +122,7 @@ class TimelineFrames extends StatelessWidget {
                                   child: Icon(Icons.movie_outlined,
                                       size: 14, color: Colors.blueGrey)))
                           : Image.memory(bytes,
-                              height: 36,
+                              height: double.infinity,
                               fit: BoxFit.cover,
                               gaplessPlayback: false,
                               errorBuilder: (_, __, ___) =>

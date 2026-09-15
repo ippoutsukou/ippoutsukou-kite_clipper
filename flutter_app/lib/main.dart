@@ -12,6 +12,10 @@ import 'editor_viewport.dart';
 import 'editor_controls.dart';
 import 'timeline_frames.dart';
 import 'preview_readiness.dart';
+import 'range_timeline.dart';
+import 'time_entry.dart';
+import 'clip_session.dart';
+import 'clip_list.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -81,6 +85,21 @@ class _WorkspaceState extends State<Workspace> {
   final timelineLoader = TimelineLoader(extractTimelineFrame);
   List<Uint8List?> timelineFrames = List.filled(8, null);
   String? timelineSource;
+  final session = ClipSession(caseInsensitivePaths: Platform.isWindows);
+  StreamSubscription<String>? mediaError;
+
+  void rememberActive() {
+    final item = session.active;
+    if (item == null || item.path != source) return;
+    if (durationMs > 0) {
+      item.setDuration(durationMs);
+      item.startMs = range.start.round();
+      item.endMs = range.end.round();
+    }
+    item.thumbnail = thumbnail;
+    item.error = error;
+    item.output = output;
+  }
 
   void loadTimeline() {
     final path = source;
@@ -91,6 +110,7 @@ class _WorkspaceState extends State<Workspace> {
       setState(() {
         timelineFrames[index] = bytes;
         thumbnail ??= bytes;
+        rememberActive();
       });
     }));
   }
@@ -140,26 +160,12 @@ class _WorkspaceState extends State<Workspace> {
     super.initState();
     // 初回のVideoウィジェット構築まで遅延させず、起動時に出力を接続する。
     controller = VideoController(player);
-    subscriptions.add(
-      player.stream.duration.listen((value) {
-        if (!mounted || value.inMilliseconds <= 0) return;
-        setState(() {
-          if (durationMs == 0)
-            range = RangeValues(0, value.inMilliseconds.toDouble());
-          durationMs = value.inMilliseconds;
-        });
-        loadTimeline();
-      }),
-    );
-    subscriptions.add(
-      player.stream.error.listen((_) {
-        if (mounted) setState(() => error = '再生できません。別の動画形式で試してください。');
-      }),
-    );
   }
 
   @override
   void dispose() {
+    session.invalidate();
+    mediaError?.cancel();
     timelineLoader.cancel();
     pendingSeek = null;
     for (final sub in subscriptions) {
@@ -171,53 +177,208 @@ class _WorkspaceState extends State<Workspace> {
 
   Future<void> pick() async {
     if (busy || loading) return;
-    setState(() {
-      loading = true;
-      error = null;
-    });
+    rememberActive();
+    setState(() => loading = true);
     try {
-      final file = await openFile(
-        acceptedTypeGroups: [
-          const XTypeGroup(
+      final files = await openFiles(acceptedTypeGroups: [
+        const XTypeGroup(
             label: '動画',
             extensions: ['mp4', 'mov', 'mkv', 'webm'],
-            mimeTypes: ['video/*'],
-          ),
-        ],
-      );
-      if (file == null || !mounted) return;
-      pendingSeek = null;
-      timelineLoader.cancel();
+            mimeTypes: ['video/*']),
+      ]);
+      if (!mounted || files.isEmpty) return;
+      final added = session.add(files.map((file) => file.path).toList());
+      setState(() {});
+      if (session.active == null && added.isNotEmpty)
+        await openClip(added.first);
+    } on StateError {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('動画は最大30本です。追加する本数を減らしてください。')));
+    } catch (_) {
+      if (mounted)
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('動画を追加できませんでした。')));
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> selectClip(ClipItem item) async {
+    if (busy || loading) return;
+    if (identical(session.active, item) && durationMs > 0 && error == null)
+      return;
+    rememberActive();
+    setState(() => loading = true);
+    try {
+      await openClip(item);
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> openClip(ClipItem item) async {
+    final ticket = session.select(item);
+    bool current() => mounted && session.accepts(ticket, item);
+    pendingSeek = null;
+    timelineLoader.cancel();
+    await mediaError?.cancel();
+    mediaError = null;
+    StreamSubscription<Duration>? durationSubscription;
+    try {
       await seekTask;
       await player.stop();
+      if (!current()) return;
       setState(() {
-        source = file.path;
-        output = null;
-        thumbnail = null;
+        source = item.path;
         durationMs = 0;
+        range = const RangeValues(0, 1);
+        error = null;
+        output = item.output;
+        thumbnail = item.thumbnail;
         timelineSource = null;
         timelineFrames = List.filled(8, null);
+      });
+      final length = Completer<Duration>();
+      durationSubscription = player.stream.duration.listen((value) {
+        if (current() && value.inMilliseconds > 0 && !length.isCompleted)
+          length.complete(value);
+      });
+      mediaError = player.stream.error.listen((_) {
+        if (current())
+          setState(() {
+            error = '再生できません。別の動画形式で試してください。';
+            rememberActive();
+          });
       });
       await openPreparedPreview(
         ready: () async {
           await controller.platform.future;
           await WidgetsBinding.instance.endOfFrame;
         }(),
-        isActive: () => mounted,
-        open: () => player.open(Media(file.path), play: false),
+        isActive: current,
+        open: () => player.open(Media(item.path), play: false),
       );
-      if (!mounted) return;
-      // 動画が読み込まれた後に取得。失敗しても再生機能は維持する。
-      try {
-        final frame = await player.screenshot();
-        if (mounted) setState(() => thumbnail = frame);
-      } catch (_) {
-        /* サムネイル未取得時は動画アイコンを使う。 */
-      }
+      if (!current()) return;
+      final duration = await length.future.timeout(const Duration(seconds: 20));
+      if (!current()) return;
+      item.setDuration(duration.inMilliseconds);
+      setState(() {
+        durationMs = item.durationMs!;
+        range = RangeValues(item.startMs!.toDouble(), item.endMs!.toDouble());
+        output = item.output;
+      });
+      await player.seek(Duration(milliseconds: item.startMs!));
+      if (!current()) return;
+      rememberActive();
+      loadTimeline();
     } catch (_) {
-      if (mounted) setState(() => error = '動画を開けませんでした。権限とファイル形式を確認してください。');
+      if (current())
+        setState(() {
+          source = item.path;
+          durationMs = 0;
+          error = '動画を読み込めませんでした。一覧から別の動画を選ぶか、同じ項目を選んで再試行してください。';
+          rememberActive();
+        });
     } finally {
-      if (mounted) setState(() => loading = false);
+      await durationSubscription?.cancel();
+    }
+  }
+
+  Future<void> showClipPicker() async {
+    if (busy || loading) return;
+    final chosen = await showModalBottomSheet<ClipItem>(
+        context: context,
+        isScrollControlled: true,
+        builder: (context) => SafeArea(
+                child: SizedBox(
+              height: MediaQuery.sizeOf(context).height * 0.7,
+              child: StatefulBuilder(
+                  builder: (sheetContext, updateSheet) => ClipList(
+                      items: session.items,
+                      selected: session.active,
+                      enabled: !busy && !loading,
+                      onSelect: (item) => Navigator.pop(context, item),
+                      onMove: (item, delta) {
+                        moveClip(item, delta);
+                        updateSheet(() {});
+                      },
+                      onRemove: (item) {
+                        Navigator.pop(context);
+                        unawaited(removeClip(item));
+                      })),
+            )));
+    if (chosen != null && mounted) await selectClip(chosen);
+  }
+
+  void moveClip(ClipItem item, int delta) {
+    if (busy || loading || !session.items.contains(item)) return;
+    rememberActive();
+    setState(() => session.move(item, delta));
+  }
+
+  Future<void> removeClip(ClipItem item) async {
+    if (busy || loading || !session.items.contains(item)) return;
+    final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+              title: const Text('一覧から外しますか？'),
+              content: SingleChildScrollView(
+                  child: Text(
+                      '${item.name}\n\nこの動画の編集範囲は一覧から失われます。元動画と保存済みファイルは削除しません。')),
+              actions: [
+                TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('キャンセル')),
+                FilledButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child: const Text('一覧から外す')),
+              ],
+            ));
+    if (!mounted ||
+        confirmed != true ||
+        busy ||
+        loading ||
+        !session.items.contains(item)) return;
+    rememberActive();
+    if (!identical(session.active, item)) {
+      setState(() => session.remove(item));
+    } else {
+      setState(() => loading = true);
+      session.invalidate();
+      timelineLoader.cancel();
+      pendingSeek = null;
+      try {
+        await mediaError?.cancel();
+        mediaError = null;
+        await seekTask;
+        await player.stop();
+        if (!mounted) return;
+        session.remove(item);
+        final next = session.active;
+        if (next != null) {
+          await openClip(next);
+        } else {
+          setState(() {
+            source = null;
+            output = null;
+            error = null;
+            thumbnail = null;
+            durationMs = 0;
+            range = const RangeValues(0, 1);
+            timelineSource = null;
+            timelineFrames = List.filled(8, null);
+          });
+        }
+      } catch (_) {
+        if (mounted) setState(() => error = '動画を停止できなかったため、一覧の変更を完了できませんでした。');
+      } finally {
+        if (mounted) setState(() => loading = false);
+      }
+    }
+    if (mounted && !session.items.contains(item)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('一覧から外しました。元動画・保存済みファイルはそのままです。')));
     }
   }
 
@@ -245,7 +406,11 @@ class _WorkspaceState extends State<Workspace> {
     } catch (e) {
       if (mounted) setState(() => error = '保存できませんでした: $e');
     } finally {
-      if (mounted) setState(() => busy = false);
+      if (mounted)
+        setState(() {
+          busy = false;
+          rememberActive();
+        });
     }
   }
 
@@ -255,85 +420,20 @@ class _WorkspaceState extends State<Workspace> {
   }
 
   Widget candidates(bool compact) => Container(
-        width: compact ? null : 260,
-        padding: const EdgeInsets.all(14),
+        width: compact
+            ? null
+            : (MediaQuery.sizeOf(context).width * 0.24).clamp(260.0, 360.0),
         decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(6),
-          border: Border.all(color: const Color(0xffe4e9f0)),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('編集中のクリップ',
-                style: TextStyle(fontWeight: FontWeight.w700)),
-            const SizedBox(height: 14),
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: const Color(0xffedf5ff),
-                border: Border.all(color: const Color(0xff2878ef)),
-                borderRadius: BorderRadius.circular(5),
-              ),
-              child: Row(
-                children: [
-                  const Icon(
-                    Icons.check_circle,
-                    color: Color(0xff159861),
-                    size: 19,
-                  ),
-                  const SizedBox(width: 8),
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(3),
-                    child: thumbnail == null
-                        ? Container(
-                            width: 64,
-                            height: 44,
-                            color: const Color(0xffd8e8f6),
-                            child: const Icon(Icons.movie_outlined),
-                          )
-                        : Image.memory(
-                            thumbnail!,
-                            width: 64,
-                            height: 44,
-                            fit: BoxFit.cover,
-                          ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          source!.split(RegExp(r'[/\\]')).last,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 12),
-                        ),
-                        Text(
-                          '${((range.end - range.start) / 1000).toStringAsFixed(1)} 秒',
-                          style: const TextStyle(
-                            color: Colors.blueGrey,
-                            fontSize: 12,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            if (!compact)
-              const Padding(
-                padding: EdgeInsets.only(top: 20),
-                child: Text(
-                  '開始と終了を調整して、残したい区間を保存',
-                  style: TextStyle(color: Colors.blueGrey, fontSize: 12),
-                ),
-              ),
-          ],
-        ),
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(color: const Color(0xffe4e9f0))),
+        child: ClipList(
+            items: session.items,
+            selected: session.active,
+            enabled: !busy && !loading,
+            onSelect: selectClip,
+            onMove: moveClip,
+            onRemove: removeClip),
       );
 
   Widget editor() => EditorViewport(
@@ -377,38 +477,23 @@ class _WorkspaceState extends State<Workspace> {
             ],
           ),
           const SizedBox(height: 6),
-          Container(
-            height: 48,
-            decoration: BoxDecoration(
-              color: const Color(0xffedf3fc),
-              borderRadius: BorderRadius.circular(4),
-            ),
-            child: Stack(fit: StackFit.expand, children: [
-              TimelineFrames(frames: timelineFrames),
-              RangeSlider(
-                min: 0,
-                max: durationMs > 0 ? durationMs.toDouble() : 1,
-                values: RangeValues(
-                  range.start
-                      .clamp(0, durationMs > 0 ? durationMs.toDouble() : 1),
-                  range.end
-                      .clamp(0, durationMs > 0 ? durationMs.toDouble() : 1),
-                ),
-                labels: RangeLabels(time(range.start), time(range.end)),
-                onChanged: busy || loading || durationMs == 0
-                    ? null
-                    : (v) {
-                        if (v.end - v.start < 100) return;
-                        final target =
-                            rangePreviewPosition(range, v, durationMs);
-                        setState(() {
-                          range = v;
-                          output = null;
-                        });
-                        previewAt(target);
-                      },
-              ),
-            ]),
+          RangeTimeline(
+            frames: timelineFrames,
+            values: range,
+            durationMs: durationMs,
+            compact: MediaQuery.sizeOf(context).height < 700,
+            onChanged: busy || loading || durationMs == 0
+                ? null
+                : (v) {
+                    if (v.end - v.start < 100) return;
+                    final target = rangePreviewPosition(range, v, durationMs);
+                    setState(() {
+                      range = v;
+                      output = null;
+                      rememberActive();
+                    });
+                    previewAt(target);
+                  },
           ),
           const SizedBox(height: 6),
           Wrap(
@@ -427,19 +512,44 @@ class _WorkspaceState extends State<Workspace> {
         ],
       );
 
+  Future<void> editTime(bool start) async {
+    if (busy || loading || durationMs <= 0) return;
+    final currentSource = source;
+    final value = await showDialog<int>(
+        context: context,
+        builder: (_) => TimeEntryDialog(
+            start: start,
+            initial: time(start ? range.start : range.end),
+            other: (start ? range.end : range.start).round(),
+            duration: durationMs));
+    if (!mounted || value == null || busy || loading || source != currentSource)
+      return;
+    setState(() {
+      range = start
+          ? RangeValues(value.toDouble(), range.end)
+          : RangeValues(range.start, value.toDouble());
+      output = null;
+      rememberActive();
+    });
+    previewAt(value.clamp(0, durationMs - 1));
+  }
+
   Widget _timeBox(String label, String value) => Row(
         mainAxisSize: MainAxisSize.min,
         children: [
           Text(label),
           const SizedBox(width: 8),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              border: Border.all(color: const Color(0xffd3d9e3)),
-              borderRadius: BorderRadius.circular(5),
-            ),
-            child: Text(value),
+          OutlinedButton(
+            onPressed: busy || loading || durationMs <= 0
+                ? null
+                : () => editTime(label == '開始'),
+            style: OutlinedButton.styleFrom(
+                minimumSize: const Size(0, 36),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                foregroundColor: const Color(0xff14213d),
+                side: const BorderSide(color: Color(0xffd3d9e3))),
+            child: Text(value, semanticsLabel: '$label時刻 $value を編集'),
           ),
         ],
       );
@@ -449,13 +559,22 @@ class _WorkspaceState extends State<Workspace> {
         appBar: AppBar(
           backgroundColor: Colors.white,
           surfaceTintColor: Colors.white,
-          leading: const Icon(Icons.sailing, color: Color(0xff1664dd)),
-          title: Text(source == null ? 'Kite Clipper' : 'クリップを確認'),
+          leading: source != null &&
+                  (Platform.isAndroid || MediaQuery.sizeOf(context).width < 800)
+              ? IconButton(
+                  tooltip: '動画一覧（${session.items.length}本）',
+                  onPressed: busy || loading ? null : showClipPicker,
+                  icon: const Icon(Icons.video_library_outlined,
+                      color: Color(0xff1664dd)))
+              : const Icon(Icons.sailing, color: Color(0xff1664dd)),
+          title: Text(source == null ? 'Kite Clipper' : 'クリップを確認',
+              style: const TextStyle(
+                  fontWeight: FontWeight.w700, color: Color(0xff14213d))),
           centerTitle: true,
           actions: [
             TextButton(
               onPressed: busy || loading ? null : pick,
-              child: const Text('動画を選択…'),
+              child: const Text('動画を追加…'),
             ),
             const SizedBox(width: 8),
           ],
@@ -500,31 +619,27 @@ class _WorkspaceState extends State<Workspace> {
                           FilledButton.icon(
                             onPressed: loading ? null : pick,
                             icon: const Icon(Icons.add),
-                            label: const Text('動画を選択…'),
+                            label: const Text('動画を追加…'),
                           ),
                         ],
                       ),
                     )
                   : LayoutBuilder(
                       builder: (context, box) {
-                        final compact = box.maxWidth < 800;
+                        final compact =
+                            Platform.isAndroid || box.maxWidth < 800;
                         return Padding(
                           padding: const EdgeInsets.all(16),
                           child: compact
                               ? Column(
                                   children: [
-                                    if (box.maxHeight > 550) ...[
-                                      candidates(true),
-                                      const SizedBox(height: 8),
-                                    ],
                                     Expanded(child: editor()),
                                   ],
                                 )
                               : Row(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    SingleChildScrollView(
-                                        child: candidates(false)),
+                                    candidates(false),
                                     const SizedBox(width: 16),
                                     Expanded(child: editor()),
                                   ],
@@ -542,7 +657,11 @@ class _WorkspaceState extends State<Workspace> {
                   children: [
                     Expanded(
                       child: Text(
-                        busy ? '保存中…' : '指定した1区間を保存',
+                        busy
+                            ? '保存中…'
+                            : '${session.active?.name ?? "選択中の動画"} の1区間',
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
                         style: const TextStyle(fontWeight: FontWeight.w600),
                       ),
                     ),
@@ -552,7 +671,7 @@ class _WorkspaceState extends State<Workspace> {
                               ? null
                               : save,
                       icon: const Icon(Icons.save_alt, size: 18),
-                      label: const Text('1本保存'),
+                      label: const Text('このクリップを保存'),
                     ),
                   ],
                 ),
