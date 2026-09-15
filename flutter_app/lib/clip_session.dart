@@ -65,6 +65,37 @@ class ClipItem {
     }
   }
 
+  /// 作業記録から区間を戻す。不正な値は ArgumentError（呼び出し側でその動画を読み飛ばす）。
+  void restore(
+      {required int? durationMs,
+      required List<ClipSegment> segments,
+      required int activeSegment}) {
+    if (durationMs == null) {
+      if (segments.isNotEmpty) throw ArgumentError('長さ未確認の動画に区間があります');
+      return;
+    }
+    if (durationMs <= 0 ||
+        segments.isEmpty ||
+        segments.length > maxSegments) {
+      throw ArgumentError('長さ・区間数が不正です');
+    }
+    for (final segment in segments) {
+      if (segment.startMs < 0 ||
+          segment.endMs > durationMs ||
+          segment.endMs - segment.startMs < minLengthMs) {
+        throw ArgumentError('区間が不正です');
+      }
+    }
+    if (activeSegment < 0 || activeSegment >= segments.length) {
+      throw ArgumentError('選択中の区間が不正です');
+    }
+    this.durationMs = durationMs;
+    _segments
+      ..clear()
+      ..addAll(segments);
+    _active = activeSegment;
+  }
+
   void setRange(int start, int end) {
     if (durationMs == null ||
         start < 0 ||

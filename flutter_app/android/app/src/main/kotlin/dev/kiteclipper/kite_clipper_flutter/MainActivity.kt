@@ -90,6 +90,8 @@ class MainActivity : FlutterActivity() {
                         call.argument<String>("source"),
                         call.argument<Number>("startMs")?.toLong(),
                         call.argument<Number>("endMs")?.toLong(), result)
+                    // 作業記録の保存場所。アプリ専用領域なので権限は不要。
+                    "appDataDir" -> result.success(filesDir.absolutePath)
                     "keepScreenOn" -> {
                         if (call.argument<Boolean>("on") == true) {
                             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)

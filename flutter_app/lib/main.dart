@@ -20,6 +20,7 @@ import 'segment_chips.dart';
 import 'batch_plan.dart';
 import 'batch_runner.dart';
 import 'batch_dialogs.dart';
+import 'session_store.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -89,7 +90,14 @@ class _WorkspaceState extends State<Workspace> {
   final timelineLoader = TimelineLoader(extractTimelineFrame);
   List<Uint8List?> timelineFrames = List.filled(8, null);
   String? timelineSource;
-  final session = ClipSession(caseInsensitivePaths: Platform.isWindows);
+  // 起動時に前回の作業記録から差し替えるため final にしない。
+  ClipSession session = ClipSession(caseInsensitivePaths: Platform.isWindows);
+  // 作業記録。場所を決められない・前回の記録を読めない場合は null（記録しない）。
+  SessionStore? sessionStore;
+  Timer? saveTimer;
+  Future<void>? saving;
+  bool saveFailureShown = false;
+  late final AppLifecycleListener lifecycle;
   StreamSubscription<String>? mediaError;
   // 一括保存中だけ値を持つ。batchProgress が null でなければ進捗欄を表示する。
   BatchRunner? batchRunner;
@@ -168,10 +176,18 @@ class _WorkspaceState extends State<Workspace> {
     super.initState();
     // 初回のVideoウィジェット構築まで遅延させず、起動時に出力を接続する。
     controller = VideoController(player);
+    // バックグラウンドへ移る・閉じる直前に作業記録を書き出す。
+    lifecycle = AppLifecycleListener(onStateChange: (state) {
+      if (state != AppLifecycleState.resumed) unawaited(flushSave());
+    });
+    loading = true;
+    unawaited(restoreSession());
   }
 
   @override
   void dispose() {
+    saveTimer?.cancel();
+    lifecycle.dispose();
     session.invalidate();
     mediaError?.cancel();
     timelineLoader.cancel();
@@ -181,6 +197,95 @@ class _WorkspaceState extends State<Workspace> {
     }
     player.dispose();
     super.dispose();
+  }
+
+  /// 画面の状態が変わるたびに作業記録の書き出しを予約する（連続した変更は0.5秒でまとめる）。
+  @override
+  void setState(VoidCallback fn) {
+    super.setState(fn);
+    scheduleSave();
+  }
+
+  void scheduleSave() {
+    if (sessionStore == null) return;
+    saveTimer?.cancel();
+    saveTimer = Timer(
+        const Duration(milliseconds: 500), () => unawaited(flushSave()));
+  }
+
+  Future<void> flushSave() {
+    saveTimer?.cancel();
+    saveTimer = null;
+    final store = sessionStore;
+    if (store == null) return Future<void>.value();
+    if (mounted) rememberActive();
+    // 書き込みを直列にし、後から始めた保存が常に最新の状態を書く。
+    final next =
+        (saving ?? Future<void>.value()).then((_) => store.save(session));
+    saving = next.catchError((Object _) {
+      if (mounted && !saveFailureShown) {
+        saveFailureShown = true;
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('作業内容を記録できませんでした。次回起動時に復元されない場合があります。')));
+      }
+    });
+    return saving!;
+  }
+
+  /// 前回の一覧と区間を戻し、前回選んでいた動画（元動画があるもの）を開く。
+  Future<void> restoreSession() async {
+    try {
+      final store = await SessionStore.open();
+      if (store == null || !mounted) return;
+      final restored =
+          await store.load(caseInsensitivePaths: Platform.isWindows);
+      if (!mounted) return;
+      sessionStore = store;
+      final notes = [
+        if (restored.warning != null) restored.warning!,
+        if (restored.skipped > 0)
+          '読み込めなかった動画${restored.skipped}本は一覧に含めていません。',
+      ];
+      if (notes.isNotEmpty) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(notes.join('\n'))));
+      }
+      if (restored.session.items.isEmpty || session.items.isNotEmpty) return;
+      setState(() => session = restored.session);
+      ClipItem? target = session.active;
+      if (target == null || target.error != null) {
+        target = null;
+        for (final item in session.items) {
+          if (item.error == null) {
+            target = item;
+            break;
+          }
+        }
+      }
+      if (target != null) {
+        await openClip(target);
+      } else {
+        // 元動画が1本も見つからなくても、一覧を見て外せるよう編集画面を出す。
+        final first = session.items.first;
+        session.select(first);
+        setState(() {
+          source = first.path;
+          error = first.error;
+          output = null;
+          thumbnail = null;
+          durationMs = 0;
+        });
+      }
+    } catch (_) {
+      // 読めない理由が分からないまま前回の記録を上書きしないよう、今回は記録しない。
+      sessionStore = null;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('前回の作業を読み込めませんでした。今回の作業内容は記録されません。')));
+      }
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
   }
 
   Future<void> pick() async {

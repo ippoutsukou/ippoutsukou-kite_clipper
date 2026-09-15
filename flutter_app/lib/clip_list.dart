@@ -25,7 +25,7 @@ class ClipList extends StatelessWidget {
                   style: const TextStyle(fontWeight: FontWeight.w700)),
               const Spacer(),
               const Tooltip(
-                  message: '範囲はアプリ起動中のみ保持します',
+                  message: '一覧と区間は自動で記録し、次回起動時に復元します',
                   child: Icon(Icons.info_outline, size: 18)),
             ])),
         Expanded(
@@ -103,7 +103,7 @@ class ClipList extends StatelessWidget {
                 })),
         const Padding(
             padding: EdgeInsets.all(12),
-            child: Text('編集範囲は終了すると失われます',
+            child: Text('一覧と区間は次回起動時に復元します',
                 style: TextStyle(fontSize: 11, color: Colors.blueGrey))),
       ]);
 }
