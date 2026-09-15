@@ -30,4 +30,17 @@ void main() {
       expect(tester.getSize(find.byType(RangeTimeline)).height, lessThanOrEqualTo(80));
     });
   }
+  testWidgets('他区間を0〜1へ正規化し長さ外は切り詰めて描画へ渡す', (tester) async {
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body: SizedBox(width: 600,
+      child: RangeTimeline(frames: List.filled(8, null),
+        values: const RangeValues(2000, 4000), durationMs: 10000, onChanged: null,
+        others: const [RangeValues(5000, 7000), RangeValues(9000, 12000)])))));
+    final shade = tester.widgetList<CustomPaint>(find.byType(CustomPaint))
+      .map((p) => p.painter).whereType<RangeShade>().single;
+    expect(shade.others, const [RangeValues(0.5, 0.7), RangeValues(0.9, 1.0)]);
+    expect(shade.shouldRepaint(RangeShade(start: shade.start, end: shade.end)), isTrue);
+    expect(shade.shouldRepaint(RangeShade(start: shade.start, end: shade.end,
+      others: const [RangeValues(0.5, 0.7), RangeValues(0.9, 1.0)])), isFalse);
+    expect(tester.takeException(), isNull);
+  });
 }

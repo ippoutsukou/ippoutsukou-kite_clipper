@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 import 'timeline_frames.dart';
 
@@ -10,11 +11,15 @@ class RangeTimeline extends StatelessWidget {
       required this.values,
       required this.durationMs,
       required this.onChanged,
+      this.others = const [],
       this.compact = false});
   final List<Uint8List?> frames;
   final RangeValues values;
   final int durationMs;
   final ValueChanged<RangeValues>? onChanged;
+
+  /// 選択していない区間（ミリ秒）。表示のみで操作はできない。
+  final List<RangeValues> others;
   final bool compact;
 
   @override
@@ -22,6 +27,10 @@ class RangeTimeline extends StatelessWidget {
     final maximum = durationMs > 0 ? durationMs.toDouble() : 1.0;
     final safe = RangeValues(
         values.start.clamp(0, maximum), values.end.clamp(0, maximum));
+    final bands = others
+        .map((o) => RangeValues(o.start.clamp(0, maximum) / maximum,
+            o.end.clamp(0, maximum) / maximum))
+        .toList();
     return Column(mainAxisSize: MainAxisSize.min, children: [
       if (!compact)
         Padding(
@@ -41,7 +50,9 @@ class RangeTimeline extends StatelessWidget {
             IgnorePointer(
                 child: CustomPaint(
                     painter: RangeShade(
-                        start: safe.start / maximum, end: safe.end / maximum))),
+                        start: safe.start / maximum,
+                        end: safe.end / maximum,
+                        others: bands))),
             SliderTheme(
                 data: SliderTheme.of(context).copyWith(
                   activeTrackColor: Colors.transparent,
@@ -66,8 +77,12 @@ class RangeTimeline extends StatelessWidget {
 }
 
 class RangeShade extends CustomPainter {
-  const RangeShade({required this.start, required this.end});
+  const RangeShade(
+      {required this.start, required this.end, this.others = const []});
   final double start, end;
+
+  /// 他区間の0〜1の位置。暗幕の上に重ねて、選択外でも見えるようにする。
+  final List<RangeValues> others;
   @override
   void paint(Canvas canvas, Size size) {
     final width = (size.width - 48).clamp(0.0, double.infinity);
@@ -78,6 +93,14 @@ class RangeShade extends CustomPainter {
     final shade = Paint()..color = const Color(0x990f2033);
     canvas.drawRect(Rect.fromLTRB(24, top, left, bottom), shade);
     canvas.drawRect(Rect.fromLTRB(right, top, size.width - 24, bottom), shade);
+    final band = Paint()..color = const Color(0x55ffb020);
+    final mark = Paint()..color = const Color(0xffffb020);
+    for (final other in others) {
+      final l = 24 + width * other.start;
+      final r = 24 + width * other.end;
+      canvas.drawRect(Rect.fromLTRB(l, top, r, bottom), band);
+      canvas.drawRect(Rect.fromLTRB(l, bottom - 4, r, bottom), mark);
+    }
     final border = Paint()
       ..color = const Color(0xff1266ff)
       ..strokeWidth = 2
@@ -96,5 +119,7 @@ class RangeShade extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant RangeShade oldDelegate) =>
-      oldDelegate.start != start || oldDelegate.end != end;
+      oldDelegate.start != start ||
+      oldDelegate.end != end ||
+      !listEquals(oldDelegate.others, others);
 }
