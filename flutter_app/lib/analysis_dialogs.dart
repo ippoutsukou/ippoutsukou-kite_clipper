@@ -172,7 +172,8 @@ class AnalysisResultDialog extends StatelessWidget {
                 const Text('所要時間',
                     style: TextStyle(fontWeight: FontWeight.w700)),
                 Text('合計：${_seconds(result.totalMs)}秒'
-                    '（取り出し ${_seconds(result.extractMs)}秒 ／ 推論 ${_seconds(result.inferMs)}秒）'),
+                    '（${result.probeMs > 0 ? '下調べ ${_seconds(result.probeMs)}秒 ／ ' : ''}'
+                    '取り出し ${_seconds(result.extractMs)}秒 ／ 推論 ${_seconds(result.inferMs)}秒）'),
                 Text('動画1分あたり：約${result.secondsPerVideoMinute.toStringAsFixed(1)}秒'),
               ],
               const SizedBox(height: 10),

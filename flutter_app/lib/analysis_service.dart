@@ -44,6 +44,7 @@ class AnalysisResult {
     required this.scores,
     this.scoresByModel = const {},
     required this.modelMs,
+    this.probeMs = 0,
     required this.extractMs,
     required this.inferMs,
     required this.totalMs,
@@ -63,6 +64,8 @@ class AnalysisResult {
 
   /// モデルの読み込み（初回のみ時間がかかる）。
   final int modelMs;
+  /// 取り出し前の下調べ（動画の長さ・キーフレーム時刻の取得）。Windowsのみ。
+  final int probeMs;
   final int extractMs;
   final int inferMs;
   final int totalMs;
@@ -203,6 +206,7 @@ class AnalysisService {
     final durationMs = await _probeDurationMs(source);
     if (durationMs <= 0) throw StateError('動画の長さを取得できませんでした');
     final keyframes = await _probeKeyframeTimesMs(source);
+    final probeMs = DateTime.now().difference(started).inMilliseconds;
     // キーフレームを取得できない動画や、間隔が粗すぎる動画では、
     // 間隔指定で取り出す方式に切り替える（遅いが希望の粒度を保てる）。
     final useKeyframes = keyframesUsable(keyframes, intervalMs);
@@ -318,6 +322,7 @@ class AnalysisService {
       scores: byModel[models.first.id]!,
       scoresByModel: byModel,
       modelMs: 0,
+      probeMs: probeMs,
       extractMs: extractMs,
       inferMs: inferMs,
       totalMs: totalMs,
@@ -327,15 +332,34 @@ class AnalysisService {
   }
 
   /// キーフレームの時刻（ミリ秒）を昇順で返す。デコードしないため高速。
+  /// キーフレームの時刻を取得する。
+  ///
+  /// まずパケット情報（キーフレームの印）だけを読む。映像をデコードしないため数秒で終わる。
+  /// 従来のフレーム方式は4K映像をデコードし、取り出しと同程度（6分の動画で約100秒）かかっていた。
+  /// パケットから取得できない動画では従来方式に戻す。
   Future<List<int>> _probeKeyframeTimesMs(String source) async {
+    final fromPackets = await _probeTimesMs(source, [
+      '-show_entries', 'packet=pts_time,flags',
+    ], keyOnly: true);
+    if (fromPackets.length >= 2) return fromPackets;
+    return _probeTimesMs(source, [
+      '-skip_frame', 'nokey', '-show_entries', 'frame=pts_time',
+    ]);
+  }
+
+  Future<List<int>> _probeTimesMs(String source, List<String> entries,
+      {bool keyOnly = false}) async {
     final result = await Process.run(await _tool('ffprobe'), [
-      '-v', 'error', '-select_streams', 'v:0', '-skip_frame', 'nokey',
-      '-show_entries', 'frame=pts_time', '-of', 'csv=p=0', source,
+      '-v', 'error', '-select_streams', 'v:0', ...entries,
+      '-of', 'csv=p=0', source,
     ]);
     final times = <int>[];
     for (final line in (result.stdout as String).split('\n')) {
       // 動画によっては "0.966667," のように区切りが付いて出力される。
-      final seconds = double.tryParse(line.split(',').first.trim());
+      final fields = line.trim().split(',');
+      // パケットの flags はキーフレームなら先頭が K（例 "K__"）。
+      if (keyOnly && (fields.length < 2 || !fields[1].startsWith('K'))) continue;
+      final seconds = double.tryParse(fields.first.trim());
       if (seconds != null && seconds >= 0) times.add((seconds * 1000).round());
     }
     times.sort();
