@@ -32,6 +32,9 @@ class MainActivity : FlutterActivity() {
     private var pending: MethodChannel.Result? = null
     private var arguments: Map<*, *>? = null
     private var pendingFolder: MethodChannel.Result? = null
+    // 動画の選択と取り込み（コピー）中。メインスレッドでのみ読み書きする。
+    private var pendingPick: MethodChannel.Result? = null
+    private var pickBusy = false
     private var folderName: String? = null
     // 一括保存のフォルダ作成・1件書き込み中。メインスレッドでのみ読み書きする。
     private var batchBusy = false
@@ -43,7 +46,8 @@ class MainActivity : FlutterActivity() {
     private var clipSession: OrtSession? = null
     private val main = Handler(Looper.getMainLooper())
 
-    private fun isBusy() = pending != null || pendingFolder != null || batchBusy
+    private fun isBusy() =
+        pending != null || pendingFolder != null || batchBusy || pendingPick != null || pickBusy
 
     override fun configureFlutterEngine(engine: FlutterEngine) {
         super.configureFlutterEngine(engine)
@@ -89,6 +93,22 @@ class MainActivity : FlutterActivity() {
                     }
                 }
             }
+        MethodChannel(engine.dartExecutor.binaryMessenger, "kite_clipper/picker")
+            .setMethodCallHandler { call, result ->
+                if (call.method != "pickVideos") { result.notImplemented(); return@setMethodCallHandler }
+                if (isBusy() || pendingPick != null) { result.error("busy", "処理中です", null); return@setMethodCallHandler }
+                pendingPick = result
+                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "video/*"
+                    putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                }
+                try { startActivityForResult(intent, PICK_REQUEST) }
+                catch (e: Exception) {
+                    pendingPick = null
+                    result.error("picker", "動画を選ぶ画面を開けません", null)
+                }
+            }
         MethodChannel(engine.dartExecutor.binaryMessenger, "kite_clipper/analyze")
             .setMethodCallHandler { call, result ->
                 if (call.method != "analyze") { result.notImplemented(); return@setMethodCallHandler }
@@ -108,8 +128,10 @@ class MainActivity : FlutterActivity() {
                     try {
                         val measured = analyze(source, intervalMs, maxFrames, coefficients, intercept)
                         main.post { analyzing = false; result.success(measured) }
-                    } catch (e: Exception) {
-                        val message = "${e.javaClass.simpleName} ${e.message ?: ""}".trim()
+                    } catch (e: Throwable) {
+                        // メモリ不足などは Exception ではないため、Throwable で受けてアプリごと落とさない。
+                        val hint = if (e is OutOfMemoryError) "（メモリ不足）" else ""
+                        val message = "${e.javaClass.simpleName}$hint ${e.message ?: ""}".trim()
                         main.post { analyzing = false; result.error("analyze", message, null) }
                     }
                 }
@@ -209,6 +231,7 @@ class MainActivity : FlutterActivity() {
         when (requestCode) {
             EXPORT_REQUEST -> onExportDestination(resultCode, data)
             FOLDER_REQUEST -> onFolderChosen(resultCode, data)
+            PICK_REQUEST -> onVideosPicked(resultCode, data)
         }
     }
 
@@ -412,6 +435,75 @@ class MainActivity : FlutterActivity() {
         return output
     }
 
+    /**
+     * 選んだ動画をアプリ専用領域へ少しずつコピーし、コピー先のパスだけを返す。
+     * file_selector のAndroid実装のように中身をDart側へ渡すと、大きい動画でメモリ不足になる。
+     */
+    private fun onVideosPicked(resultCode: Int, data: Intent?) {
+        val callback = pendingPick ?: return
+        pendingPick = null
+        val uris = mutableListOf<Uri>()
+        if (resultCode == Activity.RESULT_OK && data != null) {
+            data.clipData?.let { clip ->
+                for (index in 0 until clip.itemCount) uris.add(clip.getItemAt(index).uri)
+            }
+            if (uris.isEmpty()) data.data?.let { uris.add(it) }
+        }
+        if (uris.isEmpty()) { callback.success(emptyList<String>()); return }
+        pickBusy = true
+        worker.execute {
+            val paths = mutableListOf<String>()
+            var failure: String? = null
+            try {
+                for (uri in uris) paths.add(copyPickedVideo(uri))
+            } catch (e: Throwable) {
+                failure = when (e) {
+                    is java.io.IOException -> "動画をコピーできませんでした（空き容量を確認してください）"
+                    is SecurityException -> "選んだ動画を読み取れませんでした"
+                    else -> "動画を取り込めませんでした：${e.javaClass.simpleName}"
+                }
+            }
+            main.post {
+                pickBusy = false
+                // 一部だけ成功した場合は、取り込めた分を返す。
+                if (paths.isEmpty() && failure != null) callback.error("picker", failure, null)
+                else callback.success(paths)
+            }
+        }
+    }
+
+    private fun copyPickedVideo(uri: Uri): String {
+        val folder = File(filesDir, "videos").apply { mkdirs() }
+        val size = contentResolver.query(
+            uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null
+        )?.use { cursor ->
+            if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else -1L
+        } ?: -1L
+        val base = (displayName(uri) ?: "video.mp4")
+            .replace(Regex("[\\\\/:*?\"<>| -]"), "_").takeLast(80)
+        var target = File(folder, base)
+        var index = 2
+        while (target.exists()) {
+            // 同じ名前・同じ大きさなら、以前取り込んだものを使い回す。
+            if (size >= 0 && target.length() == size) return target.absolutePath
+            val dot = base.lastIndexOf('.')
+            val stem = if (dot > 0) base.substring(0, dot) else base
+            val extension = if (dot > 0) base.substring(dot) else ""
+            target = File(folder, "${stem}_$index$extension")
+            index++
+        }
+        val temp = File(folder, "${target.name}.tmp")
+        contentResolver.openInputStream(uri).use { input ->
+            requireNotNull(input) { "動画を開けません" }
+            temp.outputStream().use { output -> input.copyTo(output, 64 * 1024) }
+        }
+        if (!temp.renameTo(target)) {
+            temp.delete()
+            throw java.io.IOException("コピーを保存できません")
+        }
+        return target.absolutePath
+    }
+
     private fun displayName(uri: Uri): String? = runCatching {
         contentResolver.query(uri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { cursor ->
             if (cursor.moveToFirst()) cursor.getString(0) else null
@@ -531,12 +623,14 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val EXPORT_REQUEST = 8102
         private const val FOLDER_REQUEST = 8103
+        private const val PICK_REQUEST = 8104
         // vendor/clip/SOURCE.txt と clip_embedder.py に合わせた前処理仕様。
         private const val CLIP_EMBED_DIM = 512
         // assets/clip/vision_model_quantized.onnx のバイト数。モデルを差し替えたら更新すること。
         private const val CLIP_MODEL_BYTES = 89117001L
         private const val CLIP_IMAGE_SIZE = 224
-        private const val BATCH_SIZE = 8
+        // 4K動画でのメモリ不足を避けるため1枚ずつ処理する（速度差は実測で1枚39ms対45ms程度）。
+        private const val BATCH_SIZE = 1
         private val CLIP_MEAN = floatArrayOf(0.48145466f, 0.4578275f, 0.40821073f)
         private val CLIP_STD = floatArrayOf(0.26862954f, 0.26130258f, 0.27577711f)
     }

@@ -24,6 +24,7 @@ import 'session_store.dart';
 import 'ai_segments.dart';
 import 'analysis_service.dart';
 import 'analysis_dialogs.dart';
+import 'video_picker.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -298,14 +299,9 @@ class _WorkspaceState extends State<Workspace> {
     rememberActive();
     setState(() => loading = true);
     try {
-      final files = await openFiles(acceptedTypeGroups: [
-        const XTypeGroup(
-            label: '動画',
-            extensions: ['mp4', 'mov', 'mkv', 'webm'],
-            mimeTypes: ['video/*']),
-      ]);
-      if (!mounted || files.isEmpty) return;
-      final added = session.add(files.map((file) => file.path).toList());
+      final paths = await VideoPicker().pick();
+      if (!mounted || paths.isEmpty) return;
+      final added = session.add(paths);
       setState(() {});
       if (session.active == null && added.isNotEmpty)
         await openClip(added.first);
@@ -575,6 +571,11 @@ class _WorkspaceState extends State<Workspace> {
     SportModel? model;
     AnalysisResult? result;
     try {
+      // 4K動画では再生用と解析用のデコーダーが同時に動くと落ちる端末があるため、先に止める。
+      timelineLoader.cancel();
+      pendingSeek = null;
+      await seekTask;
+      await player.stop();
       model = await loadSportModel(chosen);
       result = await AnalysisService().analyze(source: item.path, model: model);
     } catch (e) {
@@ -583,6 +584,15 @@ class _WorkspaceState extends State<Workspace> {
       if (mounted) {
         Navigator.of(context, rootNavigator: true).pop();
         setState(() => busy = false);
+      }
+    }
+    // 解析の成否にかかわらず、停止した再生を元の動画・範囲へ戻す。
+    if (mounted && session.items.contains(item)) {
+      setState(() => loading = true);
+      try {
+        await openClip(item);
+      } finally {
+        if (mounted) setState(() => loading = false);
       }
     }
     if (!mounted || result == null || model == null) return;
