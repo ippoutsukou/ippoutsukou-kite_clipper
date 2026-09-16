@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -218,46 +219,67 @@ class AnalysisService {
     var truncated = false;
     var index = 0;
     final buffer = BytesBuilder(copy: false);
-    try {
-      await for (final chunk in process.stdout) {
-        buffer.add(chunk);
-        while (buffer.length >= clipFrameBytes) {
-          if (_cancelRequested) break;
-          final bytes = buffer.takeBytes();
-          final frame = Uint8List.sublistView(bytes, 0, clipFrameBytes);
-          buffer.add(Uint8List.sublistView(bytes, clipFrameBytes));
-          // キーフレーム方式では ffprobe の時刻と取り出した順番を対応させる。
-          final int time;
-          if (useKeyframes) {
-            if (index >= keyframes.length) {
-              truncated = true;
-              break;
-            }
-            time = keyframes[index++];
-            if (!wanted.contains(time)) continue;
-          } else {
-            if (index >= maxAnalysisFrames) {
-              truncated = true;
-              break;
-            }
-            time = index++ * intervalMs;
+    // 採点を待つ間もFFmpegからの読み取りを続ける。1枚ずつ待つと読み取りが止まり、
+    // 長い動画ほど停止が積み上がって遅くなるため、取り出しと採点を分ける。
+    final queue = <({int timeMs, Uint8List frame})>[];
+    var reading = true;
+    late final StreamSubscription<List<int>> reader;
+    reader = process.stdout.listen((chunk) {
+      buffer.add(chunk);
+      while (buffer.length >= clipFrameBytes) {
+        final bytes = buffer.takeBytes();
+        final frame = Uint8List.sublistView(bytes, 0, clipFrameBytes);
+        buffer.add(Uint8List.sublistView(bytes, clipFrameBytes));
+        // キーフレーム方式では ffprobe の時刻と取り出した順番を対応させる。
+        final int time;
+        if (useKeyframes) {
+          if (index >= keyframes.length) {
+            truncated = true;
+            reading = false;
+            return;
           }
-          final inferStart = DateTime.now();
-          final embedding = await clipChannel
-              .invokeListMethod<double>('embed', {'pixels': frame});
-          inferMs += DateTime.now().difference(inferStart).inMilliseconds;
-          if (embedding == null || embedding.length != SportModel.embeddingSize) {
-            throw StateError('CLIPの結果を受け取れませんでした');
+          time = keyframes[index++];
+          if (!wanted.contains(time)) continue;
+        } else {
+          if (index >= maxAnalysisFrames) {
+            truncated = true;
+            reading = false;
+            return;
           }
-          timesMs.add(time);
-          scores.add(model.score(embedding));
-          onProgress?.call(timesMs.length, total);
+          time = index++ * intervalMs;
         }
-        if (_cancelRequested || truncated) break;
+        queue.add((timeMs: time, frame: frame));
       }
+      // 溜まりすぎたら読み取りを止め、採点が進んだら再開する。
+      if (queue.length >= _frameQueueLimit) reader.pause();
+    }, onDone: () => reading = false, onError: (Object _) => reading = false);
+    try {
+      while (reading || queue.isNotEmpty) {
+        if (_cancelRequested) break;
+        if (queue.isEmpty) {
+          await Future<void>.delayed(const Duration(milliseconds: 2));
+          continue;
+        }
+        final item = queue.removeAt(0);
+        if (reader.isPaused && queue.length <= _frameQueueLimit ~/ 2) {
+          reader.resume();
+        }
+        final inferStart = DateTime.now();
+        final embedding = await clipChannel
+            .invokeListMethod<double>('embed', {'pixels': item.frame});
+        inferMs += DateTime.now().difference(inferStart).inMilliseconds;
+        if (embedding == null || embedding.length != SportModel.embeddingSize) {
+          throw StateError('CLIPの結果を受け取れませんでした');
+        }
+        timesMs.add(item.timeMs);
+        scores.add(model.score(embedding));
+        onProgress?.call(timesMs.length, total);
+      }
+      await reader.cancel();
       await errors;
       await process.exitCode;
     } finally {
+      await reader.cancel();
       process.kill();
     }
     final totalMs = DateTime.now().difference(started).inMilliseconds;
@@ -323,3 +345,6 @@ class AnalysisService {
 
 const clipImageSize = 224;
 const clipFrameBytes = clipImageSize * clipImageSize * 3;
+
+/// 採点待ちのフレームを溜める上限（1枚約147KB）。超えたら読み取りを一時停止する。
+const _frameQueueLimit = 32;
