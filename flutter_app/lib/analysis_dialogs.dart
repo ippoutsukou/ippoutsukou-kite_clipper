@@ -152,6 +152,8 @@ class AnalysisResultDialog extends StatelessWidget {
               Text('競技モデル：$sportId'),
               Text(
                   '解析したフレーム：${result.frames}枚（動画の長さ ${_time(result.durationMs)}）'),
+              if (result.frames >= 2)
+                Text('実際の間隔：約${(result.averageIntervalMs / 1000).toStringAsFixed(1)}秒'),
               if (result.cancelled)
                 const Text('中止したため、途中までの結果です。',
                     style: TextStyle(color: Color(0xffa33a3a))),

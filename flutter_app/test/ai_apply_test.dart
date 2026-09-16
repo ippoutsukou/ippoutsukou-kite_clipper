@@ -93,6 +93,23 @@ void main() {
     ]);
   });
 
+  test('キーフレームが粗すぎる動画では使わない', () {
+    // 約1秒間隔：そのまま使える。
+    expect(keyframesUsable([0, 950, 1900, 2850, 3800], 1000), isTrue);
+    // 2秒間隔でも1秒指定の3倍以内なら使う（粒度は2秒になる）。
+    expect(keyframesUsable([0, 2000, 4000, 6000], 1000), isTrue);
+    // 5秒間隔は1秒指定に対して粗すぎる。
+    expect(keyframesUsable([0, 5000, 10000, 15000], 1000), isFalse);
+    // 同じ5秒間隔でも2秒指定なら許容範囲。
+    expect(keyframesUsable([0, 5000, 10000, 15000], 2000), isTrue);
+    // 1枚しかない・空・不正な間隔は使えない。
+    expect(keyframesUsable([0], 1000), isFalse);
+    expect(keyframesUsable([], 1000), isFalse);
+    expect(keyframesUsable([0, 1000], 0), isFalse);
+    // 一部だけ間隔が空いていても、中央値で判断する。
+    expect(keyframesUsable([0, 1000, 2000, 3000, 20000], 1000), isTrue);
+  });
+
   test('上限フレーム数を超える動画は間隔を広げる', () {
     // 1時間（3600枚）はそのまま。
     expect(

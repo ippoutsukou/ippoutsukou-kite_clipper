@@ -14,6 +14,19 @@ const maxAnalysisFrames = 3600;
 Future<SportModel> loadSportModel(String id) async =>
     SportModel.fromJson(await rootBundle.loadString('assets/models/$id.json'));
 
+/// キーフレームだけで希望の粒度を保てるか。
+///
+/// キーフレームの間隔は動画によって違う（実測：GoPro 0.94秒、別の動画 2.0秒）。
+/// 間隔が希望の3倍を超えて粗い場合は、キーフレーム方式では粒度が足りないため使わない。
+bool keyframesUsable(List<int> timesMs, int intervalMs) {
+  if (timesMs.length < 2 || intervalMs <= 0) return false;
+  final gaps = [
+    for (var i = 1; i < timesMs.length; i++) timesMs[i] - timesMs[i - 1]
+  ]..sort();
+  final median = gaps[gaps.length ~/ 2];
+  return median <= intervalMs * 3;
+}
+
 /// 動画の長さと希望の間隔から、上限に収まる間隔を決める。
 int resolveIntervalMs(
     {required int durationMs, required int wantedMs, int maxFrames = maxAnalysisFrames}) {
@@ -54,6 +67,11 @@ class AnalysisResult {
   final bool cancelled;
 
   int get frames => timesMs.length;
+
+  /// 実際に採点したフレームの平均間隔（ミリ秒）。
+  /// キーフレーム方式では動画のキーフレーム間隔に依存するため、希望どおりとは限らない。
+  double get averageIntervalMs =>
+      frames < 2 ? 0 : (timesMs.last - timesMs.first) / (frames - 1);
 
   /// 動画1分あたりの解析時間（秒）。解析できた範囲から換算する。
   double get secondsPerVideoMinute {
@@ -163,8 +181,9 @@ class AnalysisService {
     final durationMs = await _probeDurationMs(source);
     if (durationMs <= 0) throw StateError('動画の長さを取得できませんでした');
     final keyframes = await _probeKeyframeTimesMs(source);
-    // キーフレームを取得できない動画では、間隔指定で取り出す方式に切り替える（遅いが確実）。
-    final useKeyframes = keyframes.length >= 2;
+    // キーフレームを取得できない動画や、間隔が粗すぎる動画では、
+    // 間隔指定で取り出す方式に切り替える（遅いが希望の粒度を保てる）。
+    final useKeyframes = keyframesUsable(keyframes, intervalMs);
     final wanted = <int>{};
     if (useKeyframes) {
       // 希望間隔に満たない間隔のキーフレームは採点しない（キーフレームより細かくはできない）。
