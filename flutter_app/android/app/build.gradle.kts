@@ -28,6 +28,21 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // 実機（arm64）向けのライブラリだけを含める指定。ただしFlutterのdebugビルドでは
+        // 後から上書きされて効かないため、実際の除外は下の packaging で行う。
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    // 実機（arm64）以外のネイティブライブラリをAPKに含めない。
+    // 再生エンジンやONNX Runtimeはプラグイン由来のため、パッケージ段階で除外する。
+    // x86_64のエミュレータでは動かなくなる。
+    packaging {
+        jniLibs {
+            excludes += listOf("lib/x86_64/**", "lib/x86/**", "lib/armeabi-v7a/**")
+        }
     }
 
     buildTypes {
