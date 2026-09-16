@@ -26,6 +26,9 @@ import 'analysis_service.dart';
 import 'analysis_dialogs.dart';
 import 'video_picker.dart';
 
+/// ビルド時に --dart-define=BUILD_LABEL=... で埋め込む。未指定なら dev。
+const buildLabel = String.fromEnvironment('BUILD_LABEL', defaultValue: 'dev');
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
@@ -1058,9 +1061,14 @@ class _WorkspaceState extends State<Workspace> {
                   icon: const Icon(Icons.video_library_outlined,
                       color: Color(0xff1664dd)))
               : const Icon(Icons.sailing, color: Color(0xff1664dd)),
-          title: Text(source == null ? 'Kite Clipper' : 'クリップを確認',
-              style: const TextStyle(
-                  fontWeight: FontWeight.w700, color: Color(0xff14213d))),
+          title: Column(mainAxisSize: MainAxisSize.min, children: [
+            Text(source == null ? 'Kite Clipper' : 'クリップを確認',
+                style: const TextStyle(
+                    fontWeight: FontWeight.w700, color: Color(0xff14213d))),
+            // どのビルドを起動しているか見分けるための表示。
+            const Text('ビルド $buildLabel',
+                style: TextStyle(fontSize: 11, color: Color(0xff6b7280))),
+          ]),
           centerTitle: true,
           actions: [
             TextButton(
