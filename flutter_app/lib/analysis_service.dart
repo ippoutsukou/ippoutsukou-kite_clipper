@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 
@@ -43,6 +42,7 @@ class AnalysisResult {
     required this.durationMs,
     required this.timesMs,
     required this.scores,
+    this.scoresByModel = const {},
     required this.modelMs,
     required this.extractMs,
     required this.inferMs,
@@ -53,7 +53,13 @@ class AnalysisResult {
 
   final int durationMs;
   final List<int> timesMs;
+
+  /// 選択した競技モデルの点数。
   final List<double> scores;
+
+  /// 競技モデルごとの点数（キーは競技ID）。
+  /// 保存済みの結果から作った場合は、選択したモデルのみを含む。
+  final Map<String, List<double>> scoresByModel;
 
   /// モデルの読み込み（初回のみ時間がかかる）。
   final int modelMs;
@@ -81,17 +87,28 @@ class AnalysisResult {
     return totalMs / analyzedMs * 60;
   }
 
-  factory AnalysisResult.fromMap(Map<String, Object?> map) {
+  /// ネイティブ側からの結果を読む。点数はモデルごとに、渡した競技IDと同じ並びで返る。
+  factory AnalysisResult.fromMap(
+      Map<String, Object?> map, List<String> modelIds) {
     int number(String key) => (map[key] as num?)?.toInt() ?? 0;
     final times = (map['timesMs'] as List?) ?? const [];
-    final scores = (map['scores'] as List?) ?? const [];
-    if (times.length != scores.length) {
-      throw const FormatException('解析結果の件数が一致しません');
+    final raw = (map['scores'] as List?) ?? const [];
+    if (raw.length != modelIds.length) {
+      throw const FormatException('解析結果のモデル数が一致しません');
+    }
+    final byModel = <String, List<double>>{};
+    for (var i = 0; i < modelIds.length; i++) {
+      final column = (raw[i] as List?) ?? const [];
+      if (column.length != times.length) {
+        throw const FormatException('解析結果の件数が一致しません');
+      }
+      byModel[modelIds[i]] = [for (final v in column) (v as num).toDouble()];
     }
     return AnalysisResult(
       durationMs: number('durationMs'),
       timesMs: [for (final value in times) (value as num).toInt()],
-      scores: [for (final value in scores) (value as num).toDouble()],
+      scores: byModel[modelIds.first]!,
+      scoresByModel: byModel,
       modelMs: number('modelMs'),
       extractMs: number('extractMs'),
       inferMs: number('inferMs'),
@@ -114,17 +131,21 @@ class AnalysisService {
   /// Windowsの解析を中止するための印。
   bool _cancelRequested = false;
 
+  /// [others] を渡すと、同じ取り出し結果を使って他の競技モデルでも採点する。
+  /// CLIPの計算は共通のため、モデルを増やしても所要時間はほとんど変わらない。
   Future<AnalysisResult> analyze({
     required String source,
     required SportModel model,
+    List<SportModel> others = const [],
     int? intervalMs,
     void Function(int done, int total)? onProgress,
   }) async {
     final interval = intervalMs ?? model.frameIntervalMs;
+    final models = [model, ...others];
     if (Platform.isWindows) {
       return _analyzeWindows(
           source: source,
-          model: model,
+          models: models,
           intervalMs: interval,
           onProgress: onProgress);
     }
@@ -148,11 +169,11 @@ class AnalysisService {
         'source': source,
         'intervalMs': interval,
         'maxFrames': maxAnalysisFrames,
-        'coef': model.coefficients,
-        'intercept': model.intercept,
+        'coefs': [for (final m in models) m.coefficients],
+        'intercepts': [for (final m in models) m.intercept],
       });
       if (result == null) throw StateError('解析結果を受け取れませんでした');
-      return AnalysisResult.fromMap(result);
+      return AnalysisResult.fromMap(result, [for (final m in models) m.id]);
     } finally {
       channel.setMethodCallHandler(null);
     }
@@ -173,7 +194,7 @@ class AnalysisService {
   /// 希望の間隔より細かい分は読み飛ばす。前処理（短辺リサイズ→中央切り出し）はFFmpegに任せる。
   Future<AnalysisResult> _analyzeWindows({
     required String source,
-    required SportModel model,
+    required List<SportModel> models,
     required int intervalMs,
     void Function(int done, int total)? onProgress,
   }) async {
@@ -201,94 +222,103 @@ class AnalysisService {
         : (durationMs / intervalMs).ceil().clamp(1, maxAnalysisFrames);
     final filter = 'scale=$clipImageSize:$clipImageSize:'
         'force_original_aspect_ratio=increase,crop=$clipImageSize:$clipImageSize';
-    final process = await Process.start(await _ffmpeg(), [
-      '-v', 'error', '-nostdin',
-      if (useKeyframes) ...['-skip_frame', 'nokey'],
-      '-i', source,
-      if (useKeyframes) ...['-fps_mode', 'passthrough'],
-      '-vf',
-      useKeyframes
-          ? filter
-          : 'fps=${(1000 / intervalMs).toStringAsFixed(6)},$filter',
-      '-pix_fmt', 'rgb24', '-f', 'rawvideo', 'pipe:1',
-    ]);
-    final errors = process.stderr.drain<void>();
+    // 取り出しと採点を「時間的に」分ける。採点は画面と同じ流れで動くため、
+    // 読み取りと同時に進めても順番待ちになり効果がなかった（実測で確認）。
+    // 先に全フレームを一時ファイルへ書き出すと、取り出し中は採点が挟まらず本来の速度が出る。
+    final temp = File('${Directory.systemTemp.path}${Platform.pathSeparator}'
+        'kite_clipper_${DateTime.now().millisecondsSinceEpoch}.rgb');
     final timesMs = <int>[];
-    final scores = <double>[];
+    // 競技モデルごとの点数。採点は係数との内積のみのため、モデルを増やしても負担は小さい。
+    final byModel = {for (final m in models) m.id: <double>[]};
+    var extractMs = 0;
     var inferMs = 0;
     var truncated = false;
-    var index = 0;
-    final buffer = BytesBuilder(copy: false);
-    // 採点を待つ間もFFmpegからの読み取りを続ける。1枚ずつ待つと読み取りが止まり、
-    // 長い動画ほど停止が積み上がって遅くなるため、取り出しと採点を分ける。
-    final queue = <({int timeMs, Uint8List frame})>[];
-    var reading = true;
-    late final StreamSubscription<List<int>> reader;
-    reader = process.stdout.listen((chunk) {
-      buffer.add(chunk);
-      while (buffer.length >= clipFrameBytes) {
-        final bytes = buffer.takeBytes();
-        final frame = Uint8List.sublistView(bytes, 0, clipFrameBytes);
-        buffer.add(Uint8List.sublistView(bytes, clipFrameBytes));
-        // キーフレーム方式では ffprobe の時刻と取り出した順番を対応させる。
-        final int time;
-        if (useKeyframes) {
-          if (index >= keyframes.length) {
-            truncated = true;
-            reading = false;
-            return;
-          }
-          time = keyframes[index++];
-          if (!wanted.contains(time)) continue;
-        } else {
-          if (index >= maxAnalysisFrames) {
-            truncated = true;
-            reading = false;
-            return;
-          }
-          time = index++ * intervalMs;
-        }
-        queue.add((timeMs: time, frame: frame));
-      }
-      // 溜まりすぎたら読み取りを止め、採点が進んだら再開する。
-      if (queue.length >= _frameQueueLimit) reader.pause();
-    }, onDone: () => reading = false, onError: (Object _) => reading = false);
     try {
-      while (reading || queue.isNotEmpty) {
-        if (_cancelRequested) break;
-        if (queue.isEmpty) {
-          await Future<void>.delayed(const Duration(milliseconds: 2));
-          continue;
+      // 1) 取り出し：採点を挟まずに一気に書き出す。
+      final extractStart = DateTime.now();
+      final process = await Process.start(await _ffmpeg(), [
+        '-v', 'error', '-nostdin',
+        if (useKeyframes) ...['-skip_frame', 'nokey'],
+        '-i', source,
+        if (useKeyframes) ...['-fps_mode', 'passthrough'],
+        '-vf',
+        useKeyframes
+            ? filter
+            : 'fps=${(1000 / intervalMs).toStringAsFixed(6)},$filter',
+        '-pix_fmt', 'rgb24', '-f', 'rawvideo', 'pipe:1',
+      ]);
+      final errors = process.stderr.drain<void>();
+      // 書き出した大きさから取り出しの進捗を出す。中止もここで受ける。
+      final ticker = Timer.periodic(const Duration(milliseconds: 200), (_) {
+        if (_cancelRequested) {
+          process.kill();
+          return;
         }
-        final item = queue.removeAt(0);
-        if (reader.isPaused && queue.length <= _frameQueueLimit ~/ 2) {
-          reader.resume();
-        }
-        final inferStart = DateTime.now();
-        final embedding = await clipChannel
-            .invokeListMethod<double>('embed', {'pixels': item.frame});
-        inferMs += DateTime.now().difference(inferStart).inMilliseconds;
-        if (embedding == null || embedding.length != SportModel.embeddingSize) {
-          throw StateError('CLIPの結果を受け取れませんでした');
-        }
-        timesMs.add(item.timeMs);
-        scores.add(model.score(embedding));
-        onProgress?.call(timesMs.length, total);
+        if (!temp.existsSync()) return;
+        onProgress?.call(
+            (temp.lengthSync() ~/ clipFrameBytes).clamp(0, total), total);
+      });
+      try {
+        await process.stdout.pipe(temp.openWrite());
+        await errors;
+        await process.exitCode;
+      } finally {
+        ticker.cancel();
       }
-      await reader.cancel();
-      await errors;
-      await process.exitCode;
+      extractMs = DateTime.now().difference(extractStart).inMilliseconds;
+
+      // 2) 採点：書き出した順番と ffprobe の時刻を対応させながら1枚ずつ。
+      final file = await temp.open();
+      try {
+        final count = (await temp.length()) ~/ clipFrameBytes;
+        for (var index = 0; index < count; index++) {
+          if (_cancelRequested) break;
+          final int time;
+          if (useKeyframes) {
+            if (index >= keyframes.length) {
+              truncated = true;
+              break;
+            }
+            time = keyframes[index];
+            if (!wanted.contains(time)) continue;
+          } else {
+            if (timesMs.length >= maxAnalysisFrames) {
+              truncated = true;
+              break;
+            }
+            time = index * intervalMs;
+          }
+          await file.setPosition(index * clipFrameBytes);
+          final Uint8List frame = await file.read(clipFrameBytes);
+          final inferStart = DateTime.now();
+          final embedding = await clipChannel
+              .invokeListMethod<double>('embed', {'pixels': frame});
+          inferMs += DateTime.now().difference(inferStart).inMilliseconds;
+          if (embedding == null ||
+              embedding.length != SportModel.embeddingSize) {
+            throw StateError('CLIPの結果を受け取れませんでした');
+          }
+          timesMs.add(time);
+          for (final m in models) {
+            byModel[m.id]!.add(m.score(embedding));
+          }
+          onProgress?.call(timesMs.length, total);
+        }
+      } finally {
+        await file.close();
+      }
     } finally {
-      await reader.cancel();
-      process.kill();
+      // 自分で作った一時ファイルだけを消す。
+      if (await temp.exists()) await temp.delete();
     }
     final totalMs = DateTime.now().difference(started).inMilliseconds;
     return AnalysisResult(
       durationMs: durationMs,
       timesMs: timesMs,
-      scores: scores,
+      scores: byModel[models.first.id]!,
+      scoresByModel: byModel,
       modelMs: 0,
-      extractMs: (totalMs - inferMs).clamp(0, totalMs),
+      extractMs: extractMs,
       inferMs: inferMs,
       totalMs: totalMs,
       truncated: truncated,
@@ -345,6 +375,3 @@ class AnalysisService {
 
 const clipImageSize = 224;
 const clipFrameBytes = clipImageSize * clipImageSize * 3;
-
-/// 採点待ちのフレームを溜める上限（1枚約147KB）。超えたら読み取りを一時停止する。
-const _frameQueueLimit = 32;

@@ -126,9 +126,12 @@ class MainActivity : FlutterActivity() {
                 val source = call.argument<String>("source")
                 val intervalMs = call.argument<Number>("intervalMs")?.toLong() ?: 1000L
                 val maxFrames = call.argument<Number>("maxFrames")?.toInt() ?: 300
-                val coefficients = call.argument<List<Double>>("coef")
-                val intercept = call.argument<Number>("intercept")?.toDouble() ?: 0.0
-                if (source == null || coefficients == null || coefficients.size != CLIP_EMBED_DIM ||
+                // 競技モデルを複数まとめて採点する。CLIPの計算は共通のため追加コストはほぼない。
+                val coefs = call.argument<List<List<Double>>>("coefs")
+                val intercepts = call.argument<List<Double>>("intercepts")
+                if (source == null || coefs == null || intercepts == null ||
+                    coefs.isEmpty() || coefs.size != intercepts.size ||
+                    coefs.any { it.size != CLIP_EMBED_DIM } ||
                     intervalMs < 100 || maxFrames < 1) {
                     result.error("arguments", "解析の指定が不正です", null)
                     return@setMethodCallHandler
@@ -137,7 +140,7 @@ class MainActivity : FlutterActivity() {
                 cancelAnalyze = false
                 analyzeWorker.execute {
                     try {
-                        val measured = analyze(source, intervalMs, maxFrames, coefficients, intercept)
+                        val measured = analyze(source, intervalMs, maxFrames, coefs, intercepts)
                         main.post { analyzing = false; result.success(measured) }
                     } catch (e: Throwable) {
                         // メモリ不足などは Exception ではないため、Throwable で受けてアプリごと落とさない。
@@ -330,7 +333,7 @@ class MainActivity : FlutterActivity() {
      */
     private fun analyze(
         source: String, intervalMs: Long, maxFrames: Int,
-        coefficients: List<Double>, intercept: Double,
+        coefs: List<List<Double>>, intercepts: List<Double>,
     ): Map<String, Any> {
         val started = System.currentTimeMillis()
         val modelStart = System.currentTimeMillis()
@@ -341,7 +344,8 @@ class MainActivity : FlutterActivity() {
 
         val retriever = android.media.MediaMetadataRetriever()
         val timesMs = mutableListOf<Long>()
-        val scores = mutableListOf<Double>()
+        // モデルごとの点数。並び順は受け取った係数と同じ。
+        val scores = List(coefs.size) { mutableListOf<Double>() }
         var extractMs = 0L
         var inferMs = 0L
         var durationMs = 0L
@@ -380,12 +384,14 @@ class MainActivity : FlutterActivity() {
                             var norm = 0.0
                             for (value in raw) norm += value.toDouble() * value
                             norm = Math.sqrt(norm)
-                            var sum = intercept
-                            if (norm > 1e-12) {
-                                for (i in raw.indices) sum += coefficients[i] * (raw[i] / norm)
-                            }
                             timesMs.add(batchTimes[index])
-                            scores.add(1.0 / (1.0 + Math.exp(-sum)))
+                            for ((modelIndex, coefficients) in coefs.withIndex()) {
+                                var sum = intercepts[modelIndex]
+                                if (norm > 1e-12) {
+                                    for (i in raw.indices) sum += coefficients[i] * (raw[i] / norm)
+                                }
+                                scores[modelIndex].add(1.0 / (1.0 + Math.exp(-sum)))
+                            }
                         }
                     }
                 }

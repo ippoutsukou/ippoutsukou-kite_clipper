@@ -554,6 +554,7 @@ class _WorkspaceState extends State<Workspace> {
     });
 
     SportModel? model;
+    var models = <SportModel>[];
     AnalysisResult? result;
     var fromSaved = false;
     final service = AnalysisService();
@@ -561,7 +562,10 @@ class _WorkspaceState extends State<Workspace> {
     final cancelling = ValueNotifier<bool>(false);
     var dialogOpen = false;
     try {
-      model = await loadSportModel(request.sportId);
+      // 全競技モデルを読み込み、同じ取り出し結果でまとめて採点する。
+      models = [for (final id in sportModelIds) await loadSportModel(id)];
+      model = models.firstWhere((m) => m.id == request.sportId,
+          orElse: () => models.first);
       final reusable = saved != null &&
           !request.reanalyze &&
           saved.matches(
@@ -608,6 +612,7 @@ class _WorkspaceState extends State<Workspace> {
         result = await service.analyze(
             source: item.path,
             model: model,
+            others: [for (final m in models) if (m.id != model.id) m],
             intervalMs: interval,
             onProgress: (done, total) => progress.value = [done, total]);
         item.analysis = AnalysisRecord(
@@ -643,6 +648,18 @@ class _WorkspaceState extends State<Workspace> {
         scores: result.scores,
         model: model,
         durationMs: result.durationMs);
+    // 他の競技モデルでいくつ提案できたかを数える（採点済みの点数を使うだけなので軽い）。
+    final otherCounts = <String, int>{};
+    for (final other in models) {
+      final otherScores = result.scoresByModel[other.id];
+      if (other.id == model.id || otherScores == null) continue;
+      otherCounts[other.id] = buildProposedSegments(
+              timesMs: result.timesMs,
+              scores: otherScores,
+              model: other,
+              durationMs: result.durationMs)
+          .length;
+    }
     await showDialog<void>(
         context: context,
         builder: (_) => AnalysisResultDialog(
@@ -650,6 +667,7 @@ class _WorkspaceState extends State<Workspace> {
             segments: proposals,
             sportId: request.sportId,
             fromSaved: fromSaved,
+            otherCounts: otherCounts,
             onApply: () => applyProposals(item, proposals)));
   }
 

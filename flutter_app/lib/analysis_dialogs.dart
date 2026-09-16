@@ -132,6 +132,7 @@ class AnalysisResultDialog extends StatelessWidget {
       required this.segments,
       required this.sportId,
       required this.fromSaved,
+      this.otherCounts = const {},
       this.onApply});
   final AnalysisResult result;
   final List<ProposedSegment> segments;
@@ -139,6 +140,9 @@ class AnalysisResultDialog extends StatelessWidget {
 
   /// 保存済みの結果から作った提案か。
   final bool fromSaved;
+
+  /// 他の競技モデルで採点した場合の提案数（キーは競技ID）。
+  final Map<String, int> otherCounts;
   final VoidCallback? onApply;
 
   @override
@@ -178,6 +182,15 @@ class AnalysisResultDialog extends StatelessWidget {
                 Text('　${_time(segment.startMs)} 〜 ${_time(segment.endMs)}'
                     '（${_seconds(segment.lengthMs)}秒・平均${segment.meanScore.toStringAsFixed(2)}）'),
               if (segments.length > 20) Text('　ほか${segments.length - 20}個'),
+              if (otherCounts.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                const Text('他の競技モデルでの提案数',
+                    style: TextStyle(fontWeight: FontWeight.w700)),
+                for (final entry in otherCounts.entries)
+                  Text('　${entry.key}：${entry.value}個'),
+                const Text('合わないモデルを選ぶと0個や全体が1区間になります。撮り方に近いものを選んでください。',
+                    style: TextStyle(fontSize: 12, color: Colors.blueGrey)),
+              ],
               const SizedBox(height: 10),
               const Text('追加すると、区間として編集・保存できます。元動画は変更しません。',
                   style: TextStyle(fontSize: 12, color: Colors.blueGrey)),
