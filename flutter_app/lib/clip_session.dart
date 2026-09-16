@@ -8,6 +8,79 @@ class ClipSegment {
   String? output;
 }
 
+/// 1動画分のAI解析結果。同じ条件なら再解析せずに使い回す。
+class AnalysisRecord {
+  const AnalysisRecord({
+    required this.sportId,
+    required this.intervalMs,
+    required this.durationMs,
+    required this.timesMs,
+    required this.scores,
+    this.partial = false,
+  });
+  final String sportId;
+  final int intervalMs;
+  final int durationMs;
+  final List<int> timesMs;
+  final List<double> scores;
+
+  /// 中止して途中まで解析した結果か。
+  final bool partial;
+
+  bool matches(
+          {required String sportId,
+          required int intervalMs,
+          required int durationMs}) =>
+      !partial &&
+      this.sportId == sportId &&
+      this.intervalMs == intervalMs &&
+      this.durationMs == durationMs;
+
+  Map<String, Object?> toJson() => {
+        'sportId': sportId,
+        'intervalMs': intervalMs,
+        'durationMs': durationMs,
+        'partial': partial,
+        'timesMs': timesMs,
+        'scores': [for (final score in scores) double.parse(score.toStringAsFixed(3))],
+      };
+
+  /// 記録が壊れている場合は FormatException（解析結果だけ捨てて動画は残す）。
+  factory AnalysisRecord.fromJson(Object? raw) {
+    if (raw is! Map) throw const FormatException('解析結果の記録が不正です');
+    final sportId = raw['sportId'];
+    final intervalMs = raw['intervalMs'];
+    final durationMs = raw['durationMs'];
+    final times = raw['timesMs'];
+    final scores = raw['scores'];
+    if (sportId is! String ||
+        sportId.isEmpty ||
+        intervalMs is! int ||
+        intervalMs <= 0 ||
+        durationMs is! int ||
+        durationMs <= 0 ||
+        times is! List ||
+        scores is! List ||
+        times.length != scores.length) {
+      throw const FormatException('解析結果の記録が不正です');
+    }
+    return AnalysisRecord(
+      sportId: sportId,
+      intervalMs: intervalMs,
+      durationMs: durationMs,
+      partial: raw['partial'] == true,
+      timesMs: [
+        for (final value in times)
+          value is int ? value : throw const FormatException('時刻が不正です')
+      ],
+      scores: [
+        for (final value in scores)
+          value is num ? value.toDouble() : throw const FormatException('点数が不正です')
+      ],
+    );
+  }
+}
+
 class ClipItem {
   ClipItem(this.path);
   static const maxSegments = 20;
@@ -18,6 +91,9 @@ class ClipItem {
   int? durationMs;
   Uint8List? thumbnail;
   String? error;
+
+  /// 直近のAI解析結果（作業記録に保存する）。
+  AnalysisRecord? analysis;
 
   /// 長さ確定前は空。確定後は常に1〜20件。
   final List<ClipSegment> _segments = [];
@@ -124,6 +200,28 @@ class ClipItem {
     }
     _segments.add(
         ClipSegment(start, math.min(duration, start + newSegmentMs)));
+    return _active = _segments.length - 1;
+  }
+
+  /// 触っていない初期状態（全体1区間・保存結果なし）か。AI提案で置き換えてよい状態。
+  bool get isUntouchedDefault =>
+      durationMs != null &&
+      _segments.length == 1 &&
+      _segments[0].startMs == 0 &&
+      _segments[0].endMs == durationMs &&
+      _segments[0].output == null;
+
+  /// 範囲を指定して区間を追加し、その区間を選ぶ（AIの提案を入れるために使う）。
+  int addSegmentRange(int start, int end) {
+    final duration = durationMs;
+    if (duration == null) throw StateError('動画の長さが未確認です');
+    if (_segments.length >= maxSegments) {
+      throw StateError('区間は1動画につき最大$maxSegments個です');
+    }
+    if (start < 0 || end > duration || end - start < minLengthMs) {
+      throw ArgumentError('区間が不正です');
+    }
+    _segments.add(ClipSegment(start, end));
     return _active = _segments.length - 1;
   }
 

@@ -199,6 +199,51 @@ void main() {
     expect(empty.warning, contains('新しく始めます'));
   });
 
+  test('AI解析の結果も記録し、壊れていればその結果だけ捨てる', () {
+    final session = sample();
+    session.items[0].analysis = const AnalysisRecord(
+        sportId: 'kite',
+        intervalMs: 1000,
+        durationMs: 20000,
+        timesMs: [0, 1000],
+        scores: [0.123456, 0.9]);
+    final restored = decodeSession(encodeSession(session), exists: (_) => true);
+    final analysis = restored.session.items[0].analysis!;
+    expect(analysis.sportId, 'kite');
+    expect(analysis.intervalMs, 1000);
+    expect(analysis.timesMs, [0, 1000]);
+    expect(analysis.scores, [0.123, 0.9]); // 小数3桁に丸めて保存する
+    expect(analysis.partial, isFalse);
+    expect(
+        analysis.matches(sportId: 'kite', intervalMs: 1000, durationMs: 20000),
+        isTrue);
+    expect(
+        analysis.matches(sportId: 'wing', intervalMs: 1000, durationMs: 20000),
+        isFalse);
+    expect(restored.session.items[2].analysis, isNull);
+
+    // 中止した部分結果は使い回さない。
+    const partial = AnalysisRecord(
+        sportId: 'kite',
+        intervalMs: 1000,
+        durationMs: 20000,
+        timesMs: [0],
+        scores: [0.5],
+        partial: true);
+    expect(
+        partial.matches(sportId: 'kite', intervalMs: 1000, durationMs: 20000),
+        isFalse);
+
+    // 件数が合わない記録は解析結果だけ捨て、動画と区間は残す。
+    final broken = jsonDecode(encodeSession(session)) as Map<String, dynamic>;
+    (broken['items'] as List)[0]['analysis']['scores'] = [0.1];
+    final loaded = decodeSession(jsonEncode(broken));
+    expect(loaded.session.items.length, 3);
+    expect(loaded.session.items[0].analysis, isNull);
+    expect(loaded.session.items[0].segments.length, 2);
+    expect(loaded.skipped, 0);
+  });
+
   test('ClipItem.restore は不正な区間を拒否し、元の状態を変えない', () {
     final item = ClipItem('a.mp4')..setDuration(9000);
     expect(

@@ -31,6 +31,7 @@ String encodeSession(ClipSession session, {DateTime? now}) =>
             'path': item.path,
             'durationMs': item.durationMs,
             'activeSegment': item.activeSegment,
+            'analysis': item.analysis?.toJson(),
             'segments': [
               for (final segment in item.segments)
                 {
@@ -77,6 +78,15 @@ RestoredSession decodeSession(String text,
           segments: [for (final s in segments) _segment(s)],
           activeSegment: active is int ? active : 0);
       if (exists != null && !exists(path)) item.error = missingSourceMessage;
+      // 解析結果が壊れている場合は、その結果だけ捨てて動画と区間は残す。
+      final analysis = raw['analysis'];
+      if (analysis != null) {
+        try {
+          item.analysis = AnalysisRecord.fromJson(analysis);
+        } on FormatException {
+          item.analysis = null;
+        }
+      }
     } catch (_) {
       if (item != null) session.remove(item);
       skipped++;

@@ -7,6 +7,7 @@ project(runner LANGUAGES CXX)
 #
 # Any new source files that you add to the application should be added here.
 add_executable(${BINARY_NAME} WIN32
+  "clip_embedder.cpp"
   "flutter_window.cpp"
   "main.cpp"
   "utils.cpp"
@@ -30,11 +31,23 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "FLUTTER_VERSION_BUILD=${FLUTT
 # Disable Windows macros that collide with C++ standard library functions.
 target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 
+# ソースをUTF-8として読む（日本語コメントが文字化けし、警告C4819が/WXでエラーになるため）。
+target_compile_options(${BINARY_NAME} PRIVATE "/utf-8")
+
 # Add dependency libraries and include directories. Add any application-specific
 # dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
+
+# AI解析（CLIP推論）用。vendor/onnxruntime は配布用バイナリと同じくGit管理外。
+set(ONNXRUNTIME_DIR "${CMAKE_SOURCE_DIR}/../../vendor/onnxruntime/windows-x64")
+target_include_directories(${BINARY_NAME} PRIVATE "${ONNXRUNTIME_DIR}/include")
+target_link_libraries(${BINARY_NAME} PRIVATE "${ONNXRUNTIME_DIR}/lib/onnxruntime.lib")
+add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${ONNXRUNTIME_DIR}/lib/onnxruntime.dll"
+    "$<TARGET_FILE_DIR:${BINARY_NAME}>")
 
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)

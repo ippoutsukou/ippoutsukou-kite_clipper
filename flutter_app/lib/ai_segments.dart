@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'clip_session.dart';
+
 /// 競技ごとの判定モデル。frame_scorer.py の学習結果（CLIP埋め込み＋ロジスティック回帰）を
 /// 係数だけ書き出したもの。assets/models/<id>.json と対応する。
 class SportModel {
@@ -82,6 +84,49 @@ class ProposedSegment {
   final int endMs;
   final double meanScore;
   int get lengthMs => endMs - startMs;
+}
+
+/// AIの提案を一覧へ反映した結果。
+class AppliedSegments {
+  const AppliedSegments(
+      {required this.added, required this.skipped, required this.replaced});
+
+  /// 実際に追加した区間数。
+  final int added;
+
+  /// 上限のため追加できなかった区間数。
+  final int skipped;
+
+  /// 触っていない初期区間を置き換えたか。
+  final bool replaced;
+}
+
+/// 提案区間を動画へ反映する。初期状態なら置き換え、そうでなければ既存の後ろに足す。
+/// 上限（20区間）を超える分は追加しない。最初に追加した区間を選んだ状態で返す。
+AppliedSegments applyProposedSegments(
+    ClipItem item, List<ProposedSegment> proposals) {
+  if (proposals.isEmpty) {
+    return const AppliedSegments(added: 0, skipped: 0, replaced: false);
+  }
+  final replace = item.isUntouchedDefault;
+  var added = 0;
+  var firstIndex = -1;
+  for (final proposal in proposals) {
+    if (item.segments.length >= ClipItem.maxSegments) break;
+    final index = item.addSegmentRange(proposal.startMs, proposal.endMs);
+    if (added == 0) {
+      firstIndex = index;
+      // 触っていない初期区間は、最初の提案を入れてから取り除く。
+      if (replace) {
+        item.removeSegment(0);
+        firstIndex = 0;
+      }
+    }
+    added++;
+  }
+  if (firstIndex >= 0) item.selectSegment(firstIndex);
+  return AppliedSegments(
+      added: added, skipped: proposals.length - added, replaced: replace);
 }
 
 /// 移動平均（窓＝window、中央寄せ）。segment_simulator.py の smooth_scores と同じ。

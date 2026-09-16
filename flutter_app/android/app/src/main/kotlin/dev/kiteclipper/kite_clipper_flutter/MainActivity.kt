@@ -44,6 +44,9 @@ class MainActivity : FlutterActivity() {
     private val analyzeWorker = Executors.newSingleThreadExecutor()
     private var analyzing = false
     private var clipSession: OrtSession? = null
+    // 進捗通知に使う。中止フラグは解析スレッドから読むため @Volatile。
+    private var analyzeChannel: MethodChannel? = null
+    @Volatile private var cancelAnalyze = false
     private val main = Handler(Looper.getMainLooper())
 
     private fun isBusy() =
@@ -109,8 +112,15 @@ class MainActivity : FlutterActivity() {
                     result.error("picker", "動画を選ぶ画面を開けません", null)
                 }
             }
-        MethodChannel(engine.dartExecutor.binaryMessenger, "kite_clipper/analyze")
-            .setMethodCallHandler { call, result ->
+        val analyze = MethodChannel(engine.dartExecutor.binaryMessenger, "kite_clipper/analyze")
+        analyzeChannel = analyze
+        analyze.setMethodCallHandler { call, result ->
+                if (call.method == "cancelAnalyze") {
+                    // 処理中の1枚が終わった時点で止める。
+                    cancelAnalyze = true
+                    result.success(null)
+                    return@setMethodCallHandler
+                }
                 if (call.method != "analyze") { result.notImplemented(); return@setMethodCallHandler }
                 if (analyzing) { result.error("busy", "解析中です", null); return@setMethodCallHandler }
                 val source = call.argument<String>("source")
@@ -124,6 +134,7 @@ class MainActivity : FlutterActivity() {
                     return@setMethodCallHandler
                 }
                 analyzing = true
+                cancelAnalyze = false
                 analyzeWorker.execute {
                     try {
                         val measured = analyze(source, intervalMs, maxFrames, coefficients, intercept)
@@ -335,6 +346,7 @@ class MainActivity : FlutterActivity() {
         var inferMs = 0L
         var durationMs = 0L
         var truncated = false
+        var cancelled = false
         try {
             retriever.setDataSource(source)
             durationMs = retriever.extractMetadata(
@@ -382,9 +394,12 @@ class MainActivity : FlutterActivity() {
                 batchTimes.clear()
             }
 
+            val total = minOf(maxFrames.toLong(), (durationMs + intervalMs - 1) / intervalMs).toInt()
             var positionMs = 0L
             while (positionMs < durationMs) {
+                if (cancelAnalyze) { cancelled = true; break }
                 if (timesMs.size + batch.size >= maxFrames) { truncated = true; break }
+                if (timesMs.size % PROGRESS_STEP == 0) notifyProgress(timesMs.size, total)
                 val extractStart = System.currentTimeMillis()
                 val frame = retriever.getScaledFrameAtTime(
                     positionMs * 1000,
@@ -412,7 +427,16 @@ class MainActivity : FlutterActivity() {
             "inferMs" to inferMs,
             "totalMs" to (System.currentTimeMillis() - started),
             "truncated" to truncated,
+            "cancelled" to cancelled,
         )
+    }
+
+    /** 解析の進捗をDart側へ知らせる（画面表示用。失敗しても解析は続ける）。 */
+    private fun notifyProgress(done: Int, total: Int) {
+        val channel = analyzeChannel ?: return
+        main.post {
+            runCatching { channel.invokeMethod("progress", mapOf("done" to done, "total" to total)) }
+        }
     }
 
     /** Bitmap の中央224x224を CHW float32 に正規化する（CLIPのmean/std）。 */
@@ -631,6 +655,7 @@ class MainActivity : FlutterActivity() {
         private const val CLIP_IMAGE_SIZE = 224
         // 4K動画でのメモリ不足を避けるため1枚ずつ処理する（速度差は実測で1枚39ms対45ms程度）。
         private const val BATCH_SIZE = 1
+        private const val PROGRESS_STEP = 8
         private val CLIP_MEAN = floatArrayOf(0.48145466f, 0.4578275f, 0.40821073f)
         private val CLIP_STD = floatArrayOf(0.26862954f, 0.26130258f, 0.27577711f)
     }

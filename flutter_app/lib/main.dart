@@ -528,66 +528,108 @@ class _WorkspaceState extends State<Workspace> {
     }
   }
 
-  /// AI候補の速度測定。競技を選び、端末内で解析して所要時間と提案区間を表示する。
-  /// この段階では区間の自動追加・保存は行わない。
+  /// AI候補の提案。競技と間隔を選び、端末内で解析して区間を提案する。
+  /// 同じ条件の保存済み結果があれば解析せずに使う。
   Future<void> runAnalysis() async {
     final item = editing;
     if (busy || loading || item == null) return;
     if (!AnalysisService.supported) {
       ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('この測定用ビルドでは Android のみ解析できます。')));
+          const SnackBar(content: Text('AI解析は現在 Android のみ対応しています。')));
       return;
     }
-    final chosen = await showDialog<String>(
+    final saved = item.analysis;
+    final request = await showDialog<AnalysisRequest>(
         context: context,
-        builder: (context) => SimpleDialog(
-              title: const Text('AI解析（測定）'),
-              children: [
-                for (final id in sportModelIds)
-                  SimpleDialogOption(
-                      onPressed: () => Navigator.pop(context, id),
-                      child: Text(id == sportId ? '$id（前回）' : id)),
-                const Padding(
-                    padding: EdgeInsets.fromLTRB(24, 8, 24, 0),
-                    child: Text('1秒ごとにフレームを取り出して採点します。最大300フレーム（5分）まで測定します。',
-                        style: TextStyle(fontSize: 12, color: Colors.blueGrey))),
-              ],
-            ));
-    if (!mounted || chosen == null || busy || loading || editing != item) return;
+        builder: (_) => AnalysisStartDialog(
+            sportId: saved?.sportId ?? sportId,
+            savedSportId: saved != null && !saved.partial ? saved.sportId : null,
+            savedIntervalMs:
+                saved != null && !saved.partial ? saved.intervalMs : null));
+    if (!mounted || request == null || busy || loading || editing != item) return;
     setState(() {
-      sportId = chosen;
+      sportId = request.sportId;
       busy = true;
       error = null;
     });
-    unawaited(showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => const AlertDialog(
-            content: Row(children: [
-              CircularProgressIndicator(),
-              SizedBox(width: 16),
-              Expanded(child: Text('AI解析中です。しばらくお待ちください。')),
-            ]))));
+
     SportModel? model;
     AnalysisResult? result;
+    var fromSaved = false;
+    final service = AnalysisService();
+    final progress = ValueNotifier<List<int>>(const [0, 0]);
+    final cancelling = ValueNotifier<bool>(false);
+    var dialogOpen = false;
     try {
-      // 4K動画では再生用と解析用のデコーダーが同時に動くと落ちる端末があるため、先に止める。
-      timelineLoader.cancel();
-      pendingSeek = null;
-      await seekTask;
-      await player.stop();
-      model = await loadSportModel(chosen);
-      result = await AnalysisService().analyze(source: item.path, model: model);
+      model = await loadSportModel(request.sportId);
+      final reusable = saved != null &&
+          !request.reanalyze &&
+          saved.matches(
+              sportId: request.sportId,
+              intervalMs: request.intervalMs,
+              durationMs: durationMs);
+      if (reusable) {
+        fromSaved = true;
+        result = AnalysisResult(
+            durationMs: saved.durationMs,
+            timesMs: saved.timesMs,
+            scores: saved.scores,
+            modelMs: 0,
+            extractMs: 0,
+            inferMs: 0,
+            totalMs: 0,
+            truncated: false,
+            cancelled: false);
+      } else {
+        // 4K動画では再生用と解析用のデコーダーが同時に動くと落ちる端末があるため、先に止める。
+        timelineLoader.cancel();
+        pendingSeek = null;
+        await seekTask;
+        await player.stop();
+        if (!mounted) return;
+        dialogOpen = true;
+        unawaited(showDialog<void>(
+            context: context,
+            barrierDismissible: false,
+            builder: (_) => ValueListenableBuilder<List<int>>(
+                valueListenable: progress,
+                builder: (_, counts, __) => ValueListenableBuilder<bool>(
+                    valueListenable: cancelling,
+                    builder: (_, stopping, __) => AnalysisProgressDialog(
+                        done: counts[0],
+                        total: counts[1],
+                        cancelling: stopping,
+                        onCancel: () {
+                          cancelling.value = true;
+                          unawaited(service.cancel());
+                        })))));
+        final interval = resolveIntervalMs(
+            durationMs: durationMs, wantedMs: request.intervalMs);
+        result = await service.analyze(
+            source: item.path,
+            model: model,
+            intervalMs: interval,
+            onProgress: (done, total) => progress.value = [done, total]);
+        item.analysis = AnalysisRecord(
+            sportId: request.sportId,
+            intervalMs: interval,
+            durationMs: result.durationMs,
+            timesMs: result.timesMs,
+            scores: result.scores,
+            partial: result.cancelled || result.truncated);
+      }
     } catch (e) {
       error = 'AI解析に失敗しました：${describeBatchError(e)}';
     } finally {
       if (mounted) {
-        Navigator.of(context, rootNavigator: true).pop();
+        if (dialogOpen) Navigator.of(context, rootNavigator: true).pop();
         setState(() => busy = false);
       }
+      progress.dispose();
+      cancelling.dispose();
     }
-    // 解析の成否にかかわらず、停止した再生を元の動画・範囲へ戻す。
-    if (mounted && session.items.contains(item)) {
+    // 解析で再生を止めた場合は、元の動画・範囲へ戻す。
+    if (!fromSaved && mounted && session.items.contains(item)) {
       setState(() => loading = true);
       try {
         await openClip(item);
@@ -596,15 +638,35 @@ class _WorkspaceState extends State<Workspace> {
       }
     }
     if (!mounted || result == null || model == null) return;
-    final segments = buildProposedSegments(
+    final proposals = buildProposedSegments(
         timesMs: result.timesMs,
         scores: result.scores,
         model: model,
         durationMs: result.durationMs);
     await showDialog<void>(
         context: context,
-        builder: (context) =>
-            AnalysisResultDialog(result: result!, segments: segments, sportId: chosen));
+        builder: (_) => AnalysisResultDialog(
+            result: result!,
+            segments: proposals,
+            sportId: request.sportId,
+            fromSaved: fromSaved,
+            onApply: () => applyProposals(item, proposals)));
+  }
+
+  /// 提案区間を一覧へ反映する。触っていない初期区間は置き換える。
+  void applyProposals(ClipItem item, List<ProposedSegment> proposals) {
+    if (busy || loading || !identical(editing, item) || proposals.isEmpty) return;
+    rememberActive();
+    final applied = applyProposedSegments(item, proposals);
+    setState(() {});
+    showSegment(item);
+    final notes = [
+      '${applied.added}個の区間を追加しました',
+      if (applied.replaced) '最初からあった区間は置き換えました',
+      if (applied.skipped > 0) '${applied.skipped}個は上限のため追加していません',
+    ];
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(notes.join('。'))));
   }
 
   bool get hasBatchTargets =>
@@ -780,7 +842,7 @@ class _WorkspaceState extends State<Workspace> {
               OutlinedButton.icon(
                 onPressed: busy || loading || editing == null ? null : runAnalysis,
                 icon: const Icon(Icons.auto_awesome, size: 16),
-                label: const Text('AI解析（測定）'),
+                label: const Text('AI解析'),
                 style: OutlinedButton.styleFrom(
                     minimumSize: const Size(0, 36),
                     padding: const EdgeInsets.symmetric(horizontal: 10)),
