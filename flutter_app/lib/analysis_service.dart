@@ -163,23 +163,33 @@ class AnalysisService {
     final durationMs = await _probeDurationMs(source);
     if (durationMs <= 0) throw StateError('動画の長さを取得できませんでした');
     final keyframes = await _probeKeyframeTimesMs(source);
-    if (keyframes.isEmpty) throw StateError('キーフレームを取得できませんでした');
-    // 希望間隔に満たない間隔のキーフレームは採点しない（キーフレームより細かくはできない）。
+    // キーフレームを取得できない動画では、間隔指定で取り出す方式に切り替える（遅いが確実）。
+    final useKeyframes = keyframes.length >= 2;
     final wanted = <int>{};
-    var last = -intervalMs;
-    for (final time in keyframes) {
-      if (time - last < intervalMs - 100) continue;
-      if (wanted.length >= maxAnalysisFrames) break;
-      wanted.add(time);
-      last = time;
+    if (useKeyframes) {
+      // 希望間隔に満たない間隔のキーフレームは採点しない（キーフレームより細かくはできない）。
+      var last = -intervalMs;
+      for (final time in keyframes) {
+        if (time - last < intervalMs - 100) continue;
+        if (wanted.length >= maxAnalysisFrames) break;
+        wanted.add(time);
+        last = time;
+      }
     }
-    final total = wanted.length;
+    final total = useKeyframes
+        ? wanted.length
+        : (durationMs / intervalMs).ceil().clamp(1, maxAnalysisFrames);
+    final filter = 'scale=$clipImageSize:$clipImageSize:'
+        'force_original_aspect_ratio=increase,crop=$clipImageSize:$clipImageSize';
     final process = await Process.start(await _ffmpeg(), [
-      '-v', 'error', '-nostdin', '-skip_frame', 'nokey', '-i', source,
-      '-fps_mode', 'passthrough',
+      '-v', 'error', '-nostdin',
+      if (useKeyframes) ...['-skip_frame', 'nokey'],
+      '-i', source,
+      if (useKeyframes) ...['-fps_mode', 'passthrough'],
       '-vf',
-      'scale=$clipImageSize:$clipImageSize:force_original_aspect_ratio=increase,'
-          'crop=$clipImageSize:$clipImageSize',
+      useKeyframes
+          ? filter
+          : 'fps=${(1000 / intervalMs).toStringAsFixed(6)},$filter',
       '-pix_fmt', 'rgb24', '-f', 'rawvideo', 'pipe:1',
     ]);
     final errors = process.stderr.drain<void>();
@@ -197,13 +207,22 @@ class AnalysisService {
           final bytes = buffer.takeBytes();
           final frame = Uint8List.sublistView(bytes, 0, clipFrameBytes);
           buffer.add(Uint8List.sublistView(bytes, clipFrameBytes));
-          // ffprobeで得た時刻と、取り出した順番を対応させる。
-          if (index >= keyframes.length) {
-            truncated = true;
-            break;
+          // キーフレーム方式では ffprobe の時刻と取り出した順番を対応させる。
+          final int time;
+          if (useKeyframes) {
+            if (index >= keyframes.length) {
+              truncated = true;
+              break;
+            }
+            time = keyframes[index++];
+            if (!wanted.contains(time)) continue;
+          } else {
+            if (index >= maxAnalysisFrames) {
+              truncated = true;
+              break;
+            }
+            time = index++ * intervalMs;
           }
-          final time = keyframes[index++];
-          if (!wanted.contains(time)) continue;
           final inferStart = DateTime.now();
           final embedding = await clipChannel
               .invokeListMethod<double>('embed', {'pixels': frame});
@@ -244,7 +263,8 @@ class AnalysisService {
     ]);
     final times = <int>[];
     for (final line in (result.stdout as String).split('\n')) {
-      final seconds = double.tryParse(line.trim());
+      // 動画によっては "0.966667," のように区切りが付いて出力される。
+      final seconds = double.tryParse(line.split(',').first.trim());
       if (seconds != null && seconds >= 0) times.add((seconds * 1000).round());
     }
     times.sort();
