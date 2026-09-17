@@ -431,6 +431,10 @@ class _WorkspaceState extends State<Workspace> {
                       onRemove: (item) {
                         Navigator.pop(context);
                         unawaited(removeClip(item));
+                      },
+                      onRemoveMany: (items) {
+                        Navigator.pop(context);
+                        unawaited(removeClips(items));
                       })),
             )));
     if (chosen != null && mounted) await selectClip(chosen);
@@ -442,32 +446,54 @@ class _WorkspaceState extends State<Workspace> {
     setState(() => session.move(item, delta));
   }
 
-  Future<void> removeClip(ClipItem item) async {
-    if (busy || loading || !session.items.contains(item)) return;
+  Future<void> removeClip(ClipItem item) => removeClips([item]);
+
+  /// 動画を一覧から外す（1本でも複数でも同じ流れ）。元動画・保存済みファイルは消さない。
+  Future<void> removeClips(List<ClipItem> requested) async {
+    List<ClipItem> targets() =>
+        [for (final item in requested) if (session.items.contains(item)) item];
+    if (busy || loading || targets().isEmpty) return;
+    final shown = targets();
+    const namesShown = 5;
+    final names = [
+      for (final item in shown.take(namesShown)) item.name,
+      if (shown.length > namesShown) 'ほか${shown.length - namesShown}本',
+    ].join('\n');
     final confirmed = await showDialog<bool>(
         context: context,
         builder: (context) => AlertDialog(
-              title: const Text('一覧から外しますか？'),
+              title: Text(shown.length == 1
+                  ? '一覧から外しますか？'
+                  : '${shown.length}本を一覧から外しますか？'),
               content: SingleChildScrollView(
                   child: Text(
-                      '${item.name}\n\nこの動画の編集範囲は一覧から失われます。元動画と保存済みファイルは削除しません。')),
+                      '$names\n\n${shown.length == 1 ? 'この動画' : 'これらの動画'}の編集範囲は一覧から失われます。元動画と保存済みファイルは削除しません。')),
               actions: [
                 TextButton(
                     onPressed: () => Navigator.pop(context, false),
                     child: const Text('キャンセル')),
                 FilledButton(
                     onPressed: () => Navigator.pop(context, true),
-                    child: const Text('一覧から外す')),
+                    child: Text(shown.length == 1
+                        ? '一覧から外す'
+                        : '${shown.length}本を外す')),
               ],
             ));
+    // 確認中に一覧が変わっていても、残っている動画だけを外す。
+    final removing = targets();
     if (!mounted ||
         confirmed != true ||
         busy ||
         loading ||
-        !session.items.contains(item)) return;
+        removing.isEmpty) return;
     rememberActive();
-    if (!identical(session.active, item)) {
-      setState(() => session.remove(item));
+    final active = session.active;
+    if (active == null || !removing.contains(active)) {
+      setState(() {
+        for (final item in removing) {
+          session.remove(item);
+        }
+      });
     } else {
       setState(() => loading = true);
       session.invalidate();
@@ -479,7 +505,11 @@ class _WorkspaceState extends State<Workspace> {
         await seekTask;
         await player.stop();
         if (!mounted) return;
-        session.remove(item);
+        // 開いている動画は最後に外し、残った動画の中から次を選ばせる。
+        for (final item in removing) {
+          if (!identical(item, active)) session.remove(item);
+        }
+        session.remove(active);
         final next = session.active;
         if (next != null) {
           await openClip(next);
@@ -501,9 +531,11 @@ class _WorkspaceState extends State<Workspace> {
         if (mounted) setState(() => loading = false);
       }
     }
-    if (mounted && !session.items.contains(item)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('一覧から外しました。元動画・保存済みファイルはそのままです。')));
+    final removed = removing.where((item) => !session.items.contains(item)).length;
+    if (mounted && removed > 0) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(
+              '${removing.length == 1 ? '' : '$removed本を'}一覧から外しました。元動画・保存済みファイルはそのままです。')));
     }
   }
 
@@ -971,7 +1003,8 @@ class _WorkspaceState extends State<Workspace> {
             enabled: !busy && !loading,
             onSelect: selectClip,
             onMove: moveClip,
-            onRemove: removeClip),
+            onRemove: removeClip,
+            onRemoveMany: removeClips),
       );
 
   Widget editor() => EditorViewport(
