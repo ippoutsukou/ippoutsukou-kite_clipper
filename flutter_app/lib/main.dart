@@ -26,6 +26,9 @@ import 'analysis_service.dart';
 import 'analysis_dialogs.dart';
 import 'video_picker.dart';
 import 'omakase.dart';
+import 'merge_plan.dart';
+import 'merge_service.dart';
+import 'merge_dialogs.dart';
 
 /// ビルド時に --dart-define=BUILD_LABEL=... で埋め込む。未指定なら dev。
 const buildLabel = String.fromEnvironment('BUILD_LABEL', defaultValue: 'dev');
@@ -872,8 +875,105 @@ class _WorkspaceState extends State<Workspace> {
         .showSnackBar(SnackBar(content: Text(notes.join('。'))));
   }
 
+  /// 複数の区間を順につないで1本にする。元動画・既存の保存ファイルは変更しない。
+  Future<void> runMerge() async {
+    if (busy || loading) return;
+    rememberActive();
+    final plan = MergePlan.from(session.items);
+    if (!plan.canMerge) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('つなぐには区間が2個以上必要です。')));
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (_) =>
+            MergeConfirmDialog(plan: plan, android: Platform.isAndroid));
+    if (!mounted || confirmed != true || busy || loading) return;
+    String? directory;
+    if (Platform.isWindows) {
+      directory = await getDirectoryPath(confirmButtonText: 'ここに保存');
+      if (!mounted || directory == null) return;
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('この環境ではまだ1本にまとめられません。')));
+      return;
+    }
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    final service = MergeService();
+    final progress = ValueNotifier<List<int>>(const [0, 0]);
+    final phase = ValueNotifier<MergePhase>(MergePhase.cutting);
+    final cancelling = ValueNotifier<bool>(false);
+    var dialogOpen = false;
+    MergeOutcome? outcome;
+    try {
+      // 4K動画では再生と切り出しが同時に動くと不安定な端末があるため、先に止める。
+      await stopPlaybackForAnalysis();
+      if (!mounted) return;
+      dialogOpen = true;
+      unawaited(showDialog<void>(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) => ListenableBuilder(
+              listenable: Listenable.merge([progress, phase, cancelling]),
+              builder: (_, __) => MergeProgressDialog(
+                  phase: phase.value,
+                  done: progress.value[0],
+                  total: progress.value[1],
+                  cancelling: cancelling.value,
+                  onCancel: () {
+                    cancelling.value = true;
+                    unawaited(service.cancel());
+                  }))));
+      outcome = await service.mergeWindows(
+          entries: plan.entries,
+          directory: directory,
+          onProgress: (current, done, total) {
+            phase.value = current;
+            progress.value = [done, total];
+          });
+    } on MergeCancelled {
+      // 中止は結果を出さない（出力は作られていない）。
+    } on MergeUnsupported catch (e) {
+      error = e.message;
+    } catch (e) {
+      error = '1本にまとめられませんでした：${describeBatchError(e)}';
+    } finally {
+      if (mounted) {
+        if (dialogOpen) Navigator.of(context, rootNavigator: true).pop();
+        setState(() => busy = false);
+      }
+      progress.dispose();
+      phase.dispose();
+      cancelling.dispose();
+    }
+    // 再生を止めたので、元の動画を開き直す。
+    final active = session.active;
+    if (mounted && active != null && session.items.contains(active)) {
+      setState(() => loading = true);
+      try {
+        await openClip(active);
+      } finally {
+        if (mounted) setState(() => loading = false);
+      }
+    }
+    if (!mounted || outcome == null) return;
+    await showDialog<void>(
+        context: context,
+        builder: (_) => MergeResultDialog(
+            outcome: outcome!, entries: plan.entries.length));
+  }
+
   bool get hasBatchTargets =>
       session.items.any((item) => item.segments.isNotEmpty);
+
+  /// つなぐには区間が2個以上必要（元動画の有無は実行時に確かめる）。
+  bool get canMerge =>
+      Platform.isWindows &&
+      session.items.fold<int>(0, (sum, item) => sum + item.segments.length) >= 2;
 
   /// 全動画の全区間を、選んだフォルダへ1件ずつ保存する。
   Future<void> saveAll() async {
@@ -1396,6 +1496,11 @@ class _WorkspaceState extends State<Workspace> {
                         size: 18),
                     label: const Text('すべて保存…'),
                   );
+                  final mergeButton = OutlinedButton.icon(
+                    onPressed: busy || loading || !canMerge ? null : runMerge,
+                    icon: const Icon(Icons.merge_outlined, size: 18),
+                    label: const Text('1本にまとめて保存…'),
+                  );
                   final saveButton = FilledButton.icon(
                     onPressed:
                         source == null || busy || loading || durationMs <= 0
@@ -1417,11 +1522,19 @@ class _WorkspaceState extends State<Workspace> {
                           const SizedBox(width: 8),
                           Expanded(child: saveButton),
                         ]),
+                        if (Platform.isWindows) ...[
+                          const SizedBox(height: 8),
+                          mergeButton,
+                        ],
                       ],
                     );
                   }
                   return Row(children: [
                     Expanded(child: label),
+                    if (Platform.isWindows) ...[
+                      mergeButton,
+                      const SizedBox(width: 8),
+                    ],
                     saveAllButton,
                     const SizedBox(width: 8),
                     saveButton,

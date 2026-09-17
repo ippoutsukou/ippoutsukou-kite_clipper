@@ -49,7 +49,7 @@ class ExportService {
     // 一意な専用ディレクトリで既存ファイルとの競合を防ぐ。
     final folder = await Directory(directory).createTemp('kite_clip_');
     final output = '${folder.path}${Platform.pathSeparator}clip.mp4';
-    final result = await _copyRange(source, range, output);
+    final result = await copyRange(source, range, output);
     if (result.exitCode != 0) {
       throw StateError(
         '動画の保存に失敗しました。形式・空き容量を確認してください。未完成ファイルは ${folder.path} に残ります。',
@@ -114,7 +114,7 @@ class ExportService {
     String path(String name) =>
         '${directory.path}${Platform.pathSeparator}$name';
     final output = path(uniqueFileName(fileName, (n) => _exists(path(n))));
-    final result = await _copyRange(source, range, output);
+    final result = await copyRange(source, range, output);
     if (result.exitCode != 0) {
       throw StateError(
           '動画の保存に失敗しました。形式・空き容量を確認してください。未完成ファイルが残る場合があります：$output');
@@ -134,10 +134,10 @@ class ExportService {
   bool _exists(String path) =>
       FileSystemEntity.typeSync(path) != FileSystemEntityType.notFound;
 
-  /// `-n` で既存ファイルを上書きしない高速コピー。1件保存・一括保存で共通。
-  Future<ProcessResult> _copyRange(
+  /// `-n` で既存ファイルを上書きしない高速コピー。1件保存・一括保存・結合で共通。
+  Future<ProcessResult> copyRange(
       String source, ClipRange range, String output) async {
-    final executable = await _ffmpeg();
+    final executable = await ffmpegPath();
     return Process.run(executable, [
       '-hide_banner',
       '-loglevel',
@@ -159,15 +159,21 @@ class ExportService {
     ]);
   }
 
-  Future<String> _ffmpeg() async {
+  /// 同梱・開発用の場所から ffmpeg を探す。見つからなければ PATH に任せる。
+  Future<String> ffmpegPath() => _tool('ffmpeg');
+
+  /// ffprobe も ffmpeg と同じ場所から探す。
+  Future<String> ffprobePath() => _tool('ffprobe');
+
+  Future<String> _tool(String name) async {
     final locations = [
-      File('${File(Platform.resolvedExecutable).parent.path}/ffmpeg.exe'),
-      File('../vendor/ffmpeg/windows-x64/ffmpeg.exe'),
-      File('vendor/ffmpeg/windows-x64/ffmpeg.exe'),
+      File('${File(Platform.resolvedExecutable).parent.path}/$name.exe'),
+      File('../vendor/ffmpeg/windows-x64/$name.exe'),
+      File('vendor/ffmpeg/windows-x64/$name.exe'),
     ];
     for (final file in locations) {
       if (await file.exists()) return file.absolute.path;
     }
-    return 'ffmpeg';
+    return name;
   }
 }
