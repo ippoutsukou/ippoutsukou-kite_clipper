@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'ai_segments.dart';
 import 'analysis_service.dart';
+import 'omakase.dart';
 
 String _time(int milliseconds) {
   final total = milliseconds ~/ 1000;
@@ -23,8 +24,21 @@ class AnalysisRequest {
 
 class AnalysisStartDialog extends StatefulWidget {
   const AnalysisStartDialog(
-      {super.key, required this.sportId, this.savedSportId, this.savedIntervalMs});
+      {super.key,
+      required this.sportId,
+      this.savedSportId,
+      this.savedIntervalMs,
+      this.intervalMs = 1000,
+      this.title = 'AI解析',
+      this.confirmLabel = '解析する',
+      this.note});
   final String sportId;
+  final int intervalMs;
+
+  /// おまかせモードの設定にも使う。
+  final String title;
+  final String confirmLabel;
+  final String? note;
 
   /// 保存済み結果がある場合の競技と間隔（ない場合は null）。
   final String? savedSportId;
@@ -35,14 +49,14 @@ class AnalysisStartDialog extends StatefulWidget {
 
 class _AnalysisStartDialogState extends State<AnalysisStartDialog> {
   late String sportId = widget.sportId;
-  late int intervalMs = widget.savedIntervalMs ?? 1000;
+  late int intervalMs = widget.savedIntervalMs ?? widget.intervalMs;
 
   bool get hasSaved =>
       widget.savedSportId == sportId && widget.savedIntervalMs == intervalMs;
 
   @override
   Widget build(BuildContext context) => AlertDialog(
-        title: const Text('AI解析'),
+        title: Text(widget.title),
         content: SingleChildScrollView(
             child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -68,6 +82,10 @@ class _AnalysisStartDialogState extends State<AnalysisStartDialog> {
               ]),
               const Text('2秒にすると時間はおよそ半分、区間の切れ目は粗くなります。',
                   style: TextStyle(fontSize: 12, color: Colors.blueGrey)),
+              if (widget.note != null) ...[
+                const SizedBox(height: 12),
+                Text(widget.note!, style: const TextStyle(fontSize: 12)),
+              ],
               if (hasSaved) ...[
                 const SizedBox(height: 12),
                 const Text('この条件の解析結果が保存されています。すぐに区間を作れます。',
@@ -86,7 +104,7 @@ class _AnalysisStartDialogState extends State<AnalysisStartDialog> {
           FilledButton(
               onPressed: () =>
                   Navigator.pop(context, AnalysisRequest(sportId, intervalMs)),
-              child: Text(hasSaved ? '保存済みを使う' : '解析する')),
+              child: Text(hasSaved ? '保存済みを使う' : widget.confirmLabel)),
         ],
       );
 }
@@ -98,8 +116,12 @@ class AnalysisProgressDialog extends StatelessWidget {
       required this.done,
       required this.total,
       required this.cancelling,
-      required this.onCancel});
+      required this.onCancel,
+      this.heading});
   final int done;
+
+  /// おまかせで何本目を処理中かなど。
+  final String? heading;
   final int total;
   final bool cancelling;
   final VoidCallback onCancel;
@@ -107,6 +129,10 @@ class AnalysisProgressDialog extends StatelessWidget {
   @override
   Widget build(BuildContext context) => AlertDialog(
         content: Column(mainAxisSize: MainAxisSize.min, children: [
+          if (heading != null) ...[
+            Text(heading!, style: const TextStyle(fontWeight: FontWeight.w700)),
+            const SizedBox(height: 8),
+          ],
           Text(cancelling
               ? '中止しています…（処理中の1枚が終わるまで待っています）'
               : total > 0
@@ -210,4 +236,51 @@ class AnalysisResultDialog extends StatelessWidget {
               child: const Text('区間として追加')),
         ],
       );
+}
+
+/// おまかせの結果一覧。動画ごとに何をしたかを示す。
+class OmakaseResultDialog extends StatelessWidget {
+  const OmakaseResultDialog(
+      {super.key, required this.sportId, required this.outcomes});
+  final String sportId;
+  final List<OmakaseOutcome> outcomes;
+
+  @override
+  Widget build(BuildContext context) {
+    final added = outcomes.where((o) => o.status == OmakaseStatus.added).length;
+    return AlertDialog(
+      title: const Text('おまかせの結果'),
+      content: SingleChildScrollView(
+          child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+            Text('競技モデル：$sportId'),
+            Text('${outcomes.length}本中 $added本に区間を追加しました。'),
+            const SizedBox(height: 10),
+            for (final outcome in outcomes)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(outcome.name,
+                          style: const TextStyle(fontWeight: FontWeight.w700)),
+                      Text('　${outcome.describe()}',
+                          style: TextStyle(
+                              color: outcome.status == OmakaseStatus.failed
+                                  ? const Color(0xffa33a3a)
+                                  : null)),
+                    ]),
+              ),
+            const SizedBox(height: 6),
+            const Text('保存はしていません。区間を確認してから「すべて保存…」で保存してください。',
+                style: TextStyle(fontSize: 12, color: Colors.blueGrey)),
+          ])),
+      actions: [
+        FilledButton(
+            onPressed: () => Navigator.pop(context), child: const Text('閉じる')),
+      ],
+    );
+  }
 }

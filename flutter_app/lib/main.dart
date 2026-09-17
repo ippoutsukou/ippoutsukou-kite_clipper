@@ -25,6 +25,7 @@ import 'ai_segments.dart';
 import 'analysis_service.dart';
 import 'analysis_dialogs.dart';
 import 'video_picker.dart';
+import 'omakase.dart';
 
 /// ビルド時に --dart-define=BUILD_LABEL=... で埋め込む。未指定なら dev。
 const buildLabel = String.fromEnvironment('BUILD_LABEL', defaultValue: 'dev');
@@ -106,6 +107,8 @@ class _WorkspaceState extends State<Workspace> {
   bool saveFailureShown = false;
   // AI解析の測定用。最後に選んだ競技を覚えておく。
   String sportId = sportModelIds.first;
+  // おまかせモードの設定（作業記録に残す）。
+  OmakaseSettings omakase = const OmakaseSettings();
   late final AppLifecycleListener lifecycle;
   StreamSubscription<String>? mediaError;
   // 一括保存中だけ値を持つ。batchProgress が null でなければ進捗欄を表示する。
@@ -230,7 +233,8 @@ class _WorkspaceState extends State<Workspace> {
     if (mounted) rememberActive();
     // 書き込みを直列にし、後から始めた保存が常に最新の状態を書く。
     final next =
-        (saving ?? Future<void>.value()).then((_) => store.save(session));
+        (saving ?? Future<void>.value())
+            .then((_) => store.save(session, omakase: omakase));
     saving = next.catchError((Object _) {
       if (mounted && !saveFailureShown) {
         saveFailureShown = true;
@@ -250,6 +254,7 @@ class _WorkspaceState extends State<Workspace> {
           await store.load(caseInsensitivePaths: Platform.isWindows);
       if (!mounted) return;
       sessionStore = store;
+      setState(() => omakase = restored.omakase);
       final notes = [
         if (restored.warning != null) restored.warning!,
         if (restored.skipped > 0)
@@ -301,10 +306,11 @@ class _WorkspaceState extends State<Workspace> {
     if (busy || loading) return;
     rememberActive();
     setState(() => loading = true);
+    var added = <ClipItem>[];
     try {
       final paths = await VideoPicker().pick();
       if (!mounted || paths.isEmpty) return;
-      final added = session.add(paths);
+      added = session.add(paths);
       setState(() {});
       if (session.active == null && added.isNotEmpty)
         await openClip(added.first);
@@ -319,6 +325,8 @@ class _WorkspaceState extends State<Workspace> {
     } finally {
       if (mounted) setState(() => loading = false);
     }
+    // おまかせONなら、今回追加した動画だけを順に解析して区間を入れる。
+    if (mounted && omakase.enabled && added.isNotEmpty) await runOmakase(added);
   }
 
   Future<void> selectClip(ClipItem item) async {
@@ -588,11 +596,7 @@ class _WorkspaceState extends State<Workspace> {
             truncated: false,
             cancelled: false);
       } else {
-        // 4K動画では再生用と解析用のデコーダーが同時に動くと落ちる端末があるため、先に止める。
-        timelineLoader.cancel();
-        pendingSeek = null;
-        await seekTask;
-        await player.stop();
+        await stopPlaybackForAnalysis();
         if (!mounted) return;
         dialogOpen = true;
         unawaited(showDialog<void>(
@@ -672,6 +676,152 @@ class _WorkspaceState extends State<Workspace> {
             fromSaved: fromSaved,
             otherCounts: otherCounts,
             onApply: () => applyProposals(item, proposals)));
+  }
+
+  /// 4K動画では再生用と解析用のデコーダーが同時に動くと落ちる端末があるため、解析前に止める。
+  Future<void> stopPlaybackForAnalysis() async {
+    timelineLoader.cancel();
+    pendingSeek = null;
+    await seekTask;
+    await player.stop();
+  }
+
+  /// おまかせモードのON/OFF。ONにするときは競技と間隔を選ぶ。
+  Future<void> toggleOmakase() async {
+    if (busy || loading) return;
+    if (omakase.enabled) {
+      setState(() => omakase = OmakaseSettings(
+          sportId: omakase.sportId, intervalMs: omakase.intervalMs));
+      return;
+    }
+    final request = await showDialog<AnalysisRequest>(
+        context: context,
+        builder: (_) => AnalysisStartDialog(
+            sportId: omakase.sportId,
+            intervalMs: omakase.intervalMs,
+            title: 'おまかせモード',
+            confirmLabel: 'ONにする',
+            note: 'ONの間に「動画を追加…」で追加した動画を、この条件で1本ずつ解析して区間を入れます。'
+                '保存はしません。すでに一覧にある動画は対象外です。'));
+    if (!mounted || request == null) return;
+    setState(() => omakase = OmakaseSettings(
+        enabled: true, sportId: request.sportId, intervalMs: request.intervalMs));
+  }
+
+  /// おまかせ：追加した動画を1本ずつ解析し、提案区間を入れる。保存はしない。
+  Future<void> runOmakase(List<ClipItem> targets) async {
+    if (busy || loading || targets.isEmpty || !AnalysisService.supported) {
+      return;
+    }
+    final settings = omakase;
+    rememberActive();
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    final service = AnalysisService();
+    final progress = ValueNotifier<List<int>>(const [0, 0]);
+    final heading = ValueNotifier<String>('');
+    final cancelling = ValueNotifier<bool>(false);
+    final outcomes = <OmakaseOutcome>[];
+    final withSegments = <ClipItem>[];
+    var stopped = false;
+    var dialogOpen = false;
+    try {
+      final models = [for (final id in sportModelIds) await loadSportModel(id)];
+      final model = models.firstWhere((m) => m.id == settings.sportId,
+          orElse: () => models.first);
+      await stopPlaybackForAnalysis();
+      stopped = true;
+      if (!mounted) return;
+      dialogOpen = true;
+      unawaited(showDialog<void>(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) => ListenableBuilder(
+              listenable: Listenable.merge([progress, heading, cancelling]),
+              builder: (_, __) => AnalysisProgressDialog(
+                  heading: heading.value,
+                  done: progress.value[0],
+                  total: progress.value[1],
+                  cancelling: cancelling.value,
+                  onCancel: () {
+                    cancelling.value = true;
+                    unawaited(service.cancel());
+                  }))));
+      for (var index = 0; index < targets.length; index++) {
+        final item = targets[index];
+        if (cancelling.value || !session.items.contains(item)) {
+          outcomes.add(OmakaseOutcome(item.name, OmakaseStatus.skipped));
+          continue;
+        }
+        heading.value = 'おまかせ ${index + 1}/${targets.length}本目：${item.name}';
+        progress.value = const [0, 0];
+        try {
+          final interval = resolveIntervalMs(
+              durationMs: item.durationMs ?? 0, wantedMs: settings.intervalMs);
+          final result = await service.analyze(
+              source: item.path,
+              model: model,
+              others: [for (final m in models) if (m.id != model.id) m],
+              intervalMs: interval,
+              onProgress: (done, total) => progress.value = [done, total]);
+          if (!mounted) return;
+          final outcome = applyOmakaseResult(
+              item: item,
+              result: result,
+              model: model,
+              sportId: settings.sportId,
+              intervalMs: interval);
+          outcomes.add(outcome);
+          if (outcome.status == OmakaseStatus.added) withSegments.add(item);
+          setState(() => syncEditorFrom(item));
+        } catch (e) {
+          outcomes.add(OmakaseOutcome(item.name, OmakaseStatus.failed,
+              message: describeBatchError(e)));
+        }
+      }
+    } catch (e) {
+      error = 'おまかせを開始できませんでした：${describeBatchError(e)}';
+    } finally {
+      if (mounted) {
+        if (dialogOpen) Navigator.of(context, rootNavigator: true).pop();
+        setState(() => busy = false);
+      }
+      progress.dispose();
+      heading.dispose();
+      cancelling.dispose();
+    }
+    if (!mounted) return;
+    // 区間が入った最初の動画を開く。なければ止める前の動画へ戻す。
+    final target = withSegments
+            .where((item) => session.items.contains(item))
+            .firstOrNull ??
+        session.active;
+    if (stopped && target != null) {
+      setState(() => loading = true);
+      try {
+        await openClip(target);
+      } finally {
+        if (mounted) setState(() => loading = false);
+      }
+    }
+    if (!mounted || outcomes.isEmpty) return;
+    await showDialog<void>(
+        context: context,
+        builder: (_) =>
+            OmakaseResultDialog(sportId: settings.sportId, outcomes: outcomes));
+  }
+
+  /// 開いている動画の区間を外から変えたとき、画面の範囲を合わせる。
+  /// 合わせないと、次の作業記録の書き出しで古い範囲が区間へ書き戻される。
+  void syncEditorFrom(ClipItem item) {
+    if (!identical(session.active, item) || item.path != source) return;
+    final start = item.startMs, end = item.endMs, duration = item.durationMs;
+    if (start == null || end == null || duration == null) return;
+    durationMs = duration;
+    range = RangeValues(start.toDouble(), end.toDouble());
+    output = item.output;
   }
 
   /// 提案区間を一覧へ反映する。触っていない初期区間は置き換える。
@@ -1071,6 +1221,26 @@ class _WorkspaceState extends State<Workspace> {
           ]),
           centerTitle: true,
           actions: [
+            if (AnalysisService.supported)
+              Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Tooltip(
+                  message: omakase.enabled
+                      ? 'おまかせON：${omakase.sportId}・${omakase.intervalMs ~/ 1000}秒間隔。押すとOFF'
+                      : '追加した動画を自動で解析して区間を入れます',
+                  child: FilterChip(
+                    avatar: const Icon(Icons.auto_awesome, size: 16),
+                    showCheckmark: false,
+                    label: Text(omakase.enabled &&
+                            MediaQuery.sizeOf(context).width >= 600
+                        ? 'おまかせ：${omakase.sportId}'
+                        : 'おまかせ'),
+                    selected: omakase.enabled,
+                    onSelected:
+                        busy || loading ? null : (_) => toggleOmakase(),
+                  ),
+                ),
+              ),
             TextButton(
               onPressed: busy || loading ? null : pick,
               child: const Text('動画を追加…'),

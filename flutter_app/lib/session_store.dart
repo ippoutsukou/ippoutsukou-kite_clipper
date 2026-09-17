@@ -3,14 +3,19 @@ import 'dart:io';
 
 import 'clip_session.dart';
 import 'export_service.dart';
+import 'omakase.dart';
 
 const sessionFormatVersion = 1;
 const missingSourceMessage =
     '元動画が見つかりません。移動・削除された可能性があります。一覧から外すか、動画を追加し直してください。';
 
 class RestoredSession {
-  const RestoredSession(this.session, {this.skipped = 0, this.warning});
+  const RestoredSession(this.session,
+      {this.skipped = 0, this.warning, this.omakase = const OmakaseSettings()});
   final ClipSession session;
+
+  /// おまかせモードの設定。記録がない・不正な場合はOFF。
+  final OmakaseSettings omakase;
 
   /// 記録が不正で読み飛ばした動画の本数。
   final int skipped;
@@ -20,11 +25,13 @@ class RestoredSession {
 }
 
 /// サムネイル・エラー・再生位置は記録しない（開いたときに作り直す）。
-String encodeSession(ClipSession session, {DateTime? now}) =>
+String encodeSession(ClipSession session,
+        {DateTime? now, OmakaseSettings omakase = const OmakaseSettings()}) =>
     const JsonEncoder.withIndent('  ').convert({
       'version': sessionFormatVersion,
       'savedAt': (now ?? DateTime.now()).toUtc().toIso8601String(),
       'activePath': session.active?.path,
+      'omakase': omakase.toJson(),
       'items': [
         for (final item in session.items)
           {
@@ -99,7 +106,8 @@ RestoredSession decodeSession(String text,
       break;
     }
   }
-  return RestoredSession(session, skipped: skipped);
+  return RestoredSession(session,
+      skipped: skipped, omakase: OmakaseSettings.fromJson(data['omakase']));
 }
 
 int? _intOrNull(Object? value) => switch (value) {
@@ -144,8 +152,9 @@ class SessionStore {
   }
 
   /// 書きかけで壊さないよう一時ファイルに書いてから置き換え、直前の記録を .bak に残す。
-  Future<void> save(ClipSession session) async {
-    final text = encodeSession(session); // 待機前に内容を確定する
+  Future<void> save(ClipSession session,
+      {OmakaseSettings omakase = const OmakaseSettings()}) async {
+    final text = encodeSession(session, omakase: omakase); // 待機前に内容を確定する
     await directory.create(recursive: true);
     await tempFile.writeAsString(text, flush: true);
     if (await file.exists()) await file.copy(backupFile.path);
@@ -164,6 +173,7 @@ class SessionStore {
         if (candidate.path == main.path) return restored;
         return RestoredSession(restored.session,
             skipped: restored.skipped,
+            omakase: restored.omakase,
             warning: '前回の作業記録が壊れていたため、1つ前の記録から復元しました。');
       } on FormatException {
         if (candidate.path == main.path) {
