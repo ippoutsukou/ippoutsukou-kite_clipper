@@ -1,4 +1,4 @@
-﻿param([ValidateSet('doctor','get','analyze','test','windows','build-windows','apk')][string]$Task = 'doctor')
+﻿param([ValidateSet('doctor','get','analyze','test','windows','build-windows','release-windows','apk')][string]$Task = 'doctor')
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
 $taskFlutter = Join-Path $taskRoot 'vendor\flutter\bin\flutter.bat'
@@ -26,6 +26,8 @@ try {
         'test' { & $taskFlutter test --no-pub --no-test-assets }
         'windows' { & $taskFlutter run -d windows $taskBuildLabel }
         'build-windows' { & $taskFlutter build windows --debug $taskBuildLabel }
+        # font-subset.exe はフォルダーアクセスの制御で書き込みを止められるため、アイコンの間引きを省く（+約1.6MB）。
+        'release-windows' { & $taskFlutter build windows --release --no-tree-shake-icons $taskBuildLabel }
         'apk' { & $taskFlutter build apk --debug $taskBuildLabel }
     }
     if ($LASTEXITCODE -ne 0) { throw "Flutter処理に失敗しました: $Task" }

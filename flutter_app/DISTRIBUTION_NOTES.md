@@ -73,3 +73,17 @@
 - 項目3（しきい値は変更なし）と項目4（キーフレーム間隔への対策、実際の間隔の表示）を含む最新版。
 - 186MB・arm64-v8a のみ・versionCode 22。out/flutter-proof/kite-clipper-0.1.0-build22-ai-tuned.apk
 - Android側の解析処理は変更していない（結果画面に「実際の間隔」が加わるのみ）。
+
+## ビルド23（全モデル採点対応・2026-09-17）
+- 186MB・arm64-v8a のみ・versionCode 23。out/flutter-proof/kite-clipper-0.1.0-build23-multi-model.apk
+- 内容：全競技モデルの同時採点（Kotlin側も複数係数の受け取りに変更）、結果画面に他モデルの提案数。
+- Android側の取り出し方式は変更なし（端末の仕組みでシークして1枚ずつ取得しているため、
+  Windowsで問題になった「採点中に取り出しが止まる」現象は起きない）。
+
+## Windows配布版 初回（2026-09-18）
+- `tool.ps1 release-windows` でReleaseビルド（176MB）。ffmpeg一式（LGPL v3）とライセンス類を加えて
+  dist/kite_clipper_flutter_20260918/KiteClipper（313MB）→ zip 168MB。起動確認のみ実施（保存・AI解析は未確認）。
+- 同梱ライセンス：FFmpeg / libmpv はともに LGPL v3（libmpv は `-Dgpl=false` を確認）、ONNX Runtime・CLIP は MIT。
+- Documents配下は「コントロールされたフォルダーアクセス」で gen_snapshot.exe と font-subset.exe の書き込みが止まる。
+  gen_snapshot.exe は利用者が許可済み。font-subset.exe は `--no-tree-shake-icons` で回避（+約1.6MB）。
+- GitHubに下書きリリース（タグ v2026.09.18、コミット 37234a9）を作成。公開は利用者が判断。
