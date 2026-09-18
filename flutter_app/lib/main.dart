@@ -909,6 +909,8 @@ class _WorkspaceState extends State<Workspace> {
     final cancelling = ValueNotifier<bool>(false);
     var dialogOpen = false;
     MergeOutcome? outcome;
+    String? failure;
+    var cancelled = false;
     try {
       // 4K動画では再生と切り出しが同時に動くと不安定な端末があるため、先に止める。
       await stopPlaybackForAnalysis();
@@ -945,11 +947,11 @@ class _WorkspaceState extends State<Workspace> {
               directory: directory!,
               onProgress: report);
     } on MergeCancelled {
-      // 中止は結果を出さない（出力は作られていない）。
+      cancelled = true;
     } on MergeUnsupported catch (e) {
-      error = e.message;
+      failure = e.message;
     } catch (e) {
-      error = '1本にまとめられませんでした：${describeBatchError(e)}';
+      failure = describeBatchError(e);
     } finally {
       if (mounted) {
         if (dialogOpen) Navigator.of(context, rootNavigator: true).pop();
@@ -972,7 +974,19 @@ class _WorkspaceState extends State<Workspace> {
         if (mounted) setState(() => loading = false);
       }
     }
-    if (!mounted || outcome == null) return;
+    if (!mounted) return;
+    // 失敗・中止は必ず知らせる（開き直しでエラー欄が消えるため、ダイアログで出す）。
+    if (failure != null) {
+      await showDialog<void>(
+          context: context,
+          builder: (_) => MergeFailureDialog(message: failure!));
+      return;
+    }
+    if (cancelled || outcome == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('1本にまとめる処理を中止しました。ファイルは作っていません。')));
+      return;
+    }
     await showDialog<void>(
         context: context,
         builder: (_) => MergeResultDialog(

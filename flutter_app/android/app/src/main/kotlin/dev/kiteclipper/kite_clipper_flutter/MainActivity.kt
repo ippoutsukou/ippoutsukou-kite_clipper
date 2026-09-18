@@ -688,7 +688,7 @@ class MainActivity : FlutterActivity() {
                 // 途中まで書いた出力は使えないため削除する。
                 runCatching { DocumentsContract.deleteDocument(contentResolver, uri) }
                 val known = e.message?.takeIf { it.startsWith("形式がそろっていません") || it.startsWith("この形式") }
-                val message = known ?: diagnostic(progress, e)
+                val message = known ?: diagnostic(progress, e).replaceFirst("ビルド4：保存失敗", "1本にまとめる処理で失敗")
                 main.post { pendingMerge = null; mergeParts = null; callback.error("merge", message, null) }
             }
         }

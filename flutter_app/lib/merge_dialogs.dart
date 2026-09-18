@@ -115,6 +115,31 @@ class MergeProgressDialog extends StatelessWidget {
       );
 }
 
+/// まとめられなかったときの理由。診断の文面も選択・コピーできるようにする。
+class MergeFailureDialog extends StatelessWidget {
+  const MergeFailureDialog({super.key, required this.message});
+  final String message;
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: const Text('1本にまとめられませんでした'),
+        content: SingleChildScrollView(
+            child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+              SelectableText(message),
+              const SizedBox(height: 8),
+              const Text('ファイルは作っていません。元動画と一覧の区間は変わっていません。',
+                  style: _note),
+            ])),
+        actions: [
+          FilledButton(
+              onPressed: () => Navigator.pop(context), child: const Text('閉じる')),
+        ],
+      );
+}
+
 /// まとめ終わったあとの結果。
 class MergeResultDialog extends StatelessWidget {
   const MergeResultDialog(
