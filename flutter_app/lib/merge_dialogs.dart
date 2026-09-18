@@ -78,17 +78,22 @@ class MergeProgressDialog extends StatelessWidget {
       required this.done,
       required this.total,
       required this.cancelling,
-      required this.onCancel});
+      required this.onCancel,
+      this.canCancel = true});
   final MergePhase phase;
   final int done;
   final int total;
   final bool cancelling;
   final VoidCallback onCancel;
 
+  /// Androidは端末側の処理を途中で止められないため中止を出さない。
+  final bool canCancel;
+
   String get _label => switch (phase) {
         MergePhase.cutting => '区間を取り出しています（$done / $total）',
         MergePhase.checking => '形式を確かめています（$done / $total）',
-        MergePhase.joining => 'つないでいます…',
+        MergePhase.joining =>
+          total > 0 ? 'つないでいます（$done / $total）' : 'つないでいます…',
       };
 
   @override
@@ -97,13 +102,15 @@ class MergeProgressDialog extends StatelessWidget {
           Text(cancelling ? '中止しています…' : _label),
           const SizedBox(height: 12),
           LinearProgressIndicator(
-              value: phase == MergePhase.joining || total <= 0
+              value: total <= 0
                   ? null
                   : (done / total).clamp(0.0, 1.0)),
         ]),
         actions: [
-          TextButton(
-              onPressed: cancelling ? null : onCancel, child: const Text('中止')),
+          if (canCancel)
+            TextButton(
+                onPressed: cancelling ? null : onCancel,
+                child: const Text('中止')),
         ],
       );
 }

@@ -894,7 +894,7 @@ class _WorkspaceState extends State<Workspace> {
     if (Platform.isWindows) {
       directory = await getDirectoryPath(confirmButtonText: 'ここに保存');
       if (!mounted || directory == null) return;
-    } else {
+    } else if (!Platform.isAndroid) {
       ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('この環境ではまだ1本にまとめられません。')));
       return;
@@ -924,17 +924,26 @@ class _WorkspaceState extends State<Workspace> {
                   done: progress.value[0],
                   total: progress.value[1],
                   cancelling: cancelling.value,
+                  canCancel: !Platform.isAndroid,
                   onCancel: () {
                     cancelling.value = true;
                     unawaited(service.cancel());
                   }))));
-      outcome = await service.mergeWindows(
-          entries: plan.entries,
-          directory: directory,
-          onProgress: (current, done, total) {
-            phase.value = current;
-            progress.value = [done, total];
-          });
+      void report(MergePhase current, int done, int total) {
+        phase.value = current;
+        progress.value = [done, total];
+      }
+
+      // Androidは処理中に画面が消えると中断されるため、消灯を防ぐ。
+      if (Platform.isAndroid) await ExportService().keepScreenOn(true);
+      // Androidは保存先の選択もネイティブ側で行う（選ばずに閉じたら中止）。
+      outcome = Platform.isAndroid
+          ? await service.mergeAndroid(
+              entries: plan.entries, onProgress: report)
+          : await service.mergeWindows(
+              entries: plan.entries,
+              directory: directory!,
+              onProgress: report);
     } on MergeCancelled {
       // 中止は結果を出さない（出力は作られていない）。
     } on MergeUnsupported catch (e) {
@@ -945,6 +954,9 @@ class _WorkspaceState extends State<Workspace> {
       if (mounted) {
         if (dialogOpen) Navigator.of(context, rootNavigator: true).pop();
         setState(() => busy = false);
+      }
+      if (Platform.isAndroid) {
+        await ExportService().keepScreenOn(false);
       }
       progress.dispose();
       phase.dispose();
@@ -970,9 +982,12 @@ class _WorkspaceState extends State<Workspace> {
   bool get hasBatchTargets =>
       session.items.any((item) => item.segments.isNotEmpty);
 
+  /// 1本にまとめられる環境か。
+  static bool get mergeSupported => Platform.isWindows || Platform.isAndroid;
+
   /// つなぐには区間が2個以上必要（元動画の有無は実行時に確かめる）。
   bool get canMerge =>
-      Platform.isWindows &&
+      mergeSupported &&
       session.items.fold<int>(0, (sum, item) => sum + item.segments.length) >= 2;
 
   /// 全動画の全区間を、選んだフォルダへ1件ずつ保存する。
@@ -1343,7 +1358,8 @@ class _WorkspaceState extends State<Workspace> {
                   onPressed: busy || loading ? null : showClipPicker,
                   icon: const Icon(Icons.video_library_outlined,
                       color: Color(0xff1664dd)))
-              : const Icon(Icons.sailing, color: Color(0xff1664dd)),
+              // 広い画面では一覧が左に出ているため、飾りのアイコンは置かない。
+              : null,
           title: Column(mainAxisSize: MainAxisSize.min, children: [
             Text(source == null ? 'Kite Clipper' : 'クリップを確認',
                 style: const TextStyle(
@@ -1522,7 +1538,7 @@ class _WorkspaceState extends State<Workspace> {
                           const SizedBox(width: 8),
                           Expanded(child: saveButton),
                         ]),
-                        if (Platform.isWindows) ...[
+                        if (mergeSupported) ...[
                           const SizedBox(height: 8),
                           mergeButton,
                         ],
@@ -1531,7 +1547,7 @@ class _WorkspaceState extends State<Workspace> {
                   }
                   return Row(children: [
                     Expanded(child: label),
-                    if (Platform.isWindows) ...[
+                    if (mergeSupported) ...[
                       mergeButton,
                       const SizedBox(width: 8),
                     ],

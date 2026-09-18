@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/services.dart';
+
 import 'batch_plan.dart';
 import 'export_service.dart';
 import 'merge_plan.dart';
@@ -215,6 +217,56 @@ class MergeService {
     } finally {
       // 一時ファイルは成功・失敗にかかわらず片付ける。
       if (await temp.exists()) await temp.delete(recursive: true);
+    }
+  }
+
+  /// Android：保存先ファイルを選んでもらい、端末の仕組みで順につなぐ。
+  /// 作り直し（再エンコード）はできないため、形式がそろっていない場合はネイティブ側が理由を返す。
+  /// 保存先を選ばずに閉じた場合は中止として扱う。
+  Future<MergeOutcome> mergeAndroid({
+    required List<BatchEntry> entries,
+    DateTime? now,
+    void Function(MergePhase phase, int done, int total)? onProgress,
+  }) async {
+    // 環境の判定は呼び出し側で行う（ここはネイティブ側の応答だけを扱う）。
+    if (entries.length < 2) throw ArgumentError('2区間以上を指定してください');
+    _cancelled = false;
+    final started = DateTime.now();
+    ExportService.channel.setMethodCallHandler((call) async {
+      if (call.method != 'mergeProgress') return null;
+      final arguments = call.arguments;
+      if (arguments is Map) {
+        onProgress?.call(MergePhase.joining,
+            (arguments['done'] as num?)?.toInt() ?? 0,
+            (arguments['total'] as num?)?.toInt() ?? entries.length);
+      }
+      return null;
+    });
+    try {
+      onProgress?.call(MergePhase.joining, 0, entries.length);
+      final uri = await ExportService.channel.invokeMethod<String>('merge', {
+        'name': mergedFileName(now ?? DateTime.now()),
+        'parts': [
+          for (final entry in entries)
+            {
+              'source': entry.item.path,
+              'startMs': entry.segment.startMs,
+              'endMs': entry.segment.endMs,
+            }
+        ],
+      });
+      if (uri == null || uri.isEmpty) throw const MergeCancelled();
+      return MergeOutcome(
+          output: uri,
+          lossless: true,
+          elapsed: DateTime.now().difference(started));
+    } on PlatformException catch (e) {
+      if (e.code == 'merge' || e.code == 'arguments') {
+        throw MergeUnsupported(e.message ?? '1本にまとめられませんでした');
+      }
+      rethrow;
+    } finally {
+      ExportService.channel.setMethodCallHandler(null);
     }
   }
 

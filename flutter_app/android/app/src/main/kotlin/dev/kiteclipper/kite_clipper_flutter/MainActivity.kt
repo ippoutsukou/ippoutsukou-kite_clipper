@@ -32,6 +32,10 @@ class MainActivity : FlutterActivity() {
     private var pending: MethodChannel.Result? = null
     private var arguments: Map<*, *>? = null
     private var pendingFolder: MethodChannel.Result? = null
+    // 1本にまとめる保存。保存先を選んでから実行する。
+    private var pendingMerge: MethodChannel.Result? = null
+    private var mergeParts: List<*>? = null
+    private var exportChannel: MethodChannel? = null
     // 動画の選択と取り込み（コピー）中。メインスレッドでのみ読み書きする。
     private var pendingPick: MethodChannel.Result? = null
     private var pickBusy = false
@@ -50,7 +54,8 @@ class MainActivity : FlutterActivity() {
     private val main = Handler(Looper.getMainLooper())
 
     private fun isBusy() =
-        pending != null || pendingFolder != null || batchBusy || pendingPick != null || pickBusy
+        pending != null || pendingFolder != null || batchBusy || pendingPick != null || pickBusy ||
+            pendingMerge != null
 
     override fun configureFlutterEngine(engine: FlutterEngine) {
         super.configureFlutterEngine(engine)
@@ -150,9 +155,12 @@ class MainActivity : FlutterActivity() {
                     }
                 }
             }
-        MethodChannel(engine.dartExecutor.binaryMessenger, "kite_clipper/export")
-            .setMethodCallHandler { call, result ->
+        val export = MethodChannel(engine.dartExecutor.binaryMessenger, "kite_clipper/export")
+        exportChannel = export
+        export.setMethodCallHandler { call, result ->
                 when (call.method) {
+                    "merge" -> startMerge(call.argument<String>("name"),
+                        call.argument<List<*>>("parts"), result)
                     "export" -> startExport(call.arguments as? Map<*, *>, result)
                     "pickFolder" -> startPickFolder(call.argument<String>("name"), result)
                     "exportTo" -> exportTo(
@@ -244,6 +252,7 @@ class MainActivity : FlutterActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         when (requestCode) {
             EXPORT_REQUEST -> onExportDestination(resultCode, data)
+            MERGE_REQUEST -> onMergeDestination(resultCode, data)
             FOLDER_REQUEST -> onFolderChosen(resultCode, data)
             PICK_REQUEST -> onVideosPicked(resultCode, data)
         }
@@ -638,6 +647,197 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    /** 1本にまとめる：保存先ファイルを選ぶ。実際の書き込みは選択後。 */
+    private fun startMerge(name: String?, parts: List<*>?, result: MethodChannel.Result) {
+        if (isBusy()) { result.error("busy", "保存中です", null); return }
+        if (android.os.Build.VERSION.SDK_INT < 26) {
+            result.error("unsupported", "保存にはAndroid 8以降が必要です", null)
+            return
+        }
+        if (name.isNullOrBlank() || parts == null || parts.size < 2) {
+            result.error("arguments", "まとめる指定が不正です", null)
+            return
+        }
+        pendingMerge = result
+        mergeParts = parts
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "video/mp4"
+            putExtra(Intent.EXTRA_TITLE, name)
+        }
+        try { startActivityForResult(intent, MERGE_REQUEST) }
+        catch (e: Exception) {
+            pendingMerge = null; mergeParts = null
+            result.error("picker", "保存先を開けません", null)
+        }
+    }
+
+    private fun onMergeDestination(resultCode: Int, data: Intent?) {
+        val callback = pendingMerge ?: return
+        val parts = mergeParts
+        val uri = data?.data
+        if (resultCode != Activity.RESULT_OK || uri == null || parts == null) {
+            pendingMerge = null; mergeParts = null; callback.success(null); return
+        }
+        worker.execute {
+            val progress = ExportProgress()
+            try {
+                mergeClips(uri, parts, progress)
+                main.post { pendingMerge = null; mergeParts = null; callback.success(uri.toString()) }
+            } catch (e: Exception) {
+                // 途中まで書いた出力は使えないため削除する。
+                runCatching { DocumentsContract.deleteDocument(contentResolver, uri) }
+                val known = e.message?.takeIf { it.startsWith("形式がそろっていません") || it.startsWith("この形式") }
+                val message = known ?: diagnostic(progress, e)
+                main.post { pendingMerge = null; mergeParts = null; callback.error("merge", message, null) }
+            }
+        }
+    }
+
+    /** 動画・音声の形式。これがそろっていないと、端末の仕組みではつなげない。 */
+    private data class Shape(val video: String, val width: Int, val height: Int,
+                             val audio: String, val sampleRate: Int, val channels: Int)
+
+    private fun shapeOf(extractor: MediaExtractor): Shape {
+        var video: MediaFormat? = null
+        var audio: MediaFormat? = null
+        for (i in 0 until extractor.trackCount) {
+            val format = extractor.getTrackFormat(i)
+            val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+            if (mime.startsWith("video/") && video == null) video = format
+            if (mime.startsWith("audio/") && audio == null) audio = format
+        }
+        val v = video ?: throw IllegalArgumentException("映像トラックがありません")
+        fun number(format: MediaFormat?, key: String) =
+            if (format != null && format.containsKey(key)) format.getInteger(key) else 0
+        return Shape(
+            v.getString(MediaFormat.KEY_MIME) ?: "",
+            number(v, MediaFormat.KEY_WIDTH), number(v, MediaFormat.KEY_HEIGHT),
+            audio?.getString(MediaFormat.KEY_MIME) ?: "",
+            number(audio, MediaFormat.KEY_SAMPLE_RATE), number(audio, MediaFormat.KEY_CHANNEL_COUNT))
+    }
+
+    private fun describe(shape: Shape) =
+        "${shape.video} ${shape.width}x${shape.height} / ${shape.audio.ifEmpty { "音声なし" }}"
+
+    /**
+     * 複数の区間を順につないで1本のMP4にする。作り直し（再エンコード）はしないため、
+     * 形式（映像・大きさ・音声）がそろっている動画だけを扱える。
+     */
+    private fun mergeClips(uri: Uri, parts: List<*>, progress: ExportProgress) {
+        progress.stage = "保存先を開く"
+        contentResolver.openFileDescriptor(uri, "w")!!.use { descriptor ->
+            progress.stage = "MP4書き込み準備"
+            val muxer = MediaMuxer(descriptor.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val extractors = mutableListOf<MediaExtractor>()
+            try {
+                // 1) すべての区間の形式を先に確かめる（1つでも違えば何も書かずに終える）。
+                var first: Shape? = null
+                val sources = mutableListOf<Triple<MediaExtractor, Long, Long>>()
+                for (part in parts) {
+                    progress.stage = "元動画を開く"
+                    val map = part as? Map<*, *> ?: throw IllegalArgumentException("まとめる指定が不正です")
+                    val source = map["source"] as? String ?: throw IllegalArgumentException("まとめる指定が不正です")
+                    val start = (map["startMs"] as Number).toLong() * 1000
+                    val end = (map["endMs"] as Number).toLong() * 1000
+                    require(start >= 0 && end > start)
+                    val extractor = MediaExtractor()
+                    extractors.add(extractor)
+                    extractor.setDataSource(source)
+                    progress.stage = "トラック形式の確認"
+                    val shape = shapeOf(extractor)
+                    require(shape.video == "video/avc" || shape.video == "video/hevc") { "未対応の映像形式です" }
+                    if (shape.audio.isNotEmpty() && shape.audio != "audio/mp4a-latm") {
+                        throw IllegalArgumentException("この形式の音声はまとめられません（${shape.audio}）")
+                    }
+                    val known = first
+                    if (known == null) first = shape
+                    else if (shape != known) {
+                        throw IllegalArgumentException(
+                            "形式がそろっていません：${describe(known)} と ${describe(shape)}")
+                    }
+                    sources.add(Triple(extractor, start, end))
+                }
+
+                // 2) 先頭の区間の形式でトラックを作り、順に書き込む。
+                val head = sources.first().first
+                val tracks = mutableMapOf<Int, Int>()
+                var video = -1
+                var audioTrack = -1
+                var bufferSize = 8 * 1024 * 1024
+                for (i in 0 until head.trackCount) {
+                    val format = head.getTrackFormat(i)
+                    val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                    progress.formats.add(if (mime.matches(Regex("[a-zA-Z0-9.+/_-]{1,80}"))) mime else "形式不明")
+                    if (mime.startsWith("video/") && video == -1) {
+                        video = i
+                        if (format.containsKey(MediaFormat.KEY_ROTATION)) muxer.setOrientationHint(format.getInteger(MediaFormat.KEY_ROTATION))
+                    } else if (mime.startsWith("audio/") && audioTrack == -1) {
+                        audioTrack = i
+                    } else continue
+                    if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) bufferSize = maxOf(bufferSize, format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
+                    progress.stage = "MP4トラック登録"
+                    tracks[i] = muxer.addTrack(format)
+                }
+                require(video >= 0) { "映像トラックがありません" }
+                require(bufferSize <= 64 * 1024 * 1024) { "必要なバッファが大きすぎます" }
+                progress.stage = "バッファ確保"
+                val buffer = ByteBuffer.allocateDirect(bufferSize)
+                val info = MediaCodec.BufferInfo()
+                progress.stage = "MP4書き込み開始"
+                muxer.start()
+                var offset = 0L
+                var videoSamples = 0
+                for ((index, entry) in sources.withIndex()) {
+                    val extractor = entry.first
+                    val start = entry.second
+                    val end = entry.third
+                    progress.stage = "区間${index + 1}の先頭を検索"
+                    extractor.selectTrack(video)
+                    extractor.seekTo(start, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                    val actualStart = extractor.sampleTime
+                    require(actualStart >= 0 && actualStart < end) { "範囲内に映像がありません" }
+                    tracks.keys.forEach { extractor.selectTrack(it) }
+                    extractor.seekTo(actualStart, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                    while (extractor.sampleTrackIndex >= 0) {
+                        val track = extractor.sampleTrackIndex
+                        val pts = extractor.sampleTime
+                        if (pts >= actualStart && pts < end) {
+                            buffer.clear()
+                            progress.stage = "区間${index + 1}の読み取り"
+                            val size = extractor.readSampleData(buffer, 0)
+                            if (size < 0) break
+                            require(extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_ENCRYPTED == 0) { "暗号化動画は未対応です" }
+                            info.set(0, size, pts - actualStart + offset,
+                                if (extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
+                            progress.stage = "区間${index + 1}の書き込み"
+                            tracks[track]?.let { muxer.writeSampleData(it, buffer, info) }
+                            if (track == video) videoSamples++
+                        }
+                        if (!extractor.advance()) break
+                    }
+                    // 次の区間は、この区間の長さ分だけ後ろにずらす（音ズレ・重なりを防ぐ）。
+                    offset += end - actualStart
+                    notifyMerge(index + 1, sources.size)
+                }
+                progress.stage = "出力内容確認"
+                require(videoSamples > 0) { "範囲内に映像がありません" }
+                progress.stage = "MP4最終処理"
+                muxer.stop()
+            } finally {
+                extractors.forEach { runCatching { it.release() } }
+                runCatching { muxer.release() }
+            }
+            progress.stage = "保存先を閉じる"
+        }
+    }
+
+    private fun notifyMerge(done: Int, total: Int) {
+        main.post {
+            exportChannel?.invokeMethod("mergeProgress", mapOf("done" to done, "total" to total))
+        }
+    }
+
     private fun diagnostic(progress: ExportProgress, e: Exception): String {
         val knownReasons = setOf("PCM16以外の音声は未対応です", "音声のサンプルレート・チャンネル数が未対応です", "PCMデータの構造が未対応です", "音声変換がタイムアウトしました", "範囲内に音声がありません", "未対応の映像形式です", "未対応の音声形式です", "映像トラックがありません", "必要なバッファが大きすぎます", "暗号化動画は未対応です", "範囲内に映像がありません")
         val reason = e.message?.takeIf { it in knownReasons } ?: when (e) {
@@ -653,6 +853,7 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val EXPORT_REQUEST = 8102
         private const val FOLDER_REQUEST = 8103
+        private const val MERGE_REQUEST = 8105
         private const val PICK_REQUEST = 8104
         // vendor/clip/SOURCE.txt と clip_embedder.py に合わせた前処理仕様。
         private const val CLIP_EMBED_DIM = 512
