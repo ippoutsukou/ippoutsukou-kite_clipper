@@ -125,17 +125,17 @@ void main() {
     expect(restored.session.active, isNull);
   });
 
-  test('31本目以降は読み飛ばす', () {
+  test('120本の作業記録もすべて復元する', () {
     final json = jsonEncode({
       'version': 1,
       'items': [
-        for (var i = 0; i < 31; i++)
+        for (var i = 0; i < 120; i++)
           {'path': '$i.mp4', 'durationMs': null, 'activeSegment': 0, 'segments': []}
       ]
     });
     final restored = decodeSession(json);
-    expect(restored.session.items.length, ClipSession.maximum);
-    expect(restored.skipped, 1);
+    expect(restored.session.items.length, 120);
+    expect(restored.skipped, 0);
   });
 
   test('全体の形式が違う記録は FormatException', () {

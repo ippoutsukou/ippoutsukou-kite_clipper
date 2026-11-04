@@ -31,13 +31,14 @@ void main() {
     expect(added.length, 1);
     expect(session.items.length, 2);
   });
-  test('上限超過を部分追加せず取り消す・キャンセルは無変更', () {
+  test('本数の上限はなく、キャンセルは無変更', () {
     final session = ClipSession();
     session.add(List.generate(29, (i) => '$i.mp4'));
     session.select(session.items.first);
-    expect(() => session.add(['new1.mp4', 'new2.mp4']), throwsStateError);
-    expect(session.items.length, 29);
+    session.add(List.generate(120, (i) => 'new$i.mp4'));
+    expect(session.items.length, 149);
     expect(session.add([]), isEmpty);
+    expect(session.items.length, 149);
     expect(session.active, same(session.items.first));
   });
   test('前の動画と画面破棄後の非同期結果を拒否', () {

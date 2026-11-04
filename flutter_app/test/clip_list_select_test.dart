@@ -25,15 +25,15 @@ Widget host(ClipSession session,
                         onRemoveMany: onRemoveMany ?? (_) {})))));
 
 void main() {
-  testWidgets('上限30本でも見切れず、スクロールで最後まで届く', (tester) async {
+  testWidgets('120本でも見切れず、スクロールで最後まで届く', (tester) async {
     final session = ClipSession()
-      ..add([for (var i = 1; i <= ClipSession.maximum; i++) 'v$i.mp4']);
+      ..add([for (var i = 1; i <= 120; i++) 'v$i.mp4']);
     await tester.pumpWidget(host(session));
     expect(tester.takeException(), isNull);
-    expect(find.text('30. v30.mp4'), findsNothing);
-    await tester.scrollUntilVisible(find.text('30. v30.mp4'), 200,
+    expect(find.text('120. v120.mp4'), findsNothing);
+    await tester.scrollUntilVisible(find.text('120. v120.mp4'), 200,
         scrollable: find.byType(Scrollable).first);
-    expect(find.text('30. v30.mp4'), findsOneWidget);
+    expect(find.text('120. v120.mp4'), findsOneWidget);
     // 最下部の案内文も見えたまま。
     expect(find.text('一覧と区間は次回起動時に復元します'), findsOneWidget);
   });

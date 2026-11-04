@@ -245,7 +245,6 @@ class ClipItem {
 
 class ClipSession {
   ClipSession({this.caseInsensitivePaths = false});
-  static const maximum = 30;
   final bool caseInsensitivePaths;
   final List<ClipItem> _items = [];
   List<ClipItem> get items => List.unmodifiable(_items);
@@ -254,15 +253,12 @@ class ClipSession {
   String _key(String path) =>
       caseInsensitivePaths ? path.replaceAll('\\', '/').toLowerCase() : path;
 
-  /// 上限超過は追加全体を取り消す。OSが返した順序を保つ。
+  /// 本数の上限はない。重複パスは追加しない。OSが返した順序を保つ。
   List<ClipItem> add(List<String> paths) {
     final known = _items.map((item) => _key(item.path)).toSet();
     final added = <ClipItem>[];
     for (final path in paths) {
       if (path.isNotEmpty && known.add(_key(path))) added.add(ClipItem(path));
-    }
-    if (_items.length + added.length > maximum) {
-      throw StateError('動画は最大30本です。追加する本数を減らしてください。');
     }
     _items.addAll(added);
     return added;

@@ -71,9 +71,6 @@ RestoredSession decodeSession(String text,
       if (path is! String || path.isEmpty) {
         throw const FormatException('動画のパスがありません');
       }
-      if (session.items.length >= ClipSession.maximum) {
-        throw StateError('動画は最大${ClipSession.maximum}本です');
-      }
       final added = session.add([path]);
       if (added.isEmpty) throw const FormatException('重複した動画です');
       item = added.single;

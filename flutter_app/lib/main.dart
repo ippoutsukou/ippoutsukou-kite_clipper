@@ -317,10 +317,6 @@ class _WorkspaceState extends State<Workspace> {
       setState(() {});
       if (session.active == null && added.isNotEmpty)
         await openClip(added.first);
-    } on StateError {
-      if (mounted)
-        ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('動画は最大30本です。追加する本数を減らしてください。')));
     } catch (_) {
       if (mounted)
         ScaffoldMessenger.of(context)
