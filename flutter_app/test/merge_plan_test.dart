@@ -74,6 +74,58 @@ void main() {
       expect(shape.differences(shape), isEmpty);
     });
 
+    test('フレームレートだけの違いは、つなげる印（joinKey）が同じになる', () {
+      final a = StreamShape.fromProbe(_probe);
+      final b = StreamShape.fromProbe(
+          _probe.replaceAll('"r_frame_rate":"30/1"', '"r_frame_rate":"60000/1001"'));
+      expect(a.key, isNot(b.key));
+      expect(a.joinKey, b.joinKey);
+      expect(a.label, '320x180・30fps');
+      expect(b.fileLabel, '320x180_59.94fps');
+      final formats = MergeFormats([a, b, a]);
+      expect(formats.mixed, isTrue);
+      expect(formats.frameRateOnly, isTrue);
+      expect(formats.forcedBlocked, isNull);
+      // 形式ごとのまとまりは最初に出た順、中は元の並びのまま。
+      expect(formats.groups.map((g) => g.indexes), [
+        [0, 2],
+        [1]
+      ]);
+    });
+
+    test('回転とビットレートを読み、縦撮りは表示の大きさを入れ替える', () {
+      final shape = StreamShape.fromProbe('{"streams":[{"codec_type":"video",'
+          '"codec_name":"hevc","width":1920,"height":1080,"r_frame_rate":"30/1",'
+          '"bit_rate":"20000000","side_data_list":[{"rotation":-90}]}]}');
+      expect(shape.rotation, -90);
+      expect(shape.bitRate, 20000000);
+      expect(shape.label, '1080x1920・30fps');
+      expect(shape.key, isNot(StreamShape.fromProbe(_probe).key));
+    });
+
+    test('作り直す先は一番大きい動画の大きさ、ビットレートは元の最大以上', () {
+      StreamShape shape(int width, int height, int bitRate) => StreamShape(
+          video: 'h264',
+          width: width,
+          height: height,
+          frameRate: '30/1',
+          audio: 'aac',
+          sampleRate: 48000,
+          channels: 2,
+          bitRate: bitRate);
+      final target = EncodeTarget.from(
+          [shape(1920, 1080, 30000000), shape(3840, 2160, 60000000)]);
+      expect([target.width, target.height], [3840, 2160]);
+      expect(target.bitRate, 60000000);
+      expect(target.exceedsH264, isFalse);
+      // 元のビットレートが低くても、大きさに応じた目安は下回らない。
+      expect(EncodeTarget.from([shape(1920, 1080, 1000000)]).bitRate, 12000000);
+      // 8:7素材は作り直せないため、強制結合はできない理由を返す。
+      final wide = MergeFormats([shape(5312, 4648, 0), shape(1920, 1080, 0)]);
+      expect(wide.frameRateOnly, isFalse);
+      expect(wide.forcedBlocked, contains('5312x4648'));
+    });
+
     test('映像がない・形式が読めないものは例外', () {
       expect(() => StreamShape.fromProbe('{"streams":[]}'),
           throwsA(isA<FormatException>()));

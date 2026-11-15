@@ -40,8 +40,10 @@ class MergePlan {
 }
 
 /// まとめた動画のファイル名 `kite_merged_YYYYMMDD_HHMMSS.mp4`（端末の現地時刻）。
-String mergedFileName(DateTime time) {
+/// 形式ごとに分けるときは [format]（例 `1920x1080_30fps`）を後ろに付ける。
+String mergedFileName(DateTime time, {String? format}) {
   String two(int value) => value.toString().padLeft(2, '0');
   return 'kite_merged_${time.year}${two(time.month)}${two(time.day)}_'
-      '${two(time.hour)}${two(time.minute)}${two(time.second)}.mp4';
+      '${two(time.hour)}${two(time.minute)}${two(time.second)}'
+      '${format == null ? '' : '_$format'}.mp4';
 }

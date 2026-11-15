@@ -881,11 +881,14 @@ class _WorkspaceState extends State<Workspace> {
           const SnackBar(content: Text('つなぐには区間が2個以上必要です。')));
       return;
     }
-    final confirmed = await showDialog<bool>(
+    // Windowsは先に元動画の形式を調べ、違いがあればつなぎ方を選んでもらう。
+    final formats = await MergeService().inspectWindows(plan.entries);
+    if (!mounted || busy || loading) return;
+    final mode = await showDialog<MergeMode>(
         context: context,
-        builder: (_) =>
-            MergeConfirmDialog(plan: plan, android: Platform.isAndroid));
-    if (!mounted || confirmed != true || busy || loading) return;
+        builder: (_) => MergeConfirmDialog(
+            plan: plan, android: Platform.isAndroid, formats: formats));
+    if (!mounted || mode == null || busy || loading) return;
     String? directory;
     if (Platform.isWindows) {
       directory = await getDirectoryPath(confirmButtonText: 'ここに保存');
@@ -941,6 +944,7 @@ class _WorkspaceState extends State<Workspace> {
           : await service.mergeWindows(
               entries: plan.entries,
               directory: directory!,
+              mode: mode,
               onProgress: report);
     } on MergeCancelled {
       cancelled = true;

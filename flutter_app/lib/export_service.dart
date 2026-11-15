@@ -135,8 +135,11 @@ class ExportService {
       FileSystemEntity.typeSync(path) != FileSystemEntityType.notFound;
 
   /// `-n` で既存ファイルを上書きしない高速コピー。1件保存・一括保存・結合で共通。
-  Future<ProcessResult> copyRange(
-      String source, ClipRange range, String output) async {
+  ///
+  /// [videoTimescale] は映像の時刻の刻み。結合では全区間でそろえないと、
+  /// フレームレートや撮影機器が違う動画をつないだときに時刻が壊れる。
+  Future<ProcessResult> copyRange(String source, ClipRange range, String output,
+      {int? videoTimescale}) async {
     final executable = await ffmpegPath();
     return Process.run(executable, [
       '-hide_banner',
@@ -155,6 +158,7 @@ class ExportService {
       '0:a:0?',
       '-c',
       'copy',
+      if (videoTimescale != null) ...['-video_track_timescale', '$videoTimescale'],
       output,
     ]);
   }
