@@ -16,7 +16,8 @@ class BatchEntry {
 
 /// 一覧から保存対象を抽出する。ファイル操作は行わない。
 class BatchPlan {
-  BatchPlan._(this.entries, this.skippedSaved, this.unconfirmedVideos);
+  BatchPlan._(this.entries, this.skippedSaved, this.unconfirmedVideos,
+      this.noProposalVideos, this.wholeVideos, this.wholeMs);
   static const maxStemLength = 60;
 
   final List<BatchEntry> entries;
@@ -27,6 +28,14 @@ class BatchPlan {
   /// 長さ未確認で区間がなく、対象外にした動画数。
   final int unconfirmedVideos;
 
+  /// AIの提案が0個で区間に手を入れていないため、対象外にした動画数。
+  final int noProposalVideos;
+
+  /// 区間を決めていない（全体1区間のまま）で対象に入る動画の数と合計の長さ。
+  /// 解析していない動画がそのまま長く入るのを、確認画面で気づけるようにする。
+  final int wholeVideos;
+  final int wholeMs;
+
   bool get isEmpty => entries.isEmpty;
   int get videoCount => entries.map((e) => e.item).toSet().length;
   int get totalMs => entries.fold(0, (sum, e) => sum + e.lengthMs);
@@ -35,11 +44,22 @@ class BatchPlan {
     final entries = <BatchEntry>[];
     var skipped = 0;
     var unconfirmed = 0;
+    var noProposals = 0;
+    var whole = 0;
+    var wholeMs = 0;
     for (var i = 0; i < items.length; i++) {
       final item = items[i];
       if (item.segments.isEmpty) {
         unconfirmed++;
         continue;
+      }
+      if (item.excludedNoProposals) {
+        noProposals++;
+        continue;
+      }
+      if (item.isUntouchedDefault) {
+        whole++;
+        wholeMs += item.durationMs!;
       }
       for (var n = 0; n < item.segments.length; n++) {
         final segment = item.segments[n];
@@ -54,7 +74,8 @@ class BatchPlan {
             fileName: batchFileName(i + 1, item.name, n + 1)));
       }
     }
-    return BatchPlan._(List.unmodifiable(entries), skipped, unconfirmed);
+    return BatchPlan._(List.unmodifiable(entries), skipped, unconfirmed,
+        noProposals, whole, wholeMs);
   }
 }
 

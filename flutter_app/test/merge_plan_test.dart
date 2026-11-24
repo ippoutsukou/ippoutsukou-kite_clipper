@@ -44,6 +44,22 @@ void main() {
       expect(plan.unconfirmedVideos, 1);
       expect(plan.canMerge, isFalse);
     });
+
+    test('提案0個の動画は全長を入れず、全体のままの動画は数える', () {
+      final session = ClipSession();
+      final items = session.add(['none.mp4', 'whole.mp4', 'cut.mp4']);
+      items[0].setDuration(600000);
+      items[0].noProposals = true;
+      items[1].setDuration(8000);
+      items[2].setDuration(9000);
+      items[2].setRange(1000, 3000);
+      final plan = MergePlan.from(session.items, exists: (_) => true);
+      expect(plan.entries.map((e) => e.item.name), ['whole.mp4', 'cut.mp4']);
+      expect(plan.totalMs, 8000 + 2000);
+      expect(plan.noProposalVideos, 1);
+      expect(plan.wholeVideos, 1);
+      expect(plan.wholeMs, 8000);
+    });
   });
 
   group('形式の照合', () {

@@ -199,6 +199,20 @@ void main() {
     expect(empty.warning, contains('新しく始めます'));
   });
 
+  test('提案0個の印を記録し、古い記録（印なし）は印なしで読む', () {
+    final session = ClipSession()..add(['a.mp4', 'b.mp4']);
+    session.items[0]
+      ..setDuration(5000)
+      ..noProposals = true;
+    session.items[1].setDuration(5000);
+    final text = encodeSession(session);
+    expect((jsonDecode(text)['items'] as List)[1].containsKey('noProposals'),
+        isFalse);
+    final restored = decodeSession(text, exists: (_) => true);
+    expect(restored.session.items[0].excludedNoProposals, isTrue);
+    expect(restored.session.items[1].noProposals, isFalse);
+  });
+
   test('AI解析の結果も記録し、壊れていればその結果だけ捨てる', () {
     final session = sample();
     session.items[0].analysis = const AnalysisRecord(

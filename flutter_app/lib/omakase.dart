@@ -65,8 +65,9 @@ class OmakaseOutcome {
         OmakaseStatus.added => '区間$added個を追加'
             '${overLimit > 0 ? '（$overLimit個は上限のため追加せず）' : ''}'
             '${partial ? '（途中までの結果）' : ''}',
-        OmakaseStatus.noProposals =>
-          '提案0個（区間は変更なし）${partial ? '（途中までの結果）' : ''}',
+        OmakaseStatus.noProposals => partial
+            ? '提案0個（区間は変更なし）（途中までの結果）'
+            : '提案0個（保存・まとめる対象から外しました）',
         OmakaseStatus.failed => '失敗：${message ?? '原因不明'}',
         OmakaseStatus.skipped => '中止のため未処理',
       };
@@ -99,6 +100,8 @@ OmakaseOutcome applyOmakaseResult({
       scores: result.scores,
       model: model,
       durationMs: duration < result.durationMs ? duration : result.durationMs);
+  // 途中までの結果で0個なら、残りに提案があるかもしれないため外さない。
+  item.noProposals = proposals.isEmpty && !partial;
   if (proposals.isEmpty) {
     return OmakaseOutcome(item.name, OmakaseStatus.noProposals, partial: partial);
   }

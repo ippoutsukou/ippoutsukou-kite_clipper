@@ -431,12 +431,22 @@ class _WorkspaceState extends State<Workspace> {
                         Navigator.pop(context);
                         unawaited(removeClip(item));
                       },
+                      onInclude: (item) {
+                        includeWhole(item);
+                        updateSheet(() {});
+                      },
                       onRemoveMany: (items) {
                         Navigator.pop(context);
                         unawaited(removeClips(items));
                       })),
             )));
     if (chosen != null && mounted) await selectClip(chosen);
+  }
+
+  /// 提案0個で外した動画を、全体のまま保存・まとめる対象に戻す。
+  void includeWhole(ClipItem item) {
+    if (busy || loading || !session.items.contains(item)) return;
+    setState(() => item.noProposals = false);
   }
 
   void moveClip(ClipItem item, int delta) {
@@ -686,6 +696,11 @@ class _WorkspaceState extends State<Workspace> {
         scores: result.scores,
         model: model,
         durationMs: result.durationMs);
+    // 最後まで解析して0個なら、全長のまま保存・結合されないよう対象から外す（おまかせと同じ）。
+    if (session.items.contains(item)) {
+      setState(() => item.noProposals = proposals.isEmpty &&
+          !(result!.cancelled || result.truncated));
+    }
     // 他の競技モデルでいくつ提案できたかを数える（採点済みの点数を使うだけなので軽い）。
     final otherCounts = <String, int>{};
     for (final other in models) {
@@ -877,8 +892,9 @@ class _WorkspaceState extends State<Workspace> {
     rememberActive();
     final plan = MergePlan.from(session.items);
     if (!plan.canMerge) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('つなぐには区間が2個以上必要です。')));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('つなぐには区間が2個以上必要です。'
+              '${plan.noProposalVideos > 0 ? 'AIの提案がなかった動画${plan.noProposalVideos}本は対象外です。' : ''}')));
       return;
     }
     // Windowsは先に元動画の形式を調べ、違いがあればつなぎ方を選んでもらう。
@@ -1133,6 +1149,7 @@ class _WorkspaceState extends State<Workspace> {
             onSelect: selectClip,
             onMove: moveClip,
             onRemove: removeClip,
+            onInclude: includeWhole,
             onRemoveMany: removeClips),
       );
 

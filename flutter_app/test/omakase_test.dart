@@ -96,12 +96,44 @@ void main() {
           sportId: 'kite', intervalMs: 1000, durationMs: 10000), isTrue);
     });
 
-    test('提案0個なら区間は変えない', () {
+    test('提案0個なら区間は変えず、保存・まとめる対象から外す', () {
       final item = ClipItem('a.mp4')..setDuration(10000);
       final outcome = apply(item, result([0.1, 0.2, 0.3]));
       expect(outcome.status, OmakaseStatus.noProposals);
+      expect(outcome.describe(), contains('対象から外しました'));
       expect(item.isUntouchedDefault, isTrue);
       expect(item.analysis, isNotNull);
+      expect(item.excludedNoProposals, isTrue);
+    });
+
+    test('途中までの結果で提案0個なら外さない', () {
+      final item = ClipItem('a.mp4')..setDuration(10000);
+      final outcome = apply(item, result([0.1, 0.2], cancelled: true));
+      expect(outcome.status, OmakaseStatus.noProposals);
+      expect(item.excludedNoProposals, isFalse);
+    });
+
+    test('触った区間がある動画は、提案0個でも対象のまま', () {
+      final item = ClipItem('a.mp4')..setDuration(10000);
+      item.setRange(1000, 3000);
+      apply(item, result([0.1, 0.2, 0.3]));
+      expect(item.noProposals, isTrue);
+      expect(item.excludedNoProposals, isFalse);
+    });
+
+    test('提案0個の後に区間を変えると対象に戻り、提案を入れると印が消える', () {
+      final item = ClipItem('a.mp4')..setDuration(10000);
+      apply(item, result([0.1, 0.2, 0.3]));
+      item.setRange(0, 4000);
+      expect(item.excludedNoProposals, isFalse);
+
+      final other = ClipItem('b.mp4')..setDuration(10000);
+      apply(other, result([0.1, 0.2, 0.3]));
+      apply(other, result([0.9, 0.9, 0.1]));
+      expect(other.noProposals, isFalse);
+      expect(other.segments, hasLength(1));
+      expect(other.segments.first.startMs, 0);
+      expect(other.segments.first.endMs, 1000);
     });
 
     test('利用者が触った区間は残し、後ろに足す', () {

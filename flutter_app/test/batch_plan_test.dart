@@ -37,6 +37,26 @@ void main() {
     expect(() => plan.entries.clear(), throwsUnsupportedError);
   });
 
+  test('提案0個の動画は外して数え、全体のままの動画は本数と長さを数える', () {
+    final session = ClipSession();
+    final items = session.add(['a.mp4', 'b.mp4', 'c.mp4', 'd.mp4']);
+    items[0].setDuration(10000);
+    items[0].noProposals = true; // 提案0個・初期区間のまま → 外す
+    items[1].setDuration(20000); // 未解析・全体のまま → 入るが数える
+    items[2].setDuration(30000);
+    items[2].setRange(1000, 4000); // 区間を決めた動画
+    items[3].setDuration(40000);
+    items[3].noProposals = true;
+    items[3].setRange(0, 5000); // 提案0個でも触った区間は入る
+    final plan = BatchPlan.from(session.items);
+    expect(plan.entries.map((e) => e.item.name), ['b.mp4', 'c.mp4', 'd.mp4']);
+    expect(plan.entries.first.fileName, '002_b_区間1.mp4');
+    expect(plan.noProposalVideos, 1);
+    expect(plan.wholeVideos, 1);
+    expect(plan.wholeMs, 20000);
+    expect(plan.totalMs, 20000 + 3000 + 5000);
+  });
+
   test('対象が0件の計画は空', () {
     final session = ClipSession()..add(['a.mp4', 'b.mp4']);
     final plan = BatchPlan.from(session.items);

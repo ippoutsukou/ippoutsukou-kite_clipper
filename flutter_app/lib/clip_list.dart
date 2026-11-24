@@ -10,7 +10,8 @@ class ClipList extends StatefulWidget {
       required this.onSelect,
       this.onMove,
       this.onRemove,
-      this.onRemoveMany});
+      this.onRemoveMany,
+      this.onInclude});
   final List<ClipItem> items;
   final ClipItem? selected;
   final bool enabled;
@@ -20,6 +21,9 @@ class ClipList extends StatefulWidget {
 
   /// 複数選んで外す依頼。確認と実際の取り外しは呼び出し側で行う。
   final ValueChanged<List<ClipItem>>? onRemoveMany;
+
+  /// 提案0個で対象外の動画を、全体のまま対象に戻す。
+  final ValueChanged<ClipItem>? onInclude;
   @override
   State<ClipList> createState() => _ClipListState();
 }
@@ -140,6 +144,8 @@ class _ClipListState extends State<ClipList> {
                                         widget.onMove?.call(item, 1);
                                       if (action == 'remove')
                                         widget.onRemove?.call(item);
+                                      if (action == 'include')
+                                        widget.onInclude?.call(item);
                                     },
                                     itemBuilder: (_) => [
                                       if (widget.onMove != null) ...[
@@ -152,6 +158,11 @@ class _ClipListState extends State<ClipList> {
                                             enabled: index < items.length - 1,
                                             child: const Text('下へ')),
                                       ],
+                                      if (widget.onInclude != null &&
+                                          item.excludedNoProposals)
+                                        const PopupMenuItem(
+                                            value: 'include',
+                                            child: Text('全体を対象に戻す')),
                                       if (widget.onRemove != null)
                                         const PopupMenuItem(
                                             value: 'remove',
@@ -182,6 +193,8 @@ class _ClipListState extends State<ClipList> {
                                 ? '読み込み・処理エラー（選択して確認）'
                                 : item.segments.isEmpty
                                     ? '長さ未確認'
+                                    : item.excludedNoProposals
+                                    ? 'AIの提案なし（保存・まとめる対象外）'
                                     : '区間${item.segments.length} ・ 合計${(item.segments.fold<int>(0, (sum, s) => sum + s.endMs - s.startMs) / 1000).toStringAsFixed(1)}秒',
                             maxLines: 2),
                       ),

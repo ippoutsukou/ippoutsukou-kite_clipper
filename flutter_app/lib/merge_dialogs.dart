@@ -127,6 +127,14 @@ class _MergeConfirmDialogState extends State<MergeConfirmDialog> {
             ],
             if (plan.unconfirmedVideos > 0)
               Text('まだ開いていない動画${plan.unconfirmedVideos}本は、長さが未確認のため含まれません。'),
+            if (plan.noProposalVideos > 0)
+              Text('AIの提案がなかった動画${plan.noProposalVideos}本は含めません'
+                  '（一覧の「︙」から全体を対象に戻せます）。'),
+            if (plan.wholeVideos > 0)
+              Text(
+                  '区間を決めていない動画${plan.wholeVideos}本は、全体'
+                  '（合計${_seconds(plan.wholeMs)}秒）がそのまま入ります。',
+                  style: const TextStyle(color: Color(0xffa36a00))),
             const SizedBox(height: 8),
             const Text('順番を変えるときは、一覧の「︙」から「上へ」「下へ」で動画を並べ替えてください。',
                 style: _note),

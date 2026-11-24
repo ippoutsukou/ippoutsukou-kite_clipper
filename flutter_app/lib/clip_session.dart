@@ -95,6 +95,13 @@ class ClipItem {
   /// 直近のAI解析結果（作業記録に保存する）。
   AnalysisRecord? analysis;
 
+  /// 直近のAI解析（最後まで解析したもの）で提案が0個だったか。作業記録に保存する。
+  bool noProposals = false;
+
+  /// 提案0個で、区間に手を入れていない動画。全長がそのまま保存・結合されないよう対象から外す。
+  /// 区間を変えれば対象に戻る（[noProposals] を消すと全体のまま対象に戻る）。
+  bool get excludedNoProposals => noProposals && isUntouchedDefault;
+
   /// 長さ確定前は空。確定後は常に1〜20件。
   final List<ClipSegment> _segments = [];
   List<ClipSegment> get segments => List.unmodifiable(_segments);

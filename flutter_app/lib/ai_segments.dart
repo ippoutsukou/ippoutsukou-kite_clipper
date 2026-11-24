@@ -109,6 +109,7 @@ AppliedSegments applyProposedSegments(
     return const AppliedSegments(added: 0, skipped: 0, replaced: false);
   }
   final replace = item.isUntouchedDefault;
+  item.noProposals = false;
   var added = 0;
   var firstIndex = -1;
   for (final proposal in proposals) {
