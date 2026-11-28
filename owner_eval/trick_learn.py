@@ -74,7 +74,8 @@ def peaks(score: np.ndarray) -> list[int]:
     return out
 
 
-def evaluate(name: str, clips: list[dict], key: str, lines: list[str], top_n: int = 40) -> list[tuple]:
+def evaluate(name: str, clips: list[dict], key: str, lines: list[str], top_n: int = 40,
+             what: str = "空中") -> list[tuple]:
     y = np.concatenate([c["y"] for c in clips])
     s = np.concatenate([c[key] for c in clips])
     use = y >= 0
@@ -95,8 +96,8 @@ def evaluate(name: str, clips: list[dict], key: str, lines: list[str], top_n: in
         for e_i, (a, b) in enumerate(c["events"]):
             if a - 0.5 <= t <= b + 0.5:
                 found.add((c["name"], e_i))
-    lines.append(f"{name}: AUC {auc:.3f} / 上位{top_n}場面のうち空中 {hit}（迷う {unk}）"
-                 f" / 空中の場面{n_events}個のうち上位{k_rec}場面で拾えた {len(found)}")
+    lines.append(f"{name}: AUC {auc:.3f} / 上位{top_n}場面のうち{what} {hit}（迷う {unk}）"
+                 f" / {what}の場面{n_events}個のうち上位{k_rec}場面で拾えた {len(found)}")
     return top
 
 
