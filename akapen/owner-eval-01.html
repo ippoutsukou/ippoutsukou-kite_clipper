@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- akapen-format: v3 -->
+<!--
+  akapen sheet template (標準モード) — シートの規約 v3 のシート + 赤ピン (視覚訂正) + 回答フォーム、HTML 1 枚で自己完結。
+  使い方: ./akapen/<topic>-01.html としてコピーし、TODO を埋める。
+  - 上半分 (#akSheet) = シート。骨格は固定: 結論 → 全体図 SVG (赤①②③) → 短い説明 (現物スクショ/モック) → 対比表 → 問いカード → 畳み付録
+  - 下半分 (#akForm) = 回答フォーム。問いカード (.qcard、判断材料) と回答ブロック (.q、答える場所) は別部品
+  - .q の radio name は q1, q2, … で script の QUESTIONS と同期する (ズレた問いは無言で「お任せ」扱いになる)
+  - DRAFT_KEY / DOC はシートごとに一意な固定文字列 (crypto.randomUUID は使わない — file:// 以外で undefined)
+  - 相対 URL 禁止 (画像は https 絶対 URL か data URI)。外部 JS ライブラリ禁止。Google Fonts は絶対 URL なので合法
+  - 色は 7 トークンのみ。赤 = 提案・訂正・論点の専任 / 青 = 導線 (リンク・ボタン・summary) の専任 / 残りは無彩色
+  - 回答は [貼り付ける文章を作る] → クリップボード + textarea。人が Claude Code のターミナルに貼る (形は references/reply-format.md)
+  - 回答フォームの選択肢にも絵 (.thumb) を付ける。人はシートを読んでからフォームで答える — フォームで絵が消えると想像で補わせることになる
+-->
+<!-- akapin:start -->
+<!--
+  - 赤ピン: 「✎ 視覚訂正モード」を ON にすると #akSheet 上のクリックでピン (赤①②③…) を打てる。座標は #akSheet 左上原点の %。
+    agent が先打ちする図中の ①②③ (注記) と、人のピン 赤①②③ は別物 — 混同しない
+-->
+<!-- akapin:end -->
+<!-- akrelay:start -->
+<!--
+  - akapen-serve.py 経由 (http://127.0.0.1) で開かれた時はボタンが [送信] になり、同じテキストを POST /akapen-answer で中継へ送る (貼り戻し不要)。file:// では従来経路
+-->
+<!-- akrelay:end -->
+<title>今のAIは、オーナーが「使う場面」をほとんど見分けられない — 赤ペン</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@400;500;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#212529;--muted:#64707C;--line:#DEE2E6;--paper:#FFFFFF;--paper-dim:#F6F8FA;--accent:#2563EB;--red:#DC2626}
+*{box-sizing:border-box}
+body{background:var(--paper);color:var(--ink);font-family:'IBM Plex Sans JP','Hiragino Kaku Gothic ProN','Hiragino Sans',-apple-system,sans-serif;font-size:14.5px;line-height:1.9;margin:0;border-top:3px solid var(--red);padding:0 16px 40px}
+main{max-width:760px;margin:0 auto}
+.kicker{font-family:'IBM Plex Mono',Menlo,monospace;font-size:12.5px;letter-spacing:.08em;color:var(--red);font-weight:600}
+h1{font-size:25px;line-height:1.45;margin:8px 0 12px}
+h2{font-size:19px;line-height:1.45;margin:30px 0 8px;padding-bottom:4px;border-bottom:1px solid var(--line)}
+h3{font-size:15px;line-height:1.5;margin:0 0 8px}
+p{margin:8px 0}
+a{color:var(--accent)}
+.concl{border:1px solid var(--line);border-left:3px solid var(--red);border-radius:10px;padding:14px 18px}
+.red{color:var(--red)}
+.m{color:var(--muted);font-size:12.5px;line-height:1.7}
+.mono{font-family:'IBM Plex Mono',Menlo,monospace;font-size:13.5px}
+.gl{font-size:12.5px;color:var(--muted);line-height:1.75;border-left:2px solid var(--line);padding-left:10px;margin:8px 0}
+.btn{display:inline-block;border:1px solid var(--accent);color:var(--accent);background:var(--paper);border-radius:8px;padding:4px 14px;font-size:13px;text-decoration:none;cursor:pointer;font-family:inherit;line-height:1.7}
+.btn:hover{background:var(--paper-dim)}
+figure{margin:14px 0 6px}
+figcaption{font-size:12.5px;color:var(--muted);line-height:1.6;padding-top:4px}
+svg{max-width:100%;height:auto;display:block}
+table{border-collapse:collapse;width:100%;font-size:13.5px;line-height:1.6;margin:8px 0}
+th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
+th{font-size:11.5px;letter-spacing:.06em;color:var(--muted);font-weight:500;white-space:nowrap;border-bottom:1.5px solid var(--ink)}
+td.n{font-family:'IBM Plex Mono',Menlo,monospace;font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}
+details{border:1px solid var(--line);border-radius:10px;padding:10px 16px;margin:10px 0}
+summary{cursor:pointer;color:var(--accent);font-weight:500;font-size:13.5px}
+/* 問いカード (自己完結 — シート側の判断材料。答える場所は下の .q) */
+.qcard{border:1px solid var(--line);border-left:3px solid var(--red);border-radius:10px;padding:12px 16px;margin:12px 0}
+.qcard .qt{font-weight:700;margin:0 0 6px}
+.qcard ul{margin:4px 0;padding-left:1.3em}.qcard li{margin:4px 0}
+.rec{font-family:'IBM Plex Mono',Menlo,monospace;font-size:11px;color:var(--red);border:1px solid var(--red);border-radius:4px;padding:0 5px;margin-left:4px;white-space:nowrap}
+/* overlay 注記 (赤を画像の上に乗せる部品 — 座標は画像に対する %) */
+.shotwrap{position:relative;line-height:0;margin:8px 0 4px}
+.shotwrap img{width:100%;border:1px solid var(--line);border-radius:8px;display:block}
+.shotwrap .mark{position:absolute;transform:translate(-50%,-50%);width:26px;height:26px;border:2.5px solid var(--red);border-radius:50%;background:rgba(255,255,255,.78);color:var(--red);font:600 13px/21px 'IBM Plex Mono',Menlo,monospace;text-align:center}
+.shotwrap .lbl{position:absolute;transform:translateX(-50%);background:var(--red);color:#fff;font:700 11px/1.5 sans-serif;padding:2px 8px;border-radius:4px;white-space:nowrap}
+/* A/B 対比 (choice の対立軸を並べる部品) */
+.ab{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.ab figure{margin:0}.ab figcaption{font-size:12.5px;color:var(--muted);line-height:1.6;padding-top:4px}
+@media (max-width:640px){.ab{grid-template-columns:1fr}}
+del{color:var(--muted)}
+footer{margin-top:28px;border-top:1px solid var(--line);padding-top:10px}
+
+/* akapin:start */
+/* ---- ヘッダバー (視覚訂正トグル) ---- */
+.akbar{position:sticky;top:0;z-index:20;background:var(--paper);display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0 8px;border-bottom:1px solid var(--line);margin-bottom:6px}
+.akbar .hint{font-size:12.5px;color:var(--muted);line-height:1.5}
+#pinToggle{border:1px solid var(--line);background:var(--paper);color:var(--ink);border-radius:8px;padding:4px 12px;font-size:13px;font-family:inherit;cursor:pointer;white-space:nowrap;line-height:1.7}
+#pinToggle.on{border-color:var(--red);color:var(--red);background:rgba(220,38,38,.06)}
+
+/* ---- シート (赤ピンの座標系の原点) ---- */
+#akSheet.pinmode{cursor:crosshair;outline:2px dashed var(--red);outline-offset:6px}
+#akSheet.pinmode a,#akSheet.pinmode summary,#akSheet.pinmode button{cursor:crosshair}
+.akpin{position:absolute;transform:translate(-50%,-50%);width:24px;height:24px;border-radius:50%;background:var(--red);color:#fff;font:600 13px/24px 'IBM Plex Mono',Menlo,monospace;text-align:center;box-shadow:0 0 0 2px var(--paper),0 1px 4px rgba(0,0,0,.25);pointer-events:none;z-index:10;user-select:none}
+#akSheet.pinmode .akpin{pointer-events:auto;cursor:pointer}
+.akpin.active{box-shadow:0 0 0 2px var(--paper),0 0 0 4px var(--red)}
+.akpop{position:absolute;z-index:15;width:280px;max-width:90vw;background:var(--paper);border:1px solid var(--red);border-radius:10px;padding:10px 12px;box-shadow:0 4px 16px rgba(0,0,0,.14);cursor:auto;line-height:1.6}
+.akpop .t{font-size:12.5px;color:var(--red);font-weight:600;margin-bottom:4px;font-family:'IBM Plex Mono',Menlo,monospace}
+.akpop textarea{min-height:64px;margin-top:0}
+.akpop .row{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
+.akpop button{font-family:inherit;font-size:12.5px;border-radius:6px;padding:3px 12px;cursor:pointer;line-height:1.7}
+.akpop .save{border:1px solid var(--red);background:var(--red);color:#fff}
+.akpop .del{border:1px solid var(--line);background:var(--paper);color:var(--muted)}
+/* akapin:end */
+
+/* ---- シート ---- */
+#akSheet{position:relative;padding-top:8px}
+
+/* ---- 回答フォーム ---- */
+#akForm{margin-top:36px}
+.q{border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:12px 0;background:var(--paper)}
+.q label{display:block;border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin:6px 0;cursor:pointer;line-height:1.7}
+.q label:has(input:checked){border-color:var(--red);background:rgba(220,38,38,.06)}
+.q input[type=radio]{margin:0 8px 0 0;accent-color:#DC2626;vertical-align:-1px}
+.q .opt-d{color:var(--muted);font-size:12.5px;margin:2px 0 0 22px;line-height:1.6}
+/* 選択肢の絵 (.thumb) — 見た目が違う選択肢には、シート本文の .ab / SVG と同じ絵をここにも置く。無彩色枝、選択中はラベルと同じ淡赤 */
+.q label .thumb{display:flex;flex-direction:column;justify-content:center;min-height:120px;margin:8px 0 2px 22px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--paper-dim)}
+.q label .thumb svg{width:100%;height:150px;max-width:100%}
+.q label .thumb img{display:block;max-width:100%;max-height:160px;margin:0 auto}
+.q label .thumb figcaption{font-size:12px;color:var(--muted);line-height:1.5;padding-top:4px}
+.q label:has(input:checked) .thumb{border-color:var(--red);background:rgba(220,38,38,.04)}
+textarea{width:100%;min-height:54px;margin-top:8px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--paper);color:var(--ink);font-family:inherit;font-size:13.5px;line-height:1.7;resize:vertical}
+textarea:focus{outline:none;border-color:var(--red)}
+.redpen textarea{min-height:110px}
+.clearsel{display:inline-block;margin-top:8px;color:var(--muted);font-size:12px;cursor:pointer;text-decoration:underline}
+/* akapin:start */
+#pinList{list-style:none;margin:0;padding:0}
+#pinList li{display:flex;gap:10px;align-items:flex-start;border-bottom:1px solid var(--line);padding:6px 0;font-size:13.5px}
+#pinList li:last-child{border-bottom:0}
+#pinList .no{color:var(--red);font-family:'IBM Plex Mono',Menlo,monospace;font-weight:600;white-space:nowrap}
+#pinList .xy{color:var(--muted);font-family:'IBM Plex Mono',Menlo,monospace;font-size:12px;white-space:nowrap}
+#pinList .txt{flex:1;white-space:pre-wrap;word-break:break-word}
+#pinList .ops{white-space:nowrap}
+#pinList .ops a{font-size:12px;color:var(--accent);cursor:pointer;margin-left:8px;text-decoration:underline}
+#pinEmpty{color:var(--muted);font-size:12.5px;margin:0}
+/* akapin:end */
+.sendbar{position:sticky;bottom:0;background:linear-gradient(rgba(255,255,255,0),var(--paper) 30%);padding:20px 0 12px;text-align:center}
+#genBtn{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:11px 32px;font-size:15px;font-weight:700;cursor:pointer;font-family:inherit}
+#genBtn:hover{filter:brightness(.95)}
+.status{margin-top:8px;font-size:12.5px;color:var(--muted);min-height:18px}
+.status.ok{color:var(--ink)}.status.err{color:var(--muted)}
+#out{display:none;font-family:'IBM Plex Mono',Menlo,monospace;font-size:12.5px;min-height:170px;margin-top:10px;text-align:left}
+@media print{.akbar,#akForm{display:none}summary{color:var(--ink)}details{border:none;padding:0}details[open] summary{display:none}}
+</style></head>
+<body><main>
+
+<!-- akapin:start -->
+<div class="akbar">
+  <div class="hint">回答はこのシートの下のフォームへ。シートの上に直接訂正を書きたいときは右のボタンを ON にしてクリック。</div>
+  <button id="pinToggle" type="button" onclick="togglePinMode()" aria-pressed="false">✎ 視覚訂正モード: OFF</button>
+</div>
+<!-- akapin:end -->
+
+<!-- ================= シート (提案領域 = 赤ピンの座標系の原点) ================= -->
+<section id="akSheet">
+
+<div class="kicker">✎ AKAPEN — 2026-11-26</div>
+<h1>今のAIは、オーナーが「使う場面」をほとんど見分けられない</h1>
+<div class="concl"><b>結論:</b> 今の kite 設定のおまかせは素材の6割（343秒）を残し、その中でオーナーが実際に使った部分は18%でした。でたらめに選んだ場合の14%とほぼ同じです。オーナーは見せ場があるときだけ短く撮るので、素材のほとんどにカイトが写っています。「カイトが写っているか」を見る今のモデルでは、使う場面と使わない場面の点数に差が出ません。次は、オーナーの採否そのものを学習したモデルが必要です。</div>
+<div class="gl"><b>このシートで使う言葉</b>:<br>
+正解区間 — 完成動画の1コマずつを元素材から探して特定した「オーナーが実際に使った区間」<br>
+点数 — モデルが動画の1秒ごとに付ける0〜1の値。高いほど「残す場面」らしい<br>
+提案 — おまかせが点数をもとに動画へ自動で入れる区間<br>
+採否 — オーナーがその場面を完成動画に使ったか、使わなかったか<br>
+学習 — 正解つきの例を大量に見せて、モデルの点数の付け方を作ること<br>
+再現率 — 正解区間のうち、AIの提案に含まれた時間の割合（高いほど取りこぼしが少ない）<br>
+適合率 — AIの提案のうち、正解区間だった時間の割合（高いほどムダが少ない）<br>
+おまかせ — 動画を追加すると自動で AI解析し、区間を入れるアプリの機能。kite / wing / windsurf / kite_static は競技別のモデル名<br>
+enter / exit — 区間を始める点数と、続ける点数の下限（kite は 0.5 / 0.4）</div>
+
+<figure>
+<svg viewBox="0 0 720 250" role="img" aria-label="今回の評価の流れと、決めてほしい3点の位置">
+  <style>
+    .bt{font:600 12px 'IBM Plex Sans JP',sans-serif;fill:#212529}
+    .bl{font:400 11px 'IBM Plex Sans JP',sans-serif;fill:#64707C}
+    .bk{font:500 11.5px 'IBM Plex Sans JP',sans-serif;fill:#212529}
+    .rd{font:600 11px 'IBM Plex Sans JP',sans-serif;fill:#DC2626}
+    .num{font:600 12px 'IBM Plex Mono',monospace;fill:#DC2626}
+    .box{fill:#F6F8FA;stroke:#DEE2E6;stroke-width:1}
+    .boxr{fill:#FFF5F5;stroke:#DC2626;stroke-width:1.4}
+  </style>
+  <defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8z" fill="#64707C"/></marker></defs>
+  <text x="10" y="18" class="bt">完成動画から「正解」を作り、アプリと同じ解析の提案と比べた</text>
+  <rect x="10" y="34" width="160" height="66" rx="6" class="box"/>
+  <text x="22" y="56" class="bk">元素材 54本・573秒</text><text x="22" y="74" class="bl">10/7 と 10/10、スマホ4K</text><text x="22" y="90" class="bl">撮ったまま全部</text>
+  <rect x="10" y="118" width="160" height="66" rx="6" class="box"/>
+  <text x="22" y="140" class="bk">完成動画 約1分50秒</text><text x="22" y="158" class="bl">YouTube の画面録画</text><text x="22" y="174" class="bl">ズーム・切り抜きあり</text>
+  <rect x="220" y="76" width="160" height="66" rx="6" class="box"/>
+  <text x="232" y="98" class="bk">照合（コマの特徴点）</text><text x="232" y="116" class="bl">正解区間 33個・82秒</text><text x="232" y="132" class="bl">使用26本 / 未使用24本</text>
+  <rect x="220" y="160" width="160" height="66" rx="6" class="box"/>
+  <text x="232" y="182" class="bk">Flutter版の解析</text><text x="232" y="200" class="bl">おまかせと同じ処理</text><text x="232" y="216" class="bl">4モデル・1秒間隔</text>
+  <rect x="430" y="110" width="140" height="70" rx="6" class="box"/>
+  <text x="442" y="132" class="bk">比べる</text><text x="442" y="150" class="bl">kite：再現率73%</text><text x="442" y="166" class="rd">適合率18%（でたらめ14%）</text>
+  <line x1="170" y1="67" x2="218" y2="100" stroke="#64707C" marker-end="url(#ar)"/>
+  <line x1="170" y1="151" x2="218" y2="118" stroke="#64707C" marker-end="url(#ar)"/>
+  <line x1="40" y1="100" x2="40" y2="116" stroke="#DEE2E6"/>
+  <path d="M90,100 C90,200 150,193 218,193" fill="none" stroke="#64707C" marker-end="url(#ar)"/>
+  <line x1="380" y1="109" x2="428" y2="135" stroke="#64707C" marker-end="url(#ar)"/>
+  <line x1="380" y1="193" x2="428" y2="160" stroke="#64707C" marker-end="url(#ar)"/>
+  <rect x="610" y="34" width="100" height="56" rx="6" class="boxr"/><text x="622" y="56" class="rd">次のモデル</text><text x="622" y="74" class="rd">をどう作るか</text>
+  <circle cx="702" cy="36" r="11" fill="#fff" stroke="#DC2626" stroke-width="2"/><text x="698" y="40" class="num">1</text>
+  <rect x="610" y="110" width="100" height="56" rx="6" class="boxr"/><text x="622" y="132" class="rd">それまでの</text><text x="622" y="150" class="rd">おまかせ設定</text>
+  <circle cx="702" cy="112" r="11" fill="#fff" stroke="#DC2626" stroke-width="2"/><text x="698" y="116" class="num">2</text>
+  <rect x="610" y="186" width="100" height="56" rx="6" class="boxr"/><text x="622" y="208" class="rd">オーナーへの</text><text x="622" y="226" class="rd">伝え方</text>
+  <circle cx="702" cy="188" r="11" fill="#fff" stroke="#DC2626" stroke-width="2"/><text x="698" y="192" class="num">3</text>
+  <line x1="570" y1="145" x2="606" y2="62" stroke="#DC2626" stroke-dasharray="3 2"/>
+  <line x1="570" y1="145" x2="606" y2="138" stroke="#DC2626" stroke-dasharray="3 2"/>
+  <line x1="570" y1="145" x2="606" y2="214" stroke="#DC2626" stroke-dasharray="3 2"/>
+</svg>
+<figcaption>図 1 — 左から右へ評価の流れ。右端の赤い ①②③ が、下の「決めてほしいこと」の問 1〜3 です。</figcaption>
+</figure>
+
+<h2>使われた動画も使われなかった動画も、ほぼ丸ごと提案している</h2>
+<p>下の図は54本を1行ずつ並べたものです。赤枠がオーナーが使った区間、灰色の帯が kite の提案です。<span class="red">上の26本（使われた動画）でも下の24本（使われなかった動画）でも、灰色の帯の付き方はほとんど同じです。</span>モデルの点数が、オーナーの採否と関係なく動いていることがわかります。</p>
+<figure>
+<svg viewBox="0 0 720 560" role="img" aria-label="動画ごとの正解区間とkiteの提案">
+<style>.t{font:600 12px 'IBM Plex Sans JP',sans-serif;fill:#212529}.l{font:400 9.5px 'IBM Plex Mono',monospace;fill:#64707C}.lg{font:400 11px 'IBM Plex Sans JP',sans-serif;fill:#64707C}</style>
+<text x="0" y="14" class="t">kite は使われた動画も使われなかった動画も、ほぼ丸ごと提案している</text>
+<text x="144" y="41" class="l" text-anchor="end">261007_145659</text>
+<rect x="150" y="35" width="126.5" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="36.5" width="60.4" height="4" fill="#64707C"/>
+<rect x="171.0" y="34" width="39.1" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<rect x="218.3" y="34" width="5.6" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<rect x="229.5" y="34" width="2.9" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="50" class="l" text-anchor="end">261007_150024</text>
+<rect x="150" y="44" width="55.0" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="43" width="29.2" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="59" class="l" text-anchor="end">261007_150039</text>
+<rect x="150" y="53" width="109.3" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="54.5" width="109.3" height="4" fill="#64707C"/>
+<rect x="171.0" y="52" width="25.0" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<rect x="218.3" y="52" width="8.5" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="68" class="l" text-anchor="end">261007_150055</text>
+<rect x="150" y="62" width="196.2" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="212.5" y="63.5" width="132.7" height="4" fill="#64707C"/>
+<rect x="187.7" y="61" width="2.7" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<rect x="201.6" y="61" width="75.4" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<rect x="260.3" y="61" width="5.6" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<rect x="313.2" y="61" width="8.5" height="9" fill="none" stroke="#DC2626" stroke-width="1" stroke-dasharray="2 1.5"/>
+<text x="144" y="77" class="l" text-anchor="end">261007_150210</text>
+<rect x="150" y="71" width="135.0" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="187.6" y="72.5" width="97.4" height="4" fill="#64707C"/>
+<rect x="204.5" y="70" width="8.3" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<rect x="218.3" y="70" width="55.8" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="86" class="l" text-anchor="end">261007_150403</text>
+<rect x="150" y="80" width="77.5" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="81.5" width="77.5" height="4" fill="#64707C"/>
+<rect x="150.0" y="79" width="40.4" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="95" class="l" text-anchor="end">261010_125525</text>
+<rect x="150" y="89" width="56.2" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="88" width="32.1" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="104" class="l" text-anchor="end">261010_125533</text>
+<rect x="150" y="98" width="64.9" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="99.5" width="64.9" height="4" fill="#64707C"/>
+<rect x="150.0" y="97" width="34.8" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="113" class="l" text-anchor="end">261010_131520</text>
+<rect x="150" y="107" width="80.7" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="106" width="23.7" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="122" class="l" text-anchor="end">261010_132747</text>
+<rect x="150" y="116" width="62.0" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="117.5" width="62.0" height="4" fill="#64707C"/>
+<rect x="150.0" y="115" width="29.2" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="131" class="l" text-anchor="end">261010_132755</text>
+<rect x="150" y="125" width="32.5" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="124" width="9.8" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="140" class="l" text-anchor="end">261010_133733</text>
+<rect x="150" y="134" width="70.2" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="135.5" width="70.2" height="4" fill="#64707C"/>
+<rect x="150.0" y="133" width="26.6" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="149" class="l" text-anchor="end">261010_133759</text>
+<rect x="150" y="143" width="79.3" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="144.5" width="79.3" height="4" fill="#64707C"/>
+<rect x="150.0" y="142" width="40.4" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="158" class="l" text-anchor="end">261010_133829</text>
+<rect x="150" y="152" width="47.0" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="151.2" y="153.5" width="45.7" height="4" fill="#64707C"/>
+<rect x="159.8" y="151" width="16.7" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<rect x="184.8" y="151" width="2.9" height="9" fill="none" stroke="#DC2626" stroke-width="1" stroke-dasharray="2 1.5"/>
+<text x="144" y="167" class="l" text-anchor="end">261010_133853</text>
+<rect x="150" y="161" width="83.3" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="151.1" y="162.5" width="82.2" height="4" fill="#64707C"/>
+<rect x="165.4" y="160" width="25.0" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="176" class="l" text-anchor="end">261010_134314</text>
+<rect x="150" y="170" width="51.7" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="163.4" y="171.5" width="38.3" height="4" fill="#64707C"/>
+<rect x="150.0" y="169" width="29.2" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="185" class="l" text-anchor="end">261010_143316</text>
+<rect x="150" y="179" width="301.7" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="383.7" y="180.5" width="68.0" height="4" fill="#64707C"/>
+<rect x="150.0" y="178" width="68.3" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<rect x="441.5" y="178" width="2.9" height="9" fill="none" stroke="#DC2626" stroke-width="1" stroke-dasharray="2 1.5"/>
+<text x="144" y="194" class="l" text-anchor="end">261010_143546</text>
+<rect x="150" y="188" width="67.0" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="189.5" width="67.0" height="4" fill="#64707C"/>
+<rect x="150.0" y="187" width="23.7" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<rect x="176.6" y="187" width="13.8" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="203" class="l" text-anchor="end">261010_144503</text>
+<rect x="150" y="197" width="91.2" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="198.5" width="91.2" height="4" fill="#64707C"/>
+<rect x="150.0" y="196" width="46.0" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="212" class="l" text-anchor="end">261010_145826</text>
+<rect x="150" y="206" width="67.0" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="207.5" width="67.0" height="4" fill="#64707C"/>
+<rect x="171.0" y="205" width="16.7" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="221" class="l" text-anchor="end">261010_145846</text>
+<rect x="150" y="215" width="127.9" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="224.7" y="216.5" width="53.2" height="4" fill="#64707C"/>
+<rect x="193.3" y="214" width="25.0" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="230" class="l" text-anchor="end">261010_145908</text>
+<rect x="150" y="224" width="105.3" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="225.5" width="105.3" height="4" fill="#64707C"/>
+<rect x="176.6" y="223" width="33.5" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="239" class="l" text-anchor="end">261010_153304</text>
+<rect x="150" y="233" width="26.0" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="232" width="15.4" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="248" class="l" text-anchor="end">261010_153403</text>
+<rect x="150" y="242" width="23.6" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="243.5" width="23.4" height="4" fill="#64707C"/>
+<rect x="150.0" y="241" width="12.5" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="257" class="l" text-anchor="end">261010_153443</text>
+<rect x="150" y="251" width="110.5" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="252.5" width="109.4" height="4" fill="#64707C"/>
+<rect x="184.8" y="250" width="30.8" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<text x="144" y="266" class="l" text-anchor="end">261010_155201</text>
+<rect x="150" y="260" width="139.0" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="175.6" y="261.5" width="113.4" height="4" fill="#64707C"/>
+<rect x="198.9" y="259" width="33.5" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/>
+<line x1="150" y1="267.5" x2="720" y2="267.5" stroke="#64707C" stroke-width=".6" stroke-dasharray="3 2"/>
+<text x="720" y="266" class="l" text-anchor="end">↓ タイトル背景にだけ使われた動画（正解に使わない）</text>
+<text x="144" y="275" class="l" text-anchor="end">261007_130640</text>
+<rect x="150" y="269" width="65.5" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="159.8" y="268" width="27.9" height="9" fill="none" stroke="#DC2626" stroke-width="1" stroke-dasharray="2 1.5"/>
+<text x="144" y="284" class="l" text-anchor="end">261007_142119</text>
+<rect x="150" y="278" width="168.8" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="277" width="12.5" height="9" fill="none" stroke="#DC2626" stroke-width="1" stroke-dasharray="2 1.5"/>
+<text x="144" y="293" class="l" text-anchor="end">261007_145523</text>
+<rect x="150" y="287" width="172.9" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="163.5" y="288.5" width="159.5" height="4" fill="#64707C"/>
+<rect x="171.0" y="286" width="19.4" height="9" fill="none" stroke="#DC2626" stroke-width="1" stroke-dasharray="2 1.5"/>
+<rect x="150.0" y="286" width="6.9" height="9" fill="none" stroke="#DC2626" stroke-width="1" stroke-dasharray="2 1.5"/>
+<rect x="150.0" y="286" width="6.9" height="9" fill="none" stroke="#DC2626" stroke-width="1" stroke-dasharray="2 1.5"/>
+<text x="144" y="302" class="l" text-anchor="end">261010_150620</text>
+<rect x="150" y="296" width="113.8" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="151.1" y="297.5" width="112.7" height="4" fill="#64707C"/>
+<rect x="168.1" y="295" width="2.9" height="9" fill="none" stroke="#DC2626" stroke-width="1" stroke-dasharray="2 1.5"/>
+<rect x="168.1" y="295" width="2.9" height="9" fill="none" stroke="#DC2626" stroke-width="1" stroke-dasharray="2 1.5"/>
+<rect x="168.1" y="295" width="2.9" height="9" fill="none" stroke="#DC2626" stroke-width="1" stroke-dasharray="2 1.5"/>
+<text x="144" y="311" class="l" text-anchor="end">261007_150032</text>
+<rect x="150" y="305" width="50.3" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<text x="144" y="320" class="l" text-anchor="end">261010_133259</text>
+<rect x="150" y="314" width="100.0" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="200.2" y="315.5" width="49.9" height="4" fill="#64707C"/>
+<text x="144" y="329" class="l" text-anchor="end">261010_133331</text>
+<rect x="150" y="323" width="133.8" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="249.5" y="324.5" width="34.2" height="4" fill="#64707C"/>
+<text x="144" y="338" class="l" text-anchor="end">261010_134136</text>
+<rect x="150" y="332" width="144.3" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="175.7" y="333.5" width="118.6" height="4" fill="#64707C"/>
+<text x="144" y="347" class="l" text-anchor="end">261010_134213</text>
+<rect x="150" y="341" width="113.8" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="200.0" y="342.5" width="63.8" height="4" fill="#64707C"/>
+<text x="144" y="356" class="l" text-anchor="end">261010_134233</text>
+<rect x="150" y="350" width="108.7" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="351.5" width="108.7" height="4" fill="#64707C"/>
+<text x="144" y="365" class="l" text-anchor="end">261010_134322</text>
+<rect x="150" y="359" width="316.6" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="360.5" width="316.6" height="4" fill="#64707C"/>
+<text x="144" y="374" class="l" text-anchor="end">261010_143354</text>
+<rect x="150" y="368" width="176.2" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<text x="144" y="383" class="l" text-anchor="end">261010_143412</text>
+<rect x="150" y="377" width="498.4" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<text x="144" y="392" class="l" text-anchor="end">261010_144312</text>
+<rect x="150" y="386" width="142.4" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="387.5" width="142.4" height="4" fill="#64707C"/>
+<text x="144" y="401" class="l" text-anchor="end">261010_145118</text>
+<rect x="150" y="395" width="540.1" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="163.2" y="396.5" width="526.9" height="4" fill="#64707C"/>
+<text x="144" y="410" class="l" text-anchor="end">261010_145218</text>
+<rect x="150" y="404" width="260.5" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="334.8" y="405.5" width="75.6" height="4" fill="#64707C"/>
+<text x="144" y="419" class="l" text-anchor="end">261010_145246</text>
+<rect x="150" y="413" width="42.8" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="414.5" width="42.8" height="4" fill="#64707C"/>
+<text x="144" y="428" class="l" text-anchor="end">261010_145451</text>
+<rect x="150" y="422" width="39.4" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="423.5" width="39.4" height="4" fill="#64707C"/>
+<text x="144" y="437" class="l" text-anchor="end">261010_145811</text>
+<rect x="150" y="431" width="21.0" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="432.5" width="21.0" height="4" fill="#64707C"/>
+<text x="144" y="446" class="l" text-anchor="end">261010_153110</text>
+<rect x="150" y="440" width="112.0" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="163.4" y="441.5" width="46.9" height="4" fill="#64707C"/>
+<text x="144" y="455" class="l" text-anchor="end">261010_153128</text>
+<rect x="150" y="449" width="162.3" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<text x="144" y="464" class="l" text-anchor="end">261010_153149</text>
+<rect x="150" y="458" width="103.8" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<text x="144" y="473" class="l" text-anchor="end">261010_153251</text>
+<rect x="150" y="467" width="52.8" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="163.4" y="468.5" width="39.4" height="4" fill="#64707C"/>
+<text x="144" y="482" class="l" text-anchor="end">261010_153318</text>
+<rect x="150" y="476" width="28.6" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<text x="144" y="491" class="l" text-anchor="end">261010_153355</text>
+<rect x="150" y="485" width="41.7" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="486.5" width="41.7" height="4" fill="#64707C"/>
+<text x="144" y="500" class="l" text-anchor="end">261010_153427</text>
+<rect x="150" y="494" width="26.0" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<text x="144" y="509" class="l" text-anchor="end">261010_154807</text>
+<rect x="150" y="503" width="116.1" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="150.0" y="504.5" width="116.1" height="4" fill="#64707C"/>
+<text x="144" y="518" class="l" text-anchor="end">261010_155145</text>
+<rect x="150" y="512" width="155.9" height="7" fill="#F6F8FA" stroke="#DEE2E6" stroke-width=".6"/>
+<rect x="163.4" y="513.5" width="120.5" height="4" fill="#64707C"/>
+<line x1="0" y1="303" x2="720" y2="303" stroke="#212529" stroke-width=".8"/>
+<text x="0" y="30" class="lg">↓ 完成動画に使われた動画（26本）</text>
+<text x="0" y="304" class="lg" dy="-2" text-anchor="start"></text>
+<text x="720" y="301" class="lg" text-anchor="end">↓ 使われなかった動画（24本）</text>
+<line x1="150.0" y1="34" x2="150.0" y2="524" stroke="#DEE2E6" stroke-width=".5"/>
+<text x="150.0" y="535" class="l" text-anchor="middle">0秒</text>
+<line x1="261.6" y1="34" x2="261.6" y2="524" stroke="#DEE2E6" stroke-width=".5"/>
+<text x="261.6" y="535" class="l" text-anchor="middle">10秒</text>
+<line x1="373.2" y1="34" x2="373.2" y2="524" stroke="#DEE2E6" stroke-width=".5"/>
+<text x="373.2" y="535" class="l" text-anchor="middle">20秒</text>
+<line x1="484.8" y1="34" x2="484.8" y2="524" stroke="#DEE2E6" stroke-width=".5"/>
+<text x="484.8" y="535" class="l" text-anchor="middle">30秒</text>
+<line x1="596.4" y1="34" x2="596.4" y2="524" stroke="#DEE2E6" stroke-width=".5"/>
+<text x="596.4" y="535" class="l" text-anchor="middle">40秒</text>
+<line x1="708.0" y1="34" x2="708.0" y2="524" stroke="#DEE2E6" stroke-width=".5"/>
+<text x="708.0" y="535" class="l" text-anchor="middle">50秒</text>
+<rect x="150" y="542" width="18" height="9" fill="none" stroke="#DC2626" stroke-width="1.6"/><text x="174" y="550" class="lg">オーナーが使った区間（正解）</text>
+<rect x="350" y="544" width="18" height="4" fill="#64707C"/><text x="374" y="550" class="lg">kite の提案（今の設定）</text>
+<rect x="530" y="542" width="18" height="9" fill="#F6F8FA" stroke="#DEE2E6"/><text x="554" y="550" class="lg">動画の長さ</text>
+</svg>
+<figcaption>図 2 — 1行が元素材1本。上から、正解区間のある26本、タイトル文字の背景にだけ使われた4本（点線の赤枠。正解には使わない）、使われなかった24本の順です。オーナーは動画の先頭付近の2〜4秒を使うことが多く、正解区間の45%が0秒目から始まっています（<span class="mono">match/segments.csv</span> の元素材側の開始秒を集計）。</figcaption>
+</figure>
+
+<h2>しきい値を変えても改善せず、単純なルールより成績が下</h2>
+<p>kite のしきい値を 0.6 に上げると提案が0個になり、0.4 以下にすると素材のほぼ全部が残ります（<span class="mono">report.txt:15-17</span>）。<span class="red">「各動画の先頭3秒だけ採る」という単純なルールのほうが、今の kite より成績が上でした。</span>点数の高い順に正解と同じ82秒分を採ると、適合率は40%まで上がります。つまり点数の高い場面ほど当たりやすく、点数に手がかりはあります。ただしその方式では正解の74%を取りこぼします。</p>
+<table>
+<tr><th>方式</th><th>再現率</th><th>適合率</th><th>残る秒数</th><th>未使用24本のうち提案0個</th></tr>
+<tr><td>kite（今の設定 0.5/0.4）</td><td class="n">73%</td><td class="n">18%</td><td class="n">343</td><td class="n">7/24</td></tr>
+<tr><td>wing（0.57/0.52）</td><td class="n">44%</td><td class="n">21%</td><td class="n">175</td><td class="n">13/24</td></tr>
+<tr><td>windsurf（0.55/0.5）</td><td class="n">12%</td><td class="n">9%</td><td class="n">108</td><td class="n">14/24</td></tr>
+<tr><td>kite_static（0.5/0.4）</td><td class="n">100%</td><td class="n">15%</td><td class="n">571</td><td class="n">1/24</td></tr>
+<tr><td>各動画の先頭3秒だけ</td><td class="n">55%</td><td class="n">29%</td><td class="n">159</td><td class="n">0/24</td></tr>
+<tr><td>kite の点数が高い順に82秒分</td><td class="n">26%</td><td class="n">40%</td><td class="n">54</td><td class="n">20/24</td></tr>
+<tr><td>（参考）でたらめに選んだ場合</td><td class="n">14%</td><td class="n">14%</td><td class="n">82</td><td class="n">—</td></tr>
+</table>
+<p class="m">表 1 — 正解は完成動画の19.5〜108.5秒に使われた33区間・82秒。右端の列は、完成動画に使われなかった24本のうち、提案が0個になった（アプリで保存・まとめる対象から外れる）本数で、多いほど良い。出所: <span class="mono">dataset/owner/2026-10-07_10/eval/report.txt</span> 6〜9行目と40〜44行目。</p>
+
+<h2>決めてほしいこと (3 問 — 未回答は推奨で進める)</h2>
+
+<div class="qcard"><p class="qt">問 1. オーナーの採否を学習するモデル作りを、いつ始めるか（開発側の進め方。オーナーのアプリの画面はこの問いでは変わらない）</p><ul>
+<li><b>A. 今の1セットで試しに作り、同時に別の撮影日の素材を依頼する</b><span class="rec">推奨</span> — 利点: 待たずに効果の見込みがわかり、依頼文に結果を添えられる。代償: 例が使用26本・未使用24本しかなく、試しに作ったモデルで測る成績は実際より良く出やすい。</li>
+<li>B. 別の撮影日の素材が届くまで始めない — 利点: 作るのに使う日と、成績を測る日を分けられ、成績を正直に測れる。代償: 素材が届くまで何も進まない。</li>
+</ul>
+<p class="m">根拠: 正解の例は <span class="mono">dataset/owner/2026-10-07_10/eval/report.txt:1</span>「正解区間 33個 / 81.6秒（26本）」。元素材のファイル名は <span class="mono">20261007_*</span>（10本。図2では 261007_…）と <span class="mono">20261010_*</span>（44本）の2日分だけ。</p>
+</div>
+
+<div class="qcard"><p class="qt">問 2. 新しいモデルができるまで、オーナーが使うおまかせの設定をどうするか</p><ul>
+<li><b>A. 変えない（kite 0.5/0.4 のまま）</b><span class="rec">推奨</span> — 利点: 取りこぼしが少なく（再現率73%）、説明し直す必要がない。代償: 素材の6割（343秒）が残り、選別の手間はあまり減らない。</li>
+<li>B. 「目標の長さに収まるまで点数の高い順に採る」方式を先に作る — おまかせの設定に「目標の長さ（例: 3分）」の入力欄を足し、点数の高い場面から順に区間を入れる。利点: 残る長さが目標に近くなり、ムダが少ない（適合率40%）。代償: 取りこぼしが多い（再現率26%）うえ、アプリの改修が要る。</li>
+<li>C. おまかせを「各動画の先頭3秒を区間にする」ルールに切り替える — 利点: 残る長さが半分（159秒）になり、今の kite より取りこぼしも少ない（再現率55%・適合率29%）。代償: AIを使わない固定のルールで、長い動画やほかの利用者の撮り方には合わない。</li>
+</ul>
+<p class="m">根拠: 表 1（<span class="mono">report.txt:6</span>）。kite のしきい値は <span class="mono">flutter_app/assets/models/kite.json:1</span>（"enter": 0.5, "exit": 0.4）、区間の作り方は <span class="mono">flutter_app/lib/ai_segments.dart:153</span>（buildProposedSegments）。</p>
+</div>
+
+<div class="qcard"><p class="qt">問 3. オーナーに今回の結果をいつ伝えるか</p><ul>
+<li><b>A. 追加素材のお願いと一緒に、要点だけ今伝える</b><span class="rec">推奨</span> — 利点: 「なぜ追加素材が要るか」が伝わり、協力を得やすい。代償: 「今のAIはあまり効いていない」と伝えることになる。</li>
+<li>B. 改善できてから、結果と改善をまとめて伝える — 利点: 良い知らせと一緒に伝えられる。代償: 追加素材の依頼の理由を説明しにくく、届くのが遅れる。</li>
+</ul>
+<p class="m">根拠: オーナー宛ての依頼文の案は <span class="mono">flutter_app/HIGHLIGHT_MODELS_PLAN.md:70</span> 「## 4. オーナーへの依頼文（案）」。今回もらった素材はファイル名から 2026-10-07 と 2026-10-10 の2日分（<span class="mono">dataset/owner/2026-10-07_10/raw</span> の54本）。</p>
+</div>
+
+<details><summary>正解区間の作り方と限界（照合の方法、正解から外した3か所、照合できなかった2か所）</summary>
+<p class="m">完成動画を0.25秒ごとのコマにし、元素材の全コマ（0.25秒ごと）と SIFT 特徴点で照合しました。SIFT は拡大縮小に強いので、完成側のズーム・切り抜きにも対応できます。448コマ中422コマが一致し、そのうち55コマは水しぶき等で特徴点が少ないため、前後の区間から時刻を予測して補いました（<span class="mono">owner_eval/match_final.py</span>）。</p>
+<p class="m">正解から外した部分: 0〜11.75秒（タイトル文字の背景）、12〜19秒（写真＝静止画。動画ではないので今回は評価しないと決めた部分）、108.5秒以降（YouTube の終了画面）。照合できなかった部分: 31〜33秒（大きな水しぶきの転倒）、91〜92秒（空中でボードが回るジャンプ）。どちらも約1〜2秒で、正解の合計82秒への影響は小さいと見ています。</p>
+</details>
+
+<details><summary>Flutter版の解析の実行方法と注意点（3項目）</summary>
+<p class="m">評価専用の起動ファイル <span class="mono">flutter_app/tool/eval_omakase.dart</span> が、アプリのおまかせと同じ解析（FFmpeg＋Windows側のCLIP、1秒間隔）と区間作成を呼び、4モデル分の点数と提案を JSON に書き出します。54本の解析は約90秒でした。</p>
+<p class="m">Debug版の exe は、Defender のフォルダーアクセス制御のため Documents 配下に書き込めません。出力は Temp に書いてからコピーしています。評価用の起動ファイルで実行したため、<span class="mono">build/windows/x64/runner/Debug</span> の中身は評価用に置き換わっています。通常の <span class="mono">flutter run</span> をすると、アプリ本体に作り直されます。</p>
+<p class="m">「点数が高い順に82秒分」は、重なった区間の時間を二重に数えているため、実際に残るのは54秒です。目安として見てください。</p>
+</details>
+
+<footer class="m">出所: 元素材54本（dataset/owner/2026-10-07_10/raw）、完成動画の画面録画、照合結果（match/）、Flutter版の解析結果（eval/flutter_omakase.json）、コミット e050c25・56acff0。回答は下のフォームから。未回答の問は推奨案で確定する。</footer>
+
+</section>
+
+<!-- ================= シートここまで ================= -->
+
+<!-- ================= 回答フォーム ================= -->
+<section id="akForm">
+<h2>回答 (未回答 = お任せ = 推奨案で確定)</h2>
+<p class="m">上の問いカードを見て選ぶ。迷う問いは未選択のままでよい。書き終えたら一番下の [貼り付ける文章を作る] を押し、出たテキストを Claude Code のターミナルに貼って Enter。</p>
+
+<div class="q" data-qid="q1">
+  <h3>Q1. オーナーの採否を学習するモデル作りを、いつ始めるか（開発側の進め方）</h3>
+  <label><input type="radio" name="q1" value="A"><b>A. 今の1セットで試しに作り、同時に別の撮影日の素材を依頼する</b><span class="rec">推奨</span>
+    <div class="opt-d">試しに作ったモデルの結果を依頼文に添えられる。成績は実際より良く出やすい。</div></label>
+  <label><input type="radio" name="q1" value="B"><b>B. 別の撮影日の素材が届くまで始めない</b>
+    <div class="opt-d">作る日と測る日を分けて正直に測れる。届くまで止まる。</div></label>
+  <textarea name="q1_note" placeholder="補足 (任意)"></textarea>
+</div>
+
+<div class="q" data-qid="q2">
+  <h3>Q2. 新しいモデルができるまで、オーナーが使うおまかせの設定をどうするか</h3>
+  <label><input type="radio" name="q2" value="A"><b>A. 変えない（kite 0.5/0.4 のまま）</b><span class="rec">推奨</span>
+    <div class="opt-d">再現率73%・適合率18%。素材573秒のうち343秒が残る。</div>
+    <figure class="thumb"><svg viewBox="0 0 560 70"><style>.b{font:400 11px 'IBM Plex Sans JP',sans-serif;fill:#64707C}</style><rect x="0" y="8" width="520" height="16" fill="#fff" stroke="#DEE2E6"/><text x="0" y="40" class="b">素材全体 573秒</text><rect x="0" y="8" width="311.3" height="16" fill="#64707C"/><rect x="0" y="8" width="54.1" height="16" fill="#DC2626"/><text x="0" y="60" class="b">残る 343秒・うち正解 60秒（正解の合計は82秒）</text></svg><figcaption>残る秒数（灰）と、そのうち正解の秒数（赤）</figcaption></figure></label>
+  <label><input type="radio" name="q2" value="B"><b>B. 「目標の長さに収まるまで点数の高い順に採る」方式を先に作る</b>
+    <div class="opt-d">設定に「目標の長さ」を足す。再現率26%・適合率40%。残るのは約54秒。アプリの改修が要る。</div>
+    <figure class="thumb"><svg viewBox="0 0 560 70"><style>.b{font:400 11px 'IBM Plex Sans JP',sans-serif;fill:#64707C}</style><rect x="0" y="8" width="520" height="16" fill="#fff" stroke="#DEE2E6"/><text x="0" y="40" class="b">素材全体 573秒</text><rect x="0" y="8" width="49.0" height="16" fill="#64707C"/><rect x="0" y="8" width="19.3" height="16" fill="#DC2626"/><text x="0" y="60" class="b">残る 54秒・うち正解 21秒（正解の合計は82秒）</text></svg><figcaption>残る秒数（灰）と、そのうち正解の秒数（赤）</figcaption></figure></label>
+  <label><input type="radio" name="q2" value="C"><b>C. おまかせを「各動画の先頭3秒」ルールに切り替える</b>
+    <div class="opt-d">再現率55%・適合率29%。159秒が残る。AIを使わない固定のルール。</div>
+    <figure class="thumb"><svg viewBox="0 0 560 70"><style>.b{font:400 11px 'IBM Plex Sans JP',sans-serif;fill:#64707C}</style><rect x="0" y="8" width="520" height="16" fill="#fff" stroke="#DEE2E6"/><text x="0" y="40" class="b">素材全体 573秒</text><rect x="0" y="8" width="144.3" height="16" fill="#64707C"/><rect x="0" y="8" width="40.7" height="16" fill="#DC2626"/><text x="0" y="60" class="b">残る 159秒・うち正解 45秒（正解の合計は82秒）</text></svg><figcaption>残る秒数（灰）と、そのうち正解の秒数（赤）</figcaption></figure></label>
+  <textarea name="q2_note" placeholder="補足 (任意)"></textarea>
+</div>
+
+<div class="q" data-qid="q3">
+  <h3>Q3. オーナーに今回の結果をいつ伝えるか</h3>
+  <label><input type="radio" name="q3" value="A"><b>A. 追加素材のお願いと一緒に、要点だけ今伝える</b><span class="rec">推奨</span>
+    <div class="opt-d">追加素材が要る理由が伝わる。今のAIがあまり効いていないことも伝わる。</div></label>
+  <label><input type="radio" name="q3" value="B"><b>B. 改善できてから、結果と改善をまとめて伝える</b>
+    <div class="opt-d">良い知らせと一緒に伝えられる。依頼の理由が弱く、素材が届くのが遅れる。</div></label>
+  <textarea name="q3_note" placeholder="補足 (任意)"></textarea>
+</div>
+
+<!-- akapin:start -->
+<h2>シートへの赤ピン</h2>
+<div class="q" id="pinBox">
+  <p class="m" style="margin-top:0">上のボタンで「✎ 視覚訂正モード」を ON にし、シートの上の直したい場所をクリックすると赤① が置かれる。その場で訂正文を書く。場所は目安で、訂正の正は本文。</p>
+  <p id="pinEmpty">まだピンはありません。</p>
+  <ul id="pinList"></ul>
+</div>
+<!-- akapin:end -->
+
+<h2>全体への赤ペン</h2>
+<div class="q redpen">
+  <p class="m" style="margin-top:0">訂正・追加要望・「そもそも」の指摘はここへ。複数行でよい。</p>
+  <textarea name="global_note" placeholder=""></textarea>
+</div>
+
+<div class="sendbar">
+  <button id="genBtn" type="button" onclick="generatePrompt()">貼り付ける文章を作る</button>
+  <div id="status" class="status"></div>
+  <textarea id="out" readonly onclick="this.select()"></textarea>
+</div>
+</section>
+
+</main>
+<script>
+// TODO: 質問 id → 見出し (回答プロンプトの行になる。.q の radio name と同期)
+var QUESTIONS = {
+  q1: "Q1. オーナーの採否を学習するモデル作りを、いつ始めるか",
+  q2: "Q2. 新しいモデルができるまでのおまかせ設定",
+  q3: "Q3. オーナーに今回の結果をいつ伝えるか"
+};
+// TODO: シートごとに一意な固定キー (例: "akapen-settings-01")。使い回すと別のシートの下書きが復元される
+var DRAFT_KEY = "akapen-owner-eval-01";
+// TODO: 回答プロンプトの見出しに入るラベル (例: "settings-01")
+var DOC = "owner-eval-01";
+
+/* ---------- 下書き (radio・textarea・ピン) ---------- */
+function saveDraft() {
+  try {
+    var d = {};
+    /* akapin:start */
+    d.pins = PINS.map(function (p) { return { x: p.x, y: p.y, note: p.note }; });
+    /* akapin:end */
+    document.querySelectorAll("#akForm input[type=radio]:checked").forEach(function (el) { d[el.name] = el.value; });
+    document.querySelectorAll("#akForm textarea").forEach(function (el) {
+      if (el.id !== "out" && el.name && el.value) d[el.name] = el.value;
+    });
+    localStorage.setItem(DRAFT_KEY, JSON.stringify(d));
+  } catch (e) {}
+}
+function loadDraft() {
+  try {
+    var d = JSON.parse(localStorage.getItem(DRAFT_KEY) || "{}");
+    Object.keys(d).forEach(function (k) {
+      if (k === "pins") return;   // 別部品の下書き (部品が無ければ無視)
+      try {
+        // radio の値は英数のみ。textarea の値 (改行や引用符入り) をセレクタに埋め込まない
+        if (!/_note$/.test(k) && k !== "global_note" && /^[A-Za-z0-9]+$/.test(String(d[k]))) {
+          var r = document.querySelector('#akForm input[name="' + k + '"][value="' + d[k] + '"]');
+          if (r) { r.checked = true; return; }
+        }
+        var t = document.querySelector('#akForm textarea[name="' + k + '"]');
+        if (t) t.value = d[k];
+      } catch (e) {}
+    });
+    /* akapin:start */
+    if (Array.isArray(d.pins)) {
+      d.pins.forEach(function (p) {
+        if (typeof p.x === "number" && typeof p.y === "number") addPin(p.x, p.y, String(p.note || ""), true);
+      });
+      renderPins();
+    }
+    /* akapin:end */
+  } catch (e) {}
+}
+document.getElementById("akForm").addEventListener("change", saveDraft);
+document.getElementById("akForm").addEventListener("input", saveDraft);
+
+// 各質問に「選択を解除」を付ける (誤クリックの取り消し = お任せに戻す)
+document.querySelectorAll("#akForm .q[data-qid]").forEach(function (q) {
+  var radios = q.querySelectorAll("input[type=radio]");
+  if (!radios.length) return;
+  var a = document.createElement("a");
+  a.textContent = "選択を解除 (お任せに戻す)";
+  a.className = "clearsel";
+  a.onclick = function () { radios.forEach(function (r) { r.checked = false; }); saveDraft(); };
+  q.appendChild(a);
+});
+
+/* akapin:start */
+/* ---------- 赤ピン (視覚訂正) ---------- */
+var PINS = [];            // [{ x, y, note, el }] — x/y は #akSheet 左上原点の % (整数)
+var PIN_MODE = false;
+var SHEET = document.getElementById("akSheet");
+var POP = null;           // 開いているポップオーバー { el, pin }
+
+function circled(n) {
+  // ①〜⑳ / ㉑〜㉟ / ㊱〜㊿。それ以上は (n)
+  if (n >= 1 && n <= 20) return String.fromCharCode(0x2460 + n - 1);
+  if (n >= 21 && n <= 35) return String.fromCharCode(0x3251 + n - 21);
+  if (n >= 36 && n <= 50) return String.fromCharCode(0x32B1 + n - 36);
+  return "(" + n + ")";
+}
+function togglePinMode(force) {
+  PIN_MODE = (typeof force === "boolean") ? force : !PIN_MODE;
+  var b = document.getElementById("pinToggle");
+  SHEET.classList.toggle("pinmode", PIN_MODE);
+  b.classList.toggle("on", PIN_MODE);
+  b.setAttribute("aria-pressed", PIN_MODE ? "true" : "false");
+  b.textContent = PIN_MODE ? "✎ 視覚訂正モード: ON — シートの上をクリック" : "✎ 視覚訂正モード: OFF";
+  if (!PIN_MODE) closePop();
+}
+function addPin(x, y, note, silent) {
+  var el = document.createElement("div");
+  el.className = "akpin";
+  var pin = { x: x, y: y, note: note || "", el: el };
+  el.style.left = x + "%";
+  el.style.top = y + "%";
+  el.addEventListener("click", function (ev) {
+    ev.stopPropagation();
+    if (PIN_MODE) openPop(pin);
+  });
+  SHEET.appendChild(el);
+  PINS.push(pin);
+  if (!silent) { renderPins(); saveDraft(); }
+  return pin;
+}
+function removePin(pin) {
+  var i = PINS.indexOf(pin);
+  if (i < 0) return;
+  if (POP && POP.pin === pin) closePop();
+  pin.el.remove();
+  PINS.splice(i, 1);
+  renderPins();
+  saveDraft();
+}
+function pinIndex(pin) { return PINS.indexOf(pin) + 1; }
+function renderPins() {
+  PINS.forEach(function (p, i) { p.el.textContent = String(i + 1); p.el.title = "赤" + circled(i + 1) + " " + p.note; });
+  var ul = document.getElementById("pinList");
+  var empty = document.getElementById("pinEmpty");
+  ul.innerHTML = "";
+  empty.style.display = PINS.length ? "none" : "";
+  PINS.forEach(function (p, i) {
+    var li = document.createElement("li");
+    var no = document.createElement("span"); no.className = "no"; no.textContent = "赤" + circled(i + 1);
+    var xy = document.createElement("span"); xy.className = "xy"; xy.textContent = "(x" + p.x + "% · y" + p.y + "%)";
+    var tx = document.createElement("span"); tx.className = "txt"; tx.textContent = p.note || "(本文なし)";
+    var ops = document.createElement("span"); ops.className = "ops";
+    var ed = document.createElement("a"); ed.textContent = "編集";
+    ed.onclick = function () { togglePinMode(true); p.el.scrollIntoView({ block: "center" }); openPop(p); };
+    var dl = document.createElement("a"); dl.textContent = "削除";
+    dl.onclick = function () { removePin(p); };
+    ops.appendChild(ed); ops.appendChild(dl);
+    li.appendChild(no); li.appendChild(xy); li.appendChild(tx); li.appendChild(ops);
+    ul.appendChild(li);
+  });
+}
+function openPop(pin) {
+  closePop();
+  PINS.forEach(function (p) { p.el.classList.remove("active"); });
+  pin.el.classList.add("active");
+  var pop = document.createElement("div");
+  pop.className = "akpop";
+  // ピンの右下に出す。右端にかかるときは左側へ
+  var left = pin.x + (pin.x > 60 ? -2 : 2), top = pin.y;
+  pop.style.left = left + "%";
+  pop.style.top = "calc(" + top + "% + 14px)";
+  if (pin.x > 60) pop.style.transform = "translateX(-100%)";
+  var t = document.createElement("div"); t.className = "t";
+  t.textContent = "赤" + circled(pinIndex(pin)) + " (x" + pin.x + "% · y" + pin.y + "%)";
+  var ta = document.createElement("textarea");
+  ta.placeholder = "ここをどう直すか (空のまま保存すると削除)";
+  ta.value = pin.note;
+  var row = document.createElement("div"); row.className = "row";
+  var del = document.createElement("button"); del.type = "button"; del.className = "del"; del.textContent = "削除";
+  del.onclick = function (ev) { ev.stopPropagation(); removePin(pin); };
+  var save = document.createElement("button"); save.type = "button"; save.className = "save"; save.textContent = "保存";
+  save.onclick = function (ev) {
+    ev.stopPropagation();
+    var v = ta.value.trim();
+    if (!v) { removePin(pin); return; }
+    pin.note = v;
+    closePop();
+    renderPins();
+    saveDraft();
+  };
+  ta.addEventListener("keydown", function (ev) {
+    if (ev.key === "Escape") { ev.preventDefault(); save.onclick(ev); }
+    if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); save.onclick(ev); }
+  });
+  pop.addEventListener("click", function (ev) { ev.stopPropagation(); });
+  pop.addEventListener("mousedown", function (ev) { ev.stopPropagation(); });
+  row.appendChild(del); row.appendChild(save);
+  pop.appendChild(t); pop.appendChild(ta); pop.appendChild(row);
+  SHEET.appendChild(pop);
+  POP = { el: pop, pin: pin, ta: ta };
+  ta.focus();
+}
+function closePop() {
+  if (!POP) return;
+  // 閉じるときも本文を拾う (クリックで外へ出たときの取りこぼし防止)
+  var v = POP.ta.value.trim();
+  var pin = POP.pin;
+  POP.el.remove();
+  POP = null;
+  pin.el.classList.remove("active");
+  if (!v) { removePin(pin); return; }
+  if (v !== pin.note) { pin.note = v; renderPins(); saveDraft(); }
+}
+SHEET.addEventListener("click", function (ev) {
+  if (!PIN_MODE) return;
+  // ピンモード中はリンク・summary の標準の動作を止める (details の開閉でシートの高さが変わり、ピンがずれる)
+  ev.preventDefault();
+  if (POP) { closePop(); return; }   // 開いているポップオーバーはまず閉じる
+  var r = SHEET.getBoundingClientRect();
+  var x = Math.round((ev.clientX - r.left) / r.width * 100);
+  var y = Math.round((ev.clientY - r.top) / r.height * 100);
+  x = Math.max(0, Math.min(100, x)); y = Math.max(0, Math.min(100, y));
+  var pin = addPin(x, y, "");
+  openPop(pin);
+});
+/* akapin:end */
+
+/* ---------- 回答プロンプト (references/reply-format.md の固定形) ---------- */
+function oneLine(s) { return s.trim().replace(/\s*\n\s*/g, " "); }
+function buildPrompt() {
+  var lines = ["【赤ペン回答】" + DOC];
+  /* akapin:start */
+  // 赤ピン (ある時だけ、Q 行より先)
+  PINS.forEach(function (p, i) {
+    if (!p.note.trim()) return;
+    lines.push("赤" + circled(i + 1) + " (x" + p.x + "% · y" + p.y + "%) " + oneLine(p.note));
+  });
+  /* akapin:end */
+  Object.keys(QUESTIONS).forEach(function (qid) {
+    var choiceEl = document.querySelector('#akForm input[name="' + qid + '"]:checked');
+    var noteEl = document.querySelector('#akForm textarea[name="' + qid + '_note"]');
+    var note = noteEl ? noteEl.value.trim() : "";
+    var line = QUESTIONS[qid] + ": ";
+    if (choiceEl) {
+      var lab = choiceEl.closest("label");
+      var b = lab ? lab.querySelector("b") : null;
+      var lbl = b ? b.innerText.trim() : "";
+      // 太字が "A. 選択肢" 形式なら先頭の記号を剥がす (A — A. の重複防止)
+      lbl = lbl.replace(new RegExp("^" + choiceEl.value + "[.．]\\s*"), "");
+      line += choiceEl.value + " — " + (lbl || choiceEl.value);
+    } else {
+      line += "(未選択 = お任せ)";
+    }
+    if (note) line += " / 補足: " + oneLine(note);
+    lines.push(line);
+  });
+  var g = document.querySelector('#akForm textarea[name="global_note"]');
+  var gv = g ? g.value.trim() : "";
+  lines.push("全体への赤ペン: " + (gv || "(なし)"));
+  lines.push("---");
+  lines.push("上の回答を反映して作業を続けてください。お任せの項目は推奨案で確定してください。");
+  return lines.join("\n");
+}
+function generatePrompt() {
+  /* akapin:start */
+  closePop();
+  /* akapin:end */
+  var text = buildPrompt();
+  /* akrelay:start */
+  if (RELAY) { relaySend(text); return; }
+  /* akrelay:end */
+  copyPrompt(text, "");
+}
+function copyPrompt(text, prefix) {
+  var out = document.getElementById("out");
+  out.style.display = "block";
+  out.value = text;
+  var done = function (copied) {
+    setStatus(prefix + (copied
+      ? "✓ コピーしました — Claude Code のターミナルに貼り付けて Enter"
+      : "下のテキストを選択してコピーし、Claude Code に貼り付けてください"), copied ? "ok" : "err");
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+  } else {
+    try { out.select(); done(document.execCommand("copy")); } catch (e) { done(false); }
+  }
+}
+function setStatus(msg, cls) {
+  var el = document.getElementById("status");
+  el.textContent = msg;
+  el.className = "status " + cls;
+}
+
+var RELAY = null;                       // 中継 (別部品が検知時に設定。無ければ null = コピー経路)
+/* akrelay:start */
+/* ---------- 直接送信 (assets/akapen-serve.py のローカル中継。http で開かれた時だけ) ---------- */
+var SENT_KEY = DRAFT_KEY + ":sent";     // 送信済みの記録 (再送はいつでも可)
+function relaySheetName() {
+  var n = location.pathname.split("/").pop() || "";
+  try { return decodeURIComponent(n); } catch (e) { return n; }
+}
+function relayUi() {
+  var btn = document.getElementById("genBtn");
+  btn.textContent = localStorage.getItem(SENT_KEY) ? "もう一度送信" : "送信";
+  document.querySelectorAll("#akForm p.m").forEach(function (p) {
+    p.innerHTML = p.innerHTML.replace(/一番下の \[貼り付ける文章を作る\] を押し、出たテキストを Claude Code のターミナルに貼って Enter/, "一番下の [送信] を押す (ターミナルに貼る必要はない)");
+  });
+}
+function relayDetect() {
+  if (!/^https?:$/.test(location.protocol) || !window.fetch) return;
+  fetch("/akapen-ping", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (j) {
+    if (j && j.ok) { RELAY = { sheet: relaySheetName() }; relayUi(); }
+  }).catch(function () {});
+}
+function relaySend(text) {
+  var btn = document.getElementById("genBtn");
+  btn.disabled = true;
+  setStatus("送信中…", "");
+  fetch("/akapen-answer", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sheet: RELAY.sheet, text: text }) })
+    .then(function (r) { return r.json().then(function (j) { return (r.ok && j && j.ok) ? j : Promise.reject(j && j.error || ("HTTP " + r.status)); }); })
+    .then(function () {
+      try { localStorage.setItem(SENT_KEY, String(Date.now())); } catch (e) {}
+      btn.disabled = false; btn.textContent = "もう一度送信";
+      document.getElementById("out").style.display = "none";
+      setStatus("✓ 送信しました。ターミナルに戻ってください (このタブは閉じてよい)", "ok");
+    })
+    .catch(function (err) {
+      btn.disabled = false;
+      copyPrompt(text, "中継に送れませんでした (" + err + ") — 代わりにコピーします: ");
+    });
+}
+/* akrelay:end */
+
+loadDraft();
+/* akrelay:start */
+relayDetect();
+/* akrelay:end */
+</script>
+</body>
+</html>
