@@ -123,16 +123,25 @@ def main() -> int:
     items = [it for it in data["items"] if "error" not in it]
     errors = [it["name"] for it in data["items"] if "error" in it]
 
-    gt, ignore = {}, {}
-    with (args.day_dir / "match" / "segments.csv").open(encoding="utf-8-sig") as f:
+    # 目視チェック済み（apply_review.py の出力）があればそちらを使う
+    seg_path = args.day_dir / "match" / "segments_reviewed.csv"
+    if not seg_path.exists():
+        seg_path = args.day_dir / "match" / "segments.csv"
+    gt, ignore, by_scene = {}, {}, {}
+    with seg_path.open(encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
+            if r.get("review") == "違う":  # 照合の誤り：正解にも「どちらとも言えない」にも入れない
+                continue
             seg = (float(r["raw_start"]), float(r["raw_end"]))
             inside = float(r["final_start"]) >= args.gt_from and float(r["final_end"]) <= args.gt_to
             (gt if inside else ignore).setdefault(r["clip"], []).append(seg)
+            if inside and r.get("scene"):
+                by_scene.setdefault(r["scene"], {}).setdefault(r["clip"], []).append(seg)
     gt_total = sum(mask(v, 600).sum() * STEP for v in gt.values())
     raw_total = sum(it["durationMs"] for it in items) / 1000
 
-    lines = [f"素材 {len(items)}本 / {raw_total:.1f}秒、正解区間 {sum(len(v) for v in gt.values())}個 / {gt_total:.1f}秒"
+    lines = [f"正解: {seg_path.name}",
+             f"素材 {len(items)}本 / {raw_total:.1f}秒、正解区間 {sum(len(v) for v in gt.values())}個 / {gt_total:.1f}秒"
              f"（{len(gt)}本）、正解に使わない素材時間あり {len(ignore)}本",
              f"解析に失敗: {errors or 'なし'}", ""]
 
@@ -145,6 +154,19 @@ def main() -> int:
         label = f"{mid} ({cfg['enter']}/{cfg['exit']})"
         lines.append(f"{label:<34}"
                      f"{m['recall']:>7.0%}{m['precision']:>7.0%}{m['total_s']:>8.1f}  {m['used_hit']:>10}  {m['unused_zero']:>10}")
+
+    if by_scene:
+        names = {"1": "①トリック", "2": "②走行", "3": "③人物・笑顔", "4": "④その他"}
+        scene_ids = sorted(by_scene)
+        lines += ["", "## 場面ごとの再現率（アプリの今の設定・目視チェックの場面ラベル）",
+                  f"{'方式':<34}" + "".join(
+                      f"{names.get(s, s) + '(' + str(sum(len(v) for v in by_scene[s].values())) + ')':>14}"
+                      for s in scene_ids)]
+        for mid in data["models"]:
+            preds = {it["name"]: [(s["startMs"] / 1000, s["endMs"] / 1000) for s in it["models"][mid]["segments"]]
+                     for it in items}
+            cells = "".join(f"{evaluate(items, preds, by_scene[s], {})['recall']:>14.0%}" for s in scene_ids)
+            lines.append(f"{mid:<34}{cells}")
 
     lines += ["", "## しきい値を変えた場合（enter を動かし、exit との差はモデルの設定のまま）", header]
     for mid, cfg in data["models"].items():
